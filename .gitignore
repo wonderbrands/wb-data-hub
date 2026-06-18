@@ -1,0 +1,28 @@
+# Entornos virtuales
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.env
+.env2
+.venv
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs
+*.log
+logs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Carpetas de IDEs y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+*.xml

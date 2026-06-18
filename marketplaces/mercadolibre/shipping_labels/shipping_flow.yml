@@ -1,0 +1,80 @@
+id: ml_api_flow
+namespace: wonderbrands.mercadolibre.shipping_label
+description: "Pipeline completo: Extrae de ML, clasifica SLA y prepara para Odoo"
+
+
+#Variables globales s
+variables:
+  repo_url:  "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main" #
+
+tasks:
+  # WorkingDirectory garantiza que el Clone y el Python compartan los archivos
+  - id: working_env_ml
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      
+      # Clonar el repositorio
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        # git keys
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN') }}"
+
+      # extracción
+      - id: shipping_extractor_data_ml
+        type: io.kestra.plugin.scripts.python.Script
+        warningOnStdErr: false
+        # Reintentos: Si falla, espera 60 segundos, intenta 3 veces
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempt: 3
+        # keys
+        env:
+          DB_HOST: "{{ secret('DB_HOST') }}"
+          DB_USER: "{{ secret('DB_USER') }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD') }}"
+          DB_NAME: "{{ envs.DB_NAME }}"
+        # Preparar el entorno de Linux en el contenedor efímero
+        beforeCommands:
+          - apt-get update && apt-get install -y default-libmysqlclient-dev build-essential
+          - pip install requests mysqlclient python-dotenv python-dateutil tzdata
+        # path
+        script: |
+          python marketplaces/mercadolibre/shipping_labels/ml_mix_db_api_sla_orders.py
+
+      #Ejecutar Fase 2
+      - id: shipping_inyector_labels_odoo_ml
+        type: io.kestra.plugin.scripts.python.Script
+        warningOnStdErr: false
+        env:
+          ODOO_URL: "{{ envs.odoo_urlV18}}"
+          ODOO_DB: "{{ envs.odoo_dbV18}}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          DB_HOST: "{{ secret('DB_HOST') }}"
+          DB_USER: "{{ secret('DB_USER') }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD') }}"
+          DB_NAME: "{{ envs.DB_NAME }}"
+        beforeCommands:
+          - apt-get update && apt-get install -y default-libmysqlclient-dev build-essential
+          - pip install requests mysqlclient python-dotenv python-dateutil tzdata
+        script: |
+          python marketplaces/mercadolibre/shipping_labels/ml_odoo_injection_labels.py
+
+# Alertas en caso de fallo (Se ejecuta solo si las tareas anteriores fallan)
+errors:
+  - id: error_alerts
+    type: io.kestra.plugin.core.log.Log # 
+    level: ERROR
+    message: "¡ALERTA! El flujo de Mercado Libre ha fallado en la tarea {{ taskrun.taskId }}. Revisa los logs."
+
+# 4. Trigger:
+triggers:
+  - id: production_cron
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+
