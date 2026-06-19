@@ -1,14 +1,16 @@
 id: ml_api_flow
 namespace: wonderbrands.mercadolibre.shipping_label
-description: "Pipeline completo: Extrae de ML, clasifica SLA, prepara e inserta en Odoo"
+description: "Pipeline completo: Extrae de ML, clasifica SLA y prepara para Odoo"
 
 # Variables globales
 variables:
   repo_url:  "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
-  db_name: "tools"         
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "sergio"
+  db_name: "tools"
+  db1_host: "wonderbrands0.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
 
 tasks:
   # WorkingDirectory garantiza que el Clone y el Python compartan los archivos
@@ -26,57 +28,53 @@ tasks:
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
       - id: shipping_extractor_data_ml
-        type: io.kestra.plugin.scripts.python.Script
-        warningOnStdErr: false
-        # Reintentos: Si falla, espera 60 segundos, intenta 3 veces
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-etl:v1
+        #TaskRunnerejecuta en la imagen de Docker 
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
         retry:
+        # Reintentos: Si falla, espera 60 segundos, intenta 3 veces
           type: constant
           interval: PT1M
           maxAttempt: 3
         env:
-          DB_HOST: "{{ secret('DB_HOST') }}"
-          DB_USER: "{{ secret('DB_USER') }}"
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD') }}"
-          # variables globales
           DB_NAME: "{{ vars.db_name }}"
-        
-        # Preparar el entorno de Linux en el contenedor efímero
-        beforeCommands:
-          - apt-get update && apt-get install -y default-libmysqlclient-dev build-essential pkg-config python3-dev
-          - pip install requests mysqlclient python-dotenv python-dateutil tzdata
-        runner: PROCESS
-        script: |
-          python marketplaces/mercadolibre/shipping_labels/ml_mix_db_api_sla_orders.py
+        commands:
+          # Ahora es un comando Shell puro, adiós SyntaxError
+          - python marketplaces/mercadolibre/shipping_labels/ml_mix_db_api_sla_orders.py
 
       - id: shipping_inyector_labels_odoo_ml
-        type: io.kestra.plugin.scripts.python.Script
-        warningOnStdErr: false
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-etl:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
         env:
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"
           ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
           ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
-          DB_HOST: "{{ secret('DB_HOST') }}"
-          DB_USER: "{{ secret('DB_USER') }}"
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD') }}"
           DB_NAME: "{{ vars.db_name }}"
-        beforeCommands:
-          - apt-get update && apt-get install -y default-libmysqlclient-dev build-essential pkg-config python3-dev
-          - pip install requests mysqlclient python-dotenv python-dateutil tzdata
-        runner: PROCESS
-        script: |
-          python marketplaces/mercadolibre/shipping_labels/ml_mix_db_api_sla_orders.py
+        commands:
+          - python marketplaces/mercadolibre/shipping_labels/ml_odoo_injection_labels.py
 
 # Alertas en caso de fallo (Se ejecuta solo si las tareas anteriores fallan)
 errors:
   - id: error_alerts
     type: io.kestra.plugin.core.log.Log 
     level: ERROR
-    #execution.id
     message: "¡ALERTA! El flujo de Mercado Libre ha fallado en la ejecución {{ execution.id }}. Revisa los logs."
 
 #dispardor
 triggers:
   - id: production_cron
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 * * * *"
+    cron: "0 * * * *" # Cada hora en minuto 0

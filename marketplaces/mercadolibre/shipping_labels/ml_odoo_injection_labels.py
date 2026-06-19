@@ -14,7 +14,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(__name__)
 
 #load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
-load_dotenv()
 
 # ODOO_URL = os.getenv('odoo_urlV18')
 # ODOO_DB = os.getenv('odoo_dbV18')

@@ -31,7 +31,6 @@ def parse_ml_datetime_to_cdmx(value):
 
 def get_db_connection():
     #load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
-    load_dotenv()
     return MySQLdb.connect(
         host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
         passwd=os.getenv("DB_PASSWORD"), db=os.getenv("DB_NAME"),
