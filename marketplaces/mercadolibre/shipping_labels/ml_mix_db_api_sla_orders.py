@@ -31,11 +31,18 @@ def parse_ml_datetime_to_cdmx(value):
 
 
 def get_db_connection():
-    #load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
+    print("--- DIAGNÓSTICO DE CONEXIÓN ---")
+    print(f"Host destino: {os.getenv('DB_HOST')}")
+    print(f"Usuario: {os.getenv('DB_USER')}")
+    
+    # Cambiamos passwd por password y db por database para pymysql
     return MySQLdb.connect(
-        host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-        passwd=os.getenv("DB_PASSWORD"), db=os.getenv("DB_NAME"),
-        local_infile=True, charset='utf8mb4'
+        host=os.getenv("DB_HOST"), 
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"), 
+        database=os.getenv("DB_NAME"),
+        local_infile=True, 
+        charset='utf8mb4'
     )
 
 
