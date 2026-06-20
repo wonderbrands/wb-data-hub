@@ -42,7 +42,7 @@ tasks:
         env:
           DB_HOST: "{{ vars.db1_host }}"
           DB_USER: "{{ vars.db_user }}"
-          DB_PASSWORD: "{{ secret('DB_PASSWORD') }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
         commands:
           # Ahora es un comando Shell puro, adiós SyntaxError

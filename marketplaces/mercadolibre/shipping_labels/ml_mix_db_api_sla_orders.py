@@ -1,7 +1,5 @@
 import os
 import requests
-#import pymysql
-#pymysql.install_as_MySQLdb()
 import MySQLdb
 from datetime import datetime, timedelta
 import logging

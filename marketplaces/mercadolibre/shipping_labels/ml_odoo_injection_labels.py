@@ -1,7 +1,5 @@
 import os
 import requests
-import pymysql
-pymysql.install_as_MySQLdb()
 import MySQLdb
 import xmlrpc.client
 import logging
