@@ -8,7 +8,6 @@ import zipfile
 import io
 import json
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)

@@ -4,7 +4,6 @@ import MySQLdb
 from datetime import datetime, timedelta
 import logging
 import concurrent.futures
-from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from zoneinfo import ZoneInfo
