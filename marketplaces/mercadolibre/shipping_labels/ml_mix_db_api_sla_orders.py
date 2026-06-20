@@ -1,7 +1,7 @@
 import os
 import requests
-import pymysql
-pymysql.install_as_MySQLdb()
+#import pymysql
+#pymysql.install_as_MySQLdb()
 import MySQLdb
 from datetime import datetime, timedelta
 import logging
@@ -10,9 +10,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from zoneinfo import ZoneInfo
 from dateutil.parser import isoparse
+import sys
 
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', handlers=[
+        logging.StreamHandler(sys.stdout)
+    ])
 log = logging.getLogger(__name__)
 
 CDMX = ZoneInfo("America/Mexico_City")
@@ -31,10 +34,6 @@ def parse_ml_datetime_to_cdmx(value):
 
 
 def get_db_connection():
-    print("--- DIAGNÓSTICO DE CONEXIÓN ---")
-    print(f"Host destino: {os.getenv('DB_HOST')}")
-    print(f"Usuario: {os.getenv('DB_USER')}")
-    
     # Cambiamos passwd por password y db por database para pymysql
     return MySQLdb.connect(
         host=os.getenv("DB_HOST"), 

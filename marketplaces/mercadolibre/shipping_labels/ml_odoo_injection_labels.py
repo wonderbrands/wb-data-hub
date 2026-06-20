@@ -10,8 +10,11 @@ import zipfile
 import io
 import json
 from datetime import datetime, timedelta
+import sys
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', handlers=[
+        logging.StreamHandler(sys.stdout)
+    ])
 log = logging.getLogger(__name__)
 
 #load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
@@ -28,10 +31,6 @@ ODOO_PWD = os.getenv('ODOO_PASSWORD')
 
 
 def get_db_connection():
-    print("--- DIAGNÓSTICO DE CONEXIÓN ---")
-    print(f"Host destino: {os.getenv('DB_HOST')}")
-    print(f"Usuario: {os.getenv('DB_USER')}")
-    
     # Cambiamos passwd por password y db por database para pymysql
     return MySQLdb.connect(
         host=os.getenv("DB_HOST"), 

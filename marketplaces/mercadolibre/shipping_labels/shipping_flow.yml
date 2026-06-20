@@ -10,7 +10,7 @@ variables:
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
   db_name: "tools"
-  db1_host: "wonderbrands0.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
 
 tasks:
   # WorkingDirectory garantiza que el Clone y el Python compartan los archivos
