@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
 RUN pip install --no-cache-dir \
     mysql-connector-python==9.4.0 \
     mysqlclient==2.2.8 \
+    pymysql \
     requests \
     python-dotenv \
     python-dateutil \
