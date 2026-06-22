@@ -213,4 +213,5 @@ if __name__ == "__main__":
     try:
         process_fase_c()
     except Exception as e:
-        log.error(f"Fallo crítico en Fase C: {str(e)}")
+        log.error(f"Fallo crítico en proceso de extracción de guías ML: {str(e)}")
+        sys.exit(1)

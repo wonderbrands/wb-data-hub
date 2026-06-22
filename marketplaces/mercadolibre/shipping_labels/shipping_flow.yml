@@ -61,20 +61,41 @@ tasks:
           ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
           DB_HOST: "{{ vars.db1_host }}"
           DB_USER: "{{ vars.db_user }}"
-          DB_PASSWORD: "{{ secret('DB_PASSWORD') }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
         commands:
           - python marketplaces/mercadolibre/shipping_labels/ml_odoo_injection_labels.py
 
+#dispardores
+triggers:
+  # Madrugada y tarde/noche (CDMX: 2,4,6 AM y 5,6,8,10 PM)
+  # Equivalente UTC: 8, 10, 12 y 23, 0, 2, 4 (pasan al día siguiente en UTC)
+  - id: madrugada_y_noche
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 0,2,4,8,10,12,23 * * *" 
+  
+  # Pico 6:30 AM (CDMX) -> Equivalente UTC: 12:30 PM
+  - id: hora_pico_630
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 12 * * *" 
+    
+  # Horas pico continuas (CDMX: 7:00 AM a 1:59 PM cada media hora)
+  # Equivalente UTC: 13:00 a 19:59
+  - id: horas_pico_matutinas
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0,30 13-19 * * *" 
+    
+  # Corte final (CDMX: 2:15 PM) -> Equivalente UTC: 20:15
+  - id: cierre_pico_1400
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "15 20 * * *"
+
 # Alertas en caso de fallo (Se ejecuta solo si las tareas anteriores fallan)
 errors:
-  - id: error_alerts
-    type: io.kestra.plugin.core.log.Log 
-    level: ERROR
-    message: "¡ALERTA! El flujo de Mercado Libre ha fallado en la ejecución {{ execution.id }}. Revisa los logs."
-
-#dispardor
-triggers:
-  - id: production_cron
-    type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 * * * *" # Cada hora en minuto 0
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook # <-- Nota: corregí un poco el "type" al oficial de Kestra
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *¡Fallo Crítico en el Pipeline guías de MercadoLibre!* 🚨\n*Flujo:* {{ flow.id }}\n*ID de Ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+      }

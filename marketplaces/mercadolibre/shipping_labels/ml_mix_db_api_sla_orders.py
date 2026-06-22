@@ -291,6 +291,7 @@ if __name__ == "__main__":
         run_etl_hybrid(db, ml_token)
     except Exception as e:
         log.error(f"Error en ejecución: {e}")
+        sys.exit(1)
     finally:
         if db:
             db.close()
