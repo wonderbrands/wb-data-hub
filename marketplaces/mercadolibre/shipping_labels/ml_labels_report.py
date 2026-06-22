@@ -13,7 +13,7 @@ def generate_and_send_report():
     # 1. Recibir fechas y canal de Kestra/Slack
     fecha_inicio = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
     fecha_fin = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
-    slack_channel = os.getenv("SLACK_DYNAMIC_CHANNEL")
+    slack_channel = os.getenv("SLACK_CHANNEL_ID")
 
     if not fecha_inicio or not fecha_fin:
         log.error("Faltan las fechas. Uso esperado: YYYY-MM-DD YYYY-MM-DD")
@@ -75,7 +75,7 @@ def generate_and_send_report():
 
     # 4. Enviar Archivo a Slack (Usando la API Moderna v2)
     slack_token = os.getenv("SLACK_BOT_TOKEN") 
-    slack_channel = os.getenv("SLACK_DYNAMIC_CHANNEL")
+    slack_channel = os.getenv("SLACK_CHANNEL_ID")
 
     if slack_token and slack_channel:
         try:
