@@ -93,9 +93,9 @@ triggers:
 # Alertas en caso de fallo (Se ejecuta solo si las tareas anteriores fallan)
 errors:
   - id: slack_alert
-    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook # <-- Nota: corregí un poco el "type" al oficial de Kestra
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *¡Fallo Crítico en el Pipeline guías de MercadoLibre!* 🚨\n*Flujo:* {{ flow.id }}\n*ID de Ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+        "text": "🚨 *¡Fallo crítico en el Pipeline guías de MercadoLibre!* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
       }
