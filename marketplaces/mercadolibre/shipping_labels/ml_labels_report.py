@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(__name__)
 
 def generate_and_send_report():
-    # 1. Recibir fechas y canal de Kestra/Slack
+    # Recibir fechas y canal de Kestra/Slack
     fecha_inicio = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
     fecha_fin = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
     slack_channel = os.getenv("SLACK_CHANNEL_ID")
@@ -34,7 +34,7 @@ def generate_and_send_report():
 
     log.info(f"Generando reporte desde {limite_inferior} UTC hasta {limite_superior} UTC")
 
-    # 2. Conexión y Query
+
     db = MySQLdb.connect(
         host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME"),
@@ -67,19 +67,19 @@ def generate_and_send_report():
         _enviar_mensaje_slack(mensaje_vacio, slack_channel)
         return
 
-    # 3. Crear CSV
+    #Crear CSV
     with open(nombre_reporte, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.DictWriter(file, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
 
-    # 4. Enviar Archivo a Slack (Usando la API Moderna v2)
+    #Enviar Archivo a Slack
     slack_token = os.getenv("SLACK_BOT_TOKEN") 
     slack_channel = os.getenv("SLACK_CHANNEL_ID")
 
     if slack_token and slack_channel:
         try:
-            # PASO 1: Pedir URL de subida segura a Slack
+            #Pedir URL de subida segura a Slack
             file_size = os.path.getsize(nombre_reporte)
             headers = {"Authorization": f"Bearer {slack_token}"}
             params = {"filename": nombre_reporte, "length": file_size}
@@ -94,7 +94,7 @@ def generate_and_send_report():
             upload_url = resp_url["upload_url"]
             file_id = resp_url["file_id"]
             
-            # PASO 2: Subir el archivo físico a la URL segura
+            #Subir el archivo físico a la URL segura
             with open(nombre_reporte, 'rb') as f:
                 upload_response = requests.post(upload_url, data=f)
                 
@@ -102,7 +102,7 @@ def generate_and_send_report():
                 log.error("Error al subir el archivo físico a Slack.")
                 sys.exit(1)
                 
-            # PASO 3: Publicar el archivo en el canal de Slack
+            #Publicar el archivo en el canal de Slack
             complete_url = "https://slack.com/api/files.completeUploadExternal"
             complete_data = {
                 "channel_id": slack_channel,
