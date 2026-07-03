@@ -1,0 +1,102 @@
+id: ml_api_flow
+namespace: wonderbrands.mercadolibre.shipping_label
+description: "Pipeline completo: Extrae de ML, clasifica SLA y prepara para Odoo"
+
+# Variables globales
+variables:
+  repo_url:  "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "kestra_bot"
+  db_name: "tools"
+  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+
+tasks:
+  # WorkingDirectory garantiza que el Clone y el Python compartan los archivos
+  - id: working_env_ml
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      
+      # Clonar el repositorio
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        # git keys
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: shipping_extractor_data_ml
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-etl:v1
+        #TaskRunnerejecuta en la imagen de Docker 
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        retry:
+        # Reintentos: Si falla, espera 60 segundos, intenta 3 veces
+          type: constant
+          interval: PT1M
+          maxAttempt: 3
+        env:
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+        commands:
+          # --- RUTA ACTUALIZADA A LA NUEVA ARQUITECTURA ---
+          - python processes/shipping_labels/mercadolibre/ml_mix_db_api_sla_orders.py
+
+      - id: shipping_inyector_labels_odoo_ml
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-etl:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        env:
+          ODOO_URL: "{{ vars.odoo_url }}"
+          ODOO_DB: "{{ vars.odoo_db }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+        commands:
+          # --- RUTA ---
+          - python processes/shipping_labels/mercadolibre/ml_odoo_injection_labels.py
+
+#dispardores
+triggers:
+  # Madrugada y tarde/noche (CDMX: 2,4,6 AM y 5,6,8,10 PM)
+  # Equivalente UTC: 8, 10, 12 y 23, 0, 2, 4 (pasan al día siguiente en UTC)
+  - id: madrugada_y_noche
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 0,2,4,8,10,12,23 * * *" 
+  
+  # Pico 6:30 AM (CDMX) -> Equivalente UTC: 12:30 PM
+  - id: hora_pico_630
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 12 * * *" 
+    
+  # Horas pico continuas (CDMX: 7:00 AM a 1:59 PM cada media hora)
+  # Equivalente UTC: 13:00 a 19:59
+  - id: horas_pico_matutinas
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0,30 13-19 * * *" 
+    
+  # Corte final (CDMX: 2:15 PM) -> Equivalente UTC: 20:15
+  - id: cierre_pico_1400
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "15 20 * * *"
+
+# Alertas en caso de fallo (Se ejecuta solo si las tareas anteriores fallan)
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *¡Fallo crítico en el Pipeline guías de MercadoLibre!* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+      }
