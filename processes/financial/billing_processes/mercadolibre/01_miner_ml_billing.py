@@ -20,7 +20,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
+#load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
 
 def xml_to_dict(element):
     """Convierte un elemento XML a dict recursivamente."""
@@ -59,7 +59,7 @@ def extract_ml_invoices():
     query = """
         SELECT o.order_id, o.date_closed, s.status as invoice_status, o.status as order_status_ml, IFNULL(s.retry_count, 0)
         FROM somos_reyes.ml_order_update o
-        LEFT JOIN finance.mkp_billing_staging s ON o.order_id = s.mkp_order_id
+        LEFT JOIN finance.mkp_billing_prod s ON o.order_id = s.mkp_order_id
         WHERE o.date_created >= GREATEST('2026-06-01 15:50:55', UTC_TIMESTAMP() - INTERVAL 7 DAY)
           AND o.status IN ('paid', 'closed') -- Solo aseguramos órdenes que ya procesaron pago
           AND (s.status IS NULL OR s.status = 'NO_INVOICE_IN_ML')
@@ -69,7 +69,7 @@ def extract_ml_invoices():
     query = """
         SELECT o.order_id, o.date_closed, s.status as invoice_status, o.status as order_status_ml, IFNULL(s.retry_count, 0)
         FROM somos_reyes.ml_order_update o
-        LEFT JOIN finance.mkp_billing_staging s ON o.order_id = s.mkp_order_id
+        LEFT JOIN finance.mkp_billing_prod s ON o.order_id = s.mkp_order_id
         WHERE o.date_created >= '2026-06-01 15:50:55' -- Fecha UTC -4 exacta del Paciente Cero
         AND o.status IN ('paid', 'closed') 
         AND (s.status IS NULL OR s.status = 'NO_INVOICE_IN_ML')
@@ -129,7 +129,7 @@ def extract_ml_invoices():
                 log.debug(f"Orden {order_id} sin factura aún ({int(hours_elapsed)} hrs desde el pago).")
 
             cursor.execute("""
-                INSERT INTO finance.mkp_billing_staging 
+                INSERT INTO finance.mkp_billing_prod 
                 (marketplace, mkp_order_id, status, retry_count) 
                 VALUES ('MERCADO_LIBRE', %s, %s, %s)
                 ON DUPLICATE KEY UPDATE status = VALUES(status), retry_count = VALUES(retry_count)
@@ -170,7 +170,7 @@ def extract_ml_invoices():
 
             # Inyectar XML y marcar como PENDING para el Loader
             cursor.execute("""
-                INSERT INTO finance.mkp_billing_staging 
+                INSERT INTO finance.mkp_billing_prod 
                 (marketplace, mkp_order_id, cfdi_uuid, total_amount, xml_data, raw_json, status, retry_count) 
                 VALUES ('MERCADO_LIBRE', %s, %s, %s, %s, %s, 'PENDING', %s)
                 ON DUPLICATE KEY UPDATE 

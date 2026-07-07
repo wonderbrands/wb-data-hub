@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
+#load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
 
 def load_ml_payments_to_odoo():
     # ── 1. Conexión a Base de Datos ──────────────────────────────
@@ -23,8 +23,8 @@ def load_ml_payments_to_odoo():
 
     cursor.execute("""
         SELECT p.*, b.odoo_so_name 
-        FROM finance.mkp_payments_staging p
-        JOIN finance.mkp_billing_staging b ON p.mkp_order_id = b.mkp_order_id
+        FROM finance.mkp_payments_prod p
+        JOIN finance.mkp_billing_prod b ON p.mkp_order_id = b.mkp_order_id
         WHERE p.status = 'PENDING'
     """)
     pending_payments = cursor.fetchall()
@@ -34,8 +34,8 @@ def load_ml_payments_to_odoo():
         return
 
     # ── 2. Conexión a Odoo 18 ────────────────────────────────────
-    odoo_url = os.getenv("odoo_url_testV18")
-    odoo_db = os.getenv("odoo_db_testV18")
+    odoo_url = os.getenv("odoo_urlV18")
+    odoo_db = os.getenv("odoo_dbV18")
     odoo_user = os.getenv("odoo_user_dataV18")
     odoo_pwd = os.getenv("odoo_password_dataV18")
     
@@ -93,12 +93,12 @@ def load_ml_payments_to_odoo():
             log.info(f"✅ Cobro aplicado y conciliado nativamente para {so_name} (IVA trasladado con éxito)")
 
             # F) Actualizar MySQL
-            cursor.execute("UPDATE finance.mkp_payments_staging SET status = 'ODOO_PAID', processed_at = NOW() WHERE id = %s", (record['id'],))
+            cursor.execute("UPDATE finance.mkp_payments_prod SET status = 'ODOO_PAID', processed_at = NOW() WHERE id = %s", (record['id'],))
             db.commit()
 
         except Exception as e:
             db.rollback()
-            cursor.execute("UPDATE finance.mkp_payments_staging SET status = 'ERROR', error_log = %s WHERE id = %s", (str(e), record['id']))
+            cursor.execute("UPDATE finance.mkp_payments_prod SET status = 'ERROR', error_log = %s WHERE id = %s", (str(e), record['id']))
             db.commit()
             log.error(f"❌ Error en cobro de {so_name}: {e}")
 

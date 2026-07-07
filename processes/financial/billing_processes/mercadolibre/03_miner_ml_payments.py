@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
+#load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
 
 def extract_ml_payments():
     # ── 1. Conexión a BD ─────────────────────────────────────────
@@ -40,8 +40,8 @@ def extract_ml_payments():
     # Buscamos en Staging las facturas exitosas que aún no tienen registro en pagos
     cursor.execute("""
         SELECT b.mkp_order_id 
-        FROM finance.mkp_billing_staging b
-        LEFT JOIN finance.mkp_payments_staging p ON b.mkp_order_id = p.mkp_order_id
+        FROM finance.mkp_billing_prod b
+        LEFT JOIN finance.mkp_payments_prod p ON b.mkp_order_id = p.mkp_order_id
         WHERE b.status in ('ODOO_INVOICED', 'ALREADY_ODOO_INVOICED') AND p.mkp_order_id IS NULL;
     """)
     orders = cursor.fetchall()
@@ -100,7 +100,7 @@ def extract_ml_payments():
                     # PASO C: Validar si el dinero ya está liberado hoy
                     if date_rel_utc <= datetime.utcnow():
                         cursor.execute("""
-                            INSERT IGNORE INTO finance.mkp_payments_staging 
+                            INSERT IGNORE INTO finance.mkp_payments_prod 
                             (marketplace, mkp_order_id, payment_id, amount, date_released, status)
                             VALUES ('MERCADO_LIBRE', %s, %s, %s, %s, 'PENDING')
                         """, (order_id, payment_id, data_mp['transaction_amount'], date_rel))

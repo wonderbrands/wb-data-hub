@@ -11,21 +11,21 @@ __description__ = """
 
 - Facturación individual (1 Factura por cada Orden de Venta).
 - Política de facturación basada en Cantidad Ordenada.
-- Se fuerza el Impuesto de IVA Cobrado para Marketplaces (ID 37).
+- Se fuerza el Impuesto de IVA Cobrado para Marketplaces (ID 38).
 - * EXCLUSIÓN DE ML como parte de la facturación a partir del 1ro de junio 2026. *
 """
 
 #dotenv_path = "/var/lib/jenkins/m1/.env"
 #credentials_json = '/var/lib/jenkins/m1/credenciales_reportes.json'
 
-dotenv_path = 'C:/Users/Sergio Gil Guerrero/Documents/WonderBrands/Repos/wonderbrands/.env'
-credentials_json = r'C:\Users\Sergio Gil Guerrero\PycharmProjects\Herramientas propias\Invoices\google_cred.json'
+#dotenv_path = 'C:/Users/Sergio Gil Guerrero/Documents/WonderBrands/Repos/wonderbrands/.env'
+credentials_json = '/var/lib/credentials/credenciales_reportes.json'
 
-load_dotenv(dotenv_path)
+#load_dotenv()
 
 # --- CONFIGURACIÓN CONTABLE GLOBAL ---
 # ID del impuesto "IVA 16% Marketplaces" (Apunta a IVA Cobrado, sin Base de Efectivo)
-TAX_ID_MARKETPLACES = 37 # 37 staging / 38 prod 
+TAX_ID_MARKETPLACES = 38 # 37 staging / 38 prod 
 PARTNER_ID_PUBLICO_GENERAL = 13436 # 13436 staging / 13436 prod
 
 # Subir archivo a Google Sheets
@@ -112,8 +112,8 @@ def main():
 def run():
     global uid, models, db_name, password, today_date, orders_list_not_serialize_message, invoice_date_first_of_month, last_day_of_year_flag
 
-    server_url = os.getenv('odoo_url_testV18')
-    db_name = os.getenv('odoo_db_testV18')
+    server_url = os.getenv('odoo_urlV18')
+    db_name = os.getenv('odoo_dbV18')
     username = os.getenv('odoo_user_dataV18')
     password = os.getenv('odoo_password_dataV18')
 

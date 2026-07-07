@@ -12,10 +12,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # Cargar variables de entorno
-load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
+#load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
 
 # IVA(16%) Marketplaces
-TAX_ID_MARKETPLACES = 37 # 37 staging / 38 prod 
+TAX_ID_MARKETPLACES = 38 # 37 staging / 38 prod 
 
 def get_account_id(models, db, uid, pwd, code):
     """Busca el ID interno de Odoo para una cuenta contable por su código."""
@@ -40,9 +40,9 @@ def load_ml_invoices_to_odoo():
 
     # Buscar registros pendientes
     cursor.execute("""
-        SELECT * FROM finance.mkp_billing_staging 
+        SELECT * FROM finance.mkp_billing_prod 
         WHERE marketplace = 'MERCADO_LIBRE' AND status = 'PENDING' 
-        ORDER BY id ASC LIMIT 100
+        ORDER BY id ASC LIMIT 1
     """)
     pending_records = cursor.fetchall()
     
@@ -53,8 +53,8 @@ def load_ml_invoices_to_odoo():
         return
 
     # ── 2. Conexión a Odoo 18 ────────────────────────────────────
-    odoo_url = os.getenv("odoo_url_testV18")
-    odoo_db = os.getenv("odoo_db_testV18")
+    odoo_url = os.getenv("odoo_urlV18")
+    odoo_db = os.getenv("odoo_dbV18")
     odoo_user = os.getenv("odoo_user_dataV18")
     odoo_pwd = os.getenv("odoo_password_dataV18")
     
@@ -113,7 +113,7 @@ def load_ml_invoices_to_odoo():
             if existing_invoice:
                 log.warning(f"Bucle evitado: La orden {so['name']} ({mkp_order}) YA TIENE la factura {existing_invoice[0]['name']} en Odoo.")
                 # Actualizamos staging para no volver a procesarla
-                cursor.execute("UPDATE finance.mkp_billing_staging SET status = 'ALREADY_ODOO_INVOICED', processed_at = NOW() WHERE id = %s", (record['id'],))
+                cursor.execute("UPDATE finance.mkp_billing_prod SET status = 'ALREADY_ODOO_INVOICED', processed_at = NOW() WHERE id = %s", (record['id'],))
                 db.commit()
                 continue # Saltamos a la siguiente orden de la lista
             # -------------------------------------------------------------------------
@@ -290,7 +290,7 @@ def load_ml_invoices_to_odoo():
 
             # H) Marcar como EXITOSO en Staging DB
             cursor.execute("""
-                UPDATE finance.mkp_billing_staging 
+                UPDATE finance.mkp_billing_prod 
                 SET status = 'ODOO_INVOICED', odoo_so_name = %s, processed_at = NOW() 
                 WHERE id = %s
             """, (so['name'], record['id']))
@@ -303,7 +303,7 @@ def load_ml_invoices_to_odoo():
             # En caso de error, marcamos el registro pero el script continúa con el siguiente
             db.rollback()
             cursor.execute("""
-                UPDATE finance.mkp_billing_staging 
+                UPDATE finance.mkp_billing_prod 
                 SET status = 'ERROR', error_log = %s, processed_at = NOW() 
                 WHERE id = %s
             """, (str(e), record['id']))
