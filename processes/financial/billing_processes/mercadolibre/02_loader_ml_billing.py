@@ -36,13 +36,13 @@ def load_ml_invoices_to_odoo():
         cursor = db.cursor(dictionary=True)
     except Exception as e:
         log.error(f"Error conectando a BD: {e}")
-        return
+        return 0
 
     # Buscar registros pendientes
     cursor.execute("""
         SELECT * FROM finance.mkp_billing_prod 
         WHERE marketplace = 'MERCADO_LIBRE' AND status = 'PENDING' 
-        ORDER BY id ASC LIMIT 1
+        ORDER BY id ASC LIMIT 100
     """)
     pending_records = cursor.fetchall()
     
@@ -50,7 +50,7 @@ def load_ml_invoices_to_odoo():
         log.info("No hay facturas pendientes de inyectar en este lote.")
         cursor.close()
         db.close()
-        return
+        return 0
 
     # ── 2. Conexión a Odoo 18 ────────────────────────────────────
     odoo_url = os.getenv("odoo_urlV18")
@@ -64,7 +64,7 @@ def load_ml_invoices_to_odoo():
         models = xmlrpc.client.ServerProxy(f'{odoo_url}/xmlrpc/2/object')
     except Exception as e:
         log.error(f"Error de conexión con Odoo XML-RPC: {e}")
-        return
+        return 0
     
     # ── 3. Pre-carga de Cuentas y Datos Maestros ─────────────────
     try:
@@ -77,7 +77,7 @@ def load_ml_invoices_to_odoo():
         
     except Exception as e:
         log.error(str(e))
-        return
+        return 0
 
     log.info(f"Procesando {len(pending_records)} registros hacia Odoo...")
 
@@ -316,5 +316,22 @@ def load_ml_invoices_to_odoo():
 
 if __name__ == "__main__":
     log.info("=== Iniciando Inyección de Facturas ML a Odoo ===")
-    load_ml_invoices_to_odoo()
-    log.info("=== Proceso de Inyección Finalizado ===")
+    MAX_EMPTY_RUNS = 5
+    SLEEP_SECONDS = 10
+
+    try:
+        empty_runs = 0
+        while empty_runs < MAX_EMPTY_RUNS:
+            result = load_ml_invoices_to_odoo()
+
+            if result == 0:
+                empty_runs += 1
+            else:
+                empty_runs = 0  # Reinicia si se procesó algo
+
+            time.sleep(SLEEP_SECONDS)
+
+        log.info("=== Proceso de Inyección Finalizado ===")
+
+    except Exception:
+        log.exception("Error general durante la inyección de facturas.")

@@ -1,0 +1,53 @@
+id: daily_dispatch_alerts
+namespace: wonderbrands.finance
+description: "Genera y envía el reporte diario de inconsistencias operativas (salidas pendientes y discrepancias)."
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 14 * * 1-5" 
+    recoverMissedSchedules: NONE
+
+tasks:
+  - id: generate_csv_report
+    type: io.kestra.plugin.scripts.python.Commands
+    # Se eliminó warningOnStdErr: false
+    env:
+       DB_HOST: "{{ secret('DB_HOST') }}"
+       DB_USER: "{{ secret('DB_USER') }}"
+       DB_PASSWORD: "{{ secret('DB_PASSWORD') }}"
+       DB_NAME: "{{ secret('DB_NAME') }}"
+       odoo_urlV18: "{{ secret('odoo_urlV18') }}"
+       odoo_dbV18: "{{ secret('odoo_dbV18') }}"
+       odoo_user_dataV18: "{{ secret('odoo_user_dataV18')}}"
+       odoo_password_dataV18: "{{ secret('odoo_password_dataV18')}}"
+    commands:
+      - python processes/financial/billing_processes/mercadolibre/dispatchs_alerts.py
+    outputFiles:
+      - "Reporte_Inconsistencias_*.csv"
+
+  - id: send_finance_email
+    type: io.kestra.plugin.email.MailSend
+    host: smtp.gmail.com 
+    port: 587
+    transportStrategy: SMTP_TLS
+    username: "{{ secret('SMTP_USERNAME') }}" 
+    password: "{{ secret('SMTP_PASSWORD') }}" 
+    from: "data@wonderbrands.co"
+    to: 
+      - "sergio@wonderbrands.co"
+    subject: "⚠️ Reporte diario: Inconsistencias de despacho y facturación"
+    htmlTextContent: |
+      <h3>Reporte Diario de Control de Despachos</h3>
+      <p>Buen día, equipo:</p>
+      <p>Adjunto encontrarán el reporte automatizado de inconsistencias detectadas en Odoo correspondiente al día de hoy.</p>
+      <p>Este reporte audita los siguientes puntos de control (Roadmap - Paso 5):</p>
+      <ul>
+        <li>Órdenes confirmadas hace más de 5 días sin despacho físico.</li>
+        <li>Órdenes con mercancía facturada, pero sin salida de almacén.</li>
+        <li>Órdenes marcadas como entregadas en Mercado Libre, pero aún pendientes en Odoo.</li>
+      </ul>
+      <p>Saludos,<br><b>Data team</b></p>
+    attachments:
+      - uri: "{{ outputs.generate_csv_report.outputFiles | first }}"
+        name: "Dispatch_Inconsistencies_Report.csv"
