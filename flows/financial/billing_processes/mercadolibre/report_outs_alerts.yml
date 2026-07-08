@@ -2,6 +2,15 @@ id: daily_dispatch_alerts
 namespace: wonderbrands.finance
 description: "Genera y envía el reporte diario de inconsistencias operativas (salidas pendientes y discrepancias)."
 
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+
 triggers:
   - id: schedule
     type: io.kestra.plugin.core.trigger.Schedule
@@ -9,45 +18,58 @@ triggers:
     recoverMissedSchedules: NONE
 
 tasks:
-  - id: generate_csv_report
-    type: io.kestra.plugin.scripts.python.Commands
-    # Se eliminó warningOnStdErr: false
-    env:
-       DB_HOST: "{{ secret('DB_HOST') }}"
-       DB_USER: "{{ secret('DB_USER') }}"
-       DB_PASSWORD: "{{ secret('DB_PASSWORD') }}"
-       DB_NAME: "{{ secret('DB_NAME') }}"
-       odoo_urlV18: "{{ secret('odoo_urlV18') }}"
-       odoo_dbV18: "{{ secret('odoo_dbV18') }}"
-       odoo_user_dataV18: "{{ secret('odoo_user_dataV18')}}"
-       odoo_password_dataV18: "{{ secret('odoo_password_dataV18')}}"
-    commands:
-      - python processes/financial/billing_processes/mercadolibre/dispatchs_alerts.py
-    outputFiles:
-      - "Reporte_Inconsistencias_*.csv"
+  - id: working_env_alerts
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
 
-  - id: send_finance_email
-    type: io.kestra.plugin.email.MailSend
-    host: smtp.gmail.com 
-    port: 587
-    transportStrategy: SMTP_TLS
-    username: "{{ secret('SMTP_USERNAME') }}" 
-    password: "{{ secret('SMTP_PASSWORD') }}" 
-    from: "data@wonderbrands.co"
-    to: 
-      - "sergio@wonderbrands.co"
-    subject: "⚠️ Reporte diario: Inconsistencias de despacho y facturación"
-    htmlTextContent: |
-      <h3>Reporte Diario de Control de Despachos</h3>
-      <p>Buen día, equipo:</p>
-      <p>Adjunto encontrarán el reporte automatizado de inconsistencias detectadas en Odoo correspondiente al día de hoy.</p>
-      <p>Este reporte audita los siguientes puntos de control (Roadmap - Paso 5):</p>
-      <ul>
-        <li>Órdenes confirmadas hace más de 5 días sin despacho físico.</li>
-        <li>Órdenes con mercancía facturada, pero sin salida de almacén.</li>
-        <li>Órdenes marcadas como entregadas en Mercado Libre, pero aún pendientes en Odoo.</li>
-      </ul>
-      <p>Saludos,<br><b>Data team</b></p>
-    attachments:
-      - uri: "{{ outputs.generate_csv_report.outputFiles | first }}"
-        name: "Dispatch_Inconsistencies_Report.csv"
+      - id: generate_csv_report
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-etl:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        env:
+           DB_HOST: "{{ vars.db1_host }}"
+           DB_USER: "{{ vars.db_user }}"
+           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+           DB_NAME: "{{ vars.db_name }}"
+           odoo_urlV18: "{{ vars.odoo_url }}"
+           odoo_dbV18: "{{ vars.odoo_db }}"
+           odoo_user_dataV18: "{{ secret('odoo_user_dataV18') }}"
+           odoo_password_dataV18: "{{ secret('odoo_password_dataV18') }}"
+        commands:
+          - python processes/financial/billing_processes/mercadolibre/dispatchs_alerts.py
+        outputFiles:
+          - "Reporte_Inconsistencias_*.csv"
+
+      - id: send_finance_email
+        type: io.kestra.plugin.email.MailSend
+        host: smtp.gmail.com 
+        port: 587
+        transportStrategy: SMTP_TLS
+        username: "{{ secret('SMTP_USERNAME') }}" 
+        password: "{{ secret('SMTP_PASSWORD') }}" 
+        from: "data@wonderbrands.co"
+        to: "sergio@wonderbrands.co"
+        subject: "⚠️ Reporte diario: Inconsistencias de despacho y facturación"
+        htmlTextContent: |
+          <h3>Reporte Diario de Control de Despachos</h3>
+          <p>Buen día, equipo:</p>
+          <p>Adjunto encontrarán el reporte automatizado de inconsistencias detectadas en Odoo correspondiente al día de hoy.</p>
+          <p>Este reporte audita los siguientes puntos de control (Roadmap - Paso 5):</p>
+          <ul>
+            <li>Órdenes confirmadas hace más de 5 días sin despacho físico.</li>
+            <li>Órdenes con mercancía facturada, pero sin salida de almacén.</li>
+            <li>Órdenes marcadas como entregadas en Mercado Libre, pero aún pendientes en Odoo.</li>
+          </ul>
+          <p>Saludos,<br><b>Data team</b></p>
+        attachments:
+          - uri: "{{ outputs.generate_csv_report.outputFiles.values() | first }}"
+            name: "Dispatch_Inconsistencies_Report.csv"
