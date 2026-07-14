@@ -47,35 +47,60 @@ def get_ml_token(db):
     return str(cursor.fetchone()[0])
 
 
+class TimeoutTransport(xmlrpc.client.SafeTransport):
+    """Transporte personalizado para forzar un timeout en XML-RPC."""
+    def __init__(self, timeout=60, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.timeout = timeout
+
+    def make_connection(self, host):
+        # Python 3.8+ permite pasar el timeout en la creación de la conexión HTTPS
+        conn = super().make_connection(host)
+        conn.timeout = self.timeout
+        return conn
+
 class OdooModelProxy:
     """
-    Proxy para envolver las llamadas a Odoo con reintentos automáticos
-    y renovación de sesión TLS en caso de 502 Bad Gateway / ProtocolError.
+    Proxy para envolver las llamadas a Odoo con reintentos automáticos,
+    renovación de sesión TLS y un TIMEOUT estricto para evitar procesos colgados.
     """
-    def __init__(self, url, db, user, pwd):
+    def __init__(self, url, db, user, pwd, timeout=45):
         self.url = url
         self.db = db
         self.user = user
         self.pwd = pwd
-        self.common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common')
+        self.timeout = timeout
+        
+        # Instanciamos un transporte con timeout para evitar que la conexión se quede zombi
+        transport = TimeoutTransport(timeout=self.timeout)
+        self.common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', transport=transport)
         self.uid = self.common.authenticate(db, user, pwd, {})
-        self.models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object')
+        
+        transport_models = TimeoutTransport(timeout=self.timeout)
+        self.models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', transport=transport_models)
 
     def reauthenticate(self):
         log.info("Cerrando sesión TLS y abriendo una nueva conexión con Odoo...")
-        self.common = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/common')
+        transport = TimeoutTransport(timeout=self.timeout)
+        self.common = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/common', transport=transport)
         self.uid = self.common.authenticate(self.db, self.user, self.pwd, {})
-        self.models = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object')
+        
+        transport_models = TimeoutTransport(timeout=self.timeout)
+        self.models = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object', transport=transport_models)
 
-    def execute_kw(self, db, uid, pwd, model, method, args, kwargs=None, max_retries=3, delay=3):
+    def execute_kw(self, db, uid, pwd, model, method, args, kwargs=None, max_retries=3, delay=2):
         for attempt in range(1, max_retries + 1):
             try:
                 if kwargs is not None:
                     return self.models.execute_kw(self.db, self.uid, self.pwd, model, method, args, kwargs)
                 else:
                     return self.models.execute_kw(self.db, self.uid, self.pwd, model, method, args)
-            except xmlrpc.client.ProtocolError as e:
-                log.warning(f"ProtocolError ({e.errcode} {e.errmsg}) en Odoo [{model}.{method}]. Intento {attempt}/{max_retries}...")
+            except xmlrpc.client.Fault as e:
+                # Errores de negocio de Odoo no se reintentan
+                raise e
+            except (xmlrpc.client.ProtocolError, TimeoutError, OSError) as e:
+                # Capturamos ProtocolError (502), TimeoutError y caídas de socket (OSError)
+                log.warning(f"Error de red/Timeout en Odoo [{model}.{method}]: {str(e)}. Intento {attempt}/{max_retries}...")
                 if attempt == max_retries:
                     raise e
                 time.sleep(delay * attempt)
@@ -92,7 +117,6 @@ class OdooModelProxy:
                     self.reauthenticate()
                 except Exception:
                     pass
-
 
 def authenticate_odoo():
     proxy = OdooModelProxy(ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PWD)
