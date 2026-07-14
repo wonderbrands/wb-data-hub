@@ -20,7 +20,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-#load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
+load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
 
 def xml_to_dict(element):
     """Convierte un elemento XML a dict recursivamente."""
@@ -120,10 +120,10 @@ def extract_ml_invoices():
 
             hours_elapsed = (datetime.utcnow() - date_closed_obj).total_seconds() / 3600
             
-            # Si pasaron más de 72 horas, ML falló definitivamente
-            if hours_elapsed > 72:
+            # Si pasaron más de 720 horas = '30 DIAS', ML falló definitivamente
+            if hours_elapsed > 720:
                 new_status = 'NEVER_BILLED_BY_ML'
-                log.warning(f"Orden {order_id} excedió 72 hrs. Marcada como NEVER_BILLED_BY_ML.")
+                log.warning(f"Orden {order_id} excedió 720 hrs. Marcada como NEVER_BILLED_BY_ML.")
             else:
                 new_status = 'NO_INVOICE_IN_ML'
                 log.debug(f"Orden {order_id} sin factura aún ({int(hours_elapsed)} hrs desde el pago).")

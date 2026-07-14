@@ -1,0 +1,495 @@
+from datetime import datetime, timedelta
+import xmlrpc.client
+import time as tm
+import logging
+import gspread
+import os
+import mysql.connector
+from mysql.connector import Error
+from dotenv import load_dotenv
+
+__description__ = """
+                **** V18 - FACTURACIÓN 1 A 1 OPTIMIZADA CON AUDITORÍA BD & RESUMEN ****
+"""
+
+dotenv_path = 'C:/Users/Sergio Gil Guerrero/Documents/WonderBrands/Repos/wonderbrands/.env'
+load_dotenv(dotenv_path)
+credentials_json = r'C:\Users\Sergio Gil Guerrero\PycharmProjects\Herramientas propias\Invoices\google_cred.json'
+
+# --- CONFIGURACIÓN CONTABLE GLOBAL ---
+TAX_ID_MARKETPLACES = 38
+PARTNER_ID_PUBLICO_GENERAL = 13436
+
+# =======================================================================
+# CONFIGURACIÓN DE PRUEBAS 
+TEST_ORDER_LIMIT = 5  # Cambia a 10, 100, o ponlo en None para correr histórico.
+# =======================================================================
+
+# --- CONFIGURACIÓN BD AUDITORÍA ---
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_USER = os.getenv('DB_USER', 'root')
+DB_PASS = os.getenv('DB_PASSWORD', '')
+DB_NAME = os.getenv('DB_NAME', 'finance')
+
+def get_db_connection():
+    try:
+        return mysql.connector.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME
+        )
+    except Error as e:
+        logging.error(f"Error conectando a la BD de auditoría: {e}")
+        return None
+
+def insert_audit_record(order_name, order_id, team_name):
+    """Inserta la orden o la actualiza si ya existe (Upsert), incrementando los intentos."""
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        cursor = conn.cursor()
+        
+        # INSERT ... ON DUPLICATE KEY UPDATE
+        query = """
+            INSERT INTO finance.billing_audit_log (odoo_order_name, odoo_order_id, team_name, status, attempt_count) 
+            VALUES (%s, %s, %s, 'PROCESSING', 1)
+            ON DUPLICATE KEY UPDATE 
+                status = 'PROCESSING',
+                attempt_count = attempt_count + 1,
+                updated_at = CURRENT_TIMESTAMP
+        """
+        cursor.execute(query, (order_name, order_id, team_name))
+        conn.commit()
+        
+        # Recuperamos el ID del registro para que update_audit_record sepa cuál actualizar
+        cursor.execute("SELECT id FROM finance.billing_audit_log WHERE odoo_order_id = %s", (order_id,))
+        record = cursor.fetchone()
+        
+        return record[0] if record else None
+        
+    except Error as e:
+        logging.error(f"Error insertando/actualizando auditoría para {order_name}: {e}")
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+    return None
+
+def update_audit_record(record_id, status, error_type='NONE', error_log=None, invoice_name=None, invoice_id=None, automation_status='NONE'):
+    if not record_id: return
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cursor = conn.cursor()
+        invoiced_at = datetime.now() if status == 'SUCCESS' else None
+        query = """UPDATE finance.billing_audit_log 
+                   SET status = %s, error_type = %s, error_log = %s, 
+                       invoice_name = %s, invoice_id = %s, invoice_automation_status = %s, invoiced_at = %s
+                   WHERE id = %s"""
+        cursor.execute(query, (status, error_type, error_log, invoice_name, invoice_id, automation_status, invoiced_at, record_id))
+        conn.commit()
+    except Error as e:
+        logging.error(f"Error actualizando auditoría ID {record_id}: {e}")
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+def insert_log_in_sheets(_path, file_id):
+    print("Actualizando GOOGLE DRIVE...")
+    try:
+        gc = gspread.service_account(filename=credentials_json)
+        sh = gc.open_by_key(file_id)
+        worksheet = sh.worksheet('log')
+        log_filename = _path
+        with open(log_filename, 'r', encoding='utf-8') as file:
+            lines = file.readlines()
+            lines.reverse() 
+        current_data = worksheet.get_all_values()
+        updated_data = [[line.strip()] for line in lines] + current_data
+        worksheet.clear()
+        worksheet.update(values=updated_data, range_name='A1')
+    except Exception as e:
+        print(f"Error subiendo log a Sheets: {e}")
+
+def delete_file(file_path):
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+UTC_local = -6
+today_date_datetime = datetime.now()
+today_date = today_date_datetime.strftime("%Y-%m-%d %H:%M:%S")
+today_date_for_log = today_date_datetime + timedelta(hours=UTC_local)
+today_date_for_log = today_date_for_log.strftime("%Y-%m-%d -- %H-%M-%S")
+
+# --- CONFIGURACIÓN DE LOGS (SILENCIANDO RUIDO EXTERNO) ---
+for noisy_logger in ['urllib3', 'google.auth', 'googleapiclient', 'gspread', 'google.auth.transport.requests']:
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG) 
+# Dejamos el archivo en INFO para que Sheets solo reciba el resumen ejecutivo
+file_handler = logging.FileHandler(f'{today_date_for_log}.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+logging.Formatter.converter = lambda *args: tm.localtime(tm.time() + UTC_local * 3600)
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+class TimeoutTransport(xmlrpc.client.Transport):
+    def __init__(self, timeout=300):
+        super().__init__()
+        self.timeout = timeout
+
+    def make_connection(self, host):
+        conn = super().make_connection(host)
+        conn.timeout = self.timeout
+        return conn
+
+def get_chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+logging.info('================================================================')
+logging.info('BIENVENIDO AL PROCESO DE FACTURACIÓN PARA MARKETPLACES (1 a 1)')
+if TEST_ORDER_LIMIT:
+    logging.info(f'MODO PRUEBA ACTIVADO: Limite de {TEST_ORDER_LIMIT} ordenes VALIDAS')
+logging.info('================================================================')
+
+def main():
+    conections_count = 0
+    while True:
+        try:
+            run()
+            break  
+        except ConnectionResetError as e:
+            conections_count += 1
+            if conections_count < 3:
+                logging.error(f"Error de conexion: {e}. Reintentando...")
+                tm.sleep(5)  
+            else:
+                break
+
+def run():
+    global uid, models, db_name, password, today_date, orders_list_not_serialize_message, invoice_date_first_of_month, last_day_of_year_flag
+
+    server_url = os.getenv('odoo_urlV18')
+    db_name = os.getenv('odoo_dbV18')
+    username = os.getenv('odoo_user_dataV18')
+    password = os.getenv('odoo_password_dataV18')
+
+    transport = TimeoutTransport(timeout=300)
+    common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(server_url), transport=transport, allow_none=True, use_datetime=True)
+    uid = common.authenticate(db_name, username, password, {})
+    models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(server_url), transport=transport, allow_none=True, use_datetime=True)
+    logging.info('Conexion con Odoo establecida')
+
+    formated_date = today_date.split(' ')[0].split('-') 
+
+    if int(formated_date[2]) == 1: 
+        start_date = (today_date_datetime - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d")  
+        end_date = (today_date_datetime - timedelta(days=1)).strftime("%Y-%m-%d")  
+        delta_days = False
+        invoice_date_first_of_month = end_date
+        last_day_of_year_flag = True if end_date.endswith("-12-31") else False
+    else: 
+        start_date = today_date_datetime.replace(day=1).strftime("%Y-%m-%d")  
+        end_date = today_date.split(' ')[0]  
+        delta_days = True
+        invoice_date_first_of_month = None
+        last_day_of_year_flag = False
+
+    logging.info("Iniciando busqueda de ordenes con mensaje 'serialize'...")
+    t0 = tm.time()
+    orders_list_not_serialize_message = search_sales_with_message(start_date, end_date)
+    logging.info(f"Terminado en {round(tm.time()-t0, 2)}s. Encontradas: {len(orders_list_not_serialize_message)}")
+
+    logging.info("Iniciando busqueda de stock insuficiente...")
+    t1 = tm.time()
+    search_sales_with_stock_insufficient_message(start_date, end_date)
+    logging.info(f"Terminado en {round(tm.time()-t1, 2)}s.")
+
+    all_records = []
+    date_range = generate_date_range(start_date, end_date)
+
+    logging.info(f"Extrayendo ordenes diarias desde {start_date} hasta {end_date}...")
+    for number_day, single_date in enumerate(date_range):
+        t_day = tm.time()
+        day_start, day_end = adjust_to_cdmx_time(single_date)
+        day_records = fetch_records(day_start, day_end)
+        all_records.extend(day_records)
+        logging.debug(f"Dia {number_day + 1} ({single_date.strftime('%Y-%m-%d')}): {len(day_records)} registros recuperados en {round(tm.time()-t_day, 2)}s")
+
+    logging.info(f'Total de registros extraidos antes de filtros: {len(all_records)}')
+    process_records(all_records, delta_days)
+    logging.info('PROCESO DE FACTURACION TERMINADO')
+
+def generate_date_range(start_date, end_date):
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    return [start_dt + timedelta(days=x) for x in range((end_dt - start_dt).days + 1)]
+
+def get_current_year_cdmx():
+    current_year = datetime.now().year
+    first_day_of_year = datetime(current_year, 1, 1)
+    last_day_of_year = datetime(current_year, 12, 31, 23, 59, 59)
+    first_day_of_year_cdmx, last_day_of_year_cdmx = adjust_to_cdmx_time(first_day_of_year, last_day_of_year)
+    if last_day_of_year_flag:
+        return first_day_of_year_cdmx.replace(year=first_day_of_year_cdmx.year - 1), last_day_of_year_cdmx.replace(year=last_day_of_year_cdmx.year - 1)
+    return first_day_of_year_cdmx, last_day_of_year_cdmx
+
+def adjust_to_cdmx_time(first_date, last_day = None):
+    start_date = first_date - timedelta(hours=UTC_local)
+    end_date = start_date + timedelta(hours=24) if not last_day else last_day - timedelta(hours=UTC_local)
+    return start_date, end_date
+
+def fetch_records(day_start, day_end):
+    so_domain = [('invoice_status', '=', 'to invoice'), ('locked', '=', 'True'), ('date_order', '>=', day_start), ('date_order', '<=', day_end)]
+    try:
+        return models.execute_kw(db_name, uid, password, 'sale.order', 'search_read', [so_domain])
+    except Exception as e:
+        logging.error(f"Error fetch_records: {e}")
+        return []
+
+def process_records(records, delta_days):
+    global today_date, invoice_date_first_of_month, procees_invoices_start_time
+    today_date = datetime.strptime(today_date, '%Y-%m-%d %H:%M:%S') if isinstance(today_date, str) else today_date
+
+    teams_dict = {}
+    cutoff_ml = datetime(2026, 6, 1, 0, 0, 0)
+    
+    skipped_ml = 0
+    skipped_grace = 0
+
+    for record in records:
+        if record['invoice_status'] == 'to invoice': 
+            order_date_str = record.get('date_order', False)
+            if not order_date_str: continue
+            
+            real_order_date = datetime.strptime(order_date_str, '%Y-%m-%d %H:%M:%S')
+            difference_days = (today_date - real_order_date).days
+            team_name = record['team_id'][1]
+
+            if 'MercadoLibre' in team_name and real_order_date >= cutoff_ml: 
+                skipped_ml += 1
+                continue
+
+            grace_days = 1 
+            if not delta_days or (delta_days and difference_days >= grace_days):
+                teams_dict.setdefault(team_name, []).append(record)
+            else:
+                skipped_grace += 1
+
+    logging.info(f"Filtros: {skipped_ml} excluidas por ML, {skipped_grace} excluidas por periodo de gracia (1 dia).")
+
+    walmart_removed = teams_dict.pop('Team_Walmart', None)
+    facebook_removed = teams_dict.pop('Salderos / Facebook', None) 
+    
+    if walmart_removed: logging.info(f"Excluidas {len(walmart_removed)} de Team_Walmart.")
+    if facebook_removed: logging.info(f"Excluidas {len(facebook_removed)} de Salderos / Facebook.")
+    
+    # ======================  TEST ==============================================
+    tiktok_removed = teams_dict.pop('Team_TikTok', None)
+    amazon_removed = teams_dict.pop('Team_Amazon', None) 
+    
+    if tiktok_removed: logging.info(f"Excluidas {len(tiktok_removed)} de Team_TikTok.")
+    if amazon_removed: logging.info(f"Excluidas {len(amazon_removed)} de Team_Amazon.")
+    # ====================================================================
+    
+
+    if TEST_ORDER_LIMIT:
+        valid_count = 0
+        for team, orders in list(teams_dict.items()):
+            remaining = TEST_ORDER_LIMIT - valid_count
+            if remaining <= 0:
+                teams_dict[team] = []
+            elif len(orders) > remaining:
+                teams_dict[team] = orders[:remaining]
+                valid_count += remaining
+            else:
+                valid_count += len(orders)
+        
+        teams_dict = {k: v for k, v in teams_dict.items() if v}
+        logging.info(f"Limite aplicado: Se procesaran {valid_count} ordenes validas en total.")
+        
+    procees_invoices_start_time = tm.time()
+    for team_name, orders_list in teams_dict.items():
+        logging.info(f"Procesando equipo: {team_name} ({len(orders_list)} ordenes)")
+        # Recuperamos cuántas facturas se lograron crear de este equipo
+        invoiced_qty = execute_invoice(team_name, orders_list)
+        
+        if invoiced_qty > 0:
+            logging.info(f"-> {invoiced_qty} ordenes facturadas exitosamente de {team_name}.")
+
+def execute_invoice(team_name, orders_list):
+    if not orders_list: return 0
+        
+    team_id = orders_list[0]['team_id'][0] 
+    total_orders = len(orders_list)
+    success_count = 0
+
+    order_names = [order['name'] for order in orders_list]
+    existing_invoices_data = []
+    for chunk in get_chunks(order_names, 500):
+        data = models.execute_kw(db_name, uid, password, 'account.move', 'search_read', 
+                                    [[('invoice_origin', 'in', chunk), ('move_type', '=', 'out_invoice'), ('state', '!=', 'cancel')]], 
+                                    {'fields': ['invoice_origin', 'name']})
+        existing_invoices_data.extend(data)
+    
+    invoiced_origins = {inv['invoice_origin']: inv['name'] for inv in existing_invoices_data if inv['invoice_origin']}
+
+    all_line_ids = [line_id for order in orders_list for line_id in order['order_line']]
+    all_lines_data = []
+    for chunk in get_chunks(all_line_ids, 1000):
+        data = models.execute_kw(db_name, uid, password, 'sale.order.line', 'search_read', [[('id', 'in', chunk)]])
+        all_lines_data.extend(data)
+        
+    lines_dict = {line['id']: line for line in all_lines_data}
+
+    for index, order in enumerate(orders_list): 
+        order_name = order['name']
+        order_id = order['id']
+        
+        audit_id = insert_audit_record(order_name, order_id, team_name)
+        
+        if order_name in invoiced_origins:
+            logging.warning(f"BUCLE EVITADO: {order_name} YA TIENE la factura {invoiced_origins[order_name]}. Se ignorara.")
+            update_audit_record(audit_id, status='IGNORED_DUPLICATE', error_log=f"Ya tiene factura {invoiced_origins[order_name]}")
+            continue
+
+        if (order['state'] == 'sale' and order['locked']) or (order_name in orders_list_not_serialize_message):
+            if order['invoice_status'] == 'to invoice' and order['invoice_count'] == 0:
+                try:
+                    invoice_line_vals_list = []
+                    abortar_orden = False
+                    
+                    for line_id in order['order_line']:
+                        line = lines_dict.get(line_id)
+                        if not line: continue
+
+                        qty_ordered = line['product_uom_qty']
+                        qty_invoiced = line['qty_invoiced']
+                        qty_delivered = line['qty_delivered']
+                        
+                        product_name = line['product_id'][1].upper() if line.get('product_id') else ""
+                        is_shipping = 'C-ENVIO' in product_name
+
+                        # Si es envío y falta entregar, FORZAMOS la entrega en Odoo
+                        if is_shipping and qty_delivered < qty_ordered:
+                            try:
+                                models.execute_kw(db_name, uid, password, 'sale.order.line', 'write', [[line['id']], {'qty_delivered': qty_ordered}])
+                                qty_delivered = qty_ordered  # Actualizamos localmente
+                                logging.debug(f"Actualizada qty_delivered para C-ENVIO en la orden {order_name}")
+                            except Exception as e:
+                                logging.error(f"No se pudo actualizar la cantidad entregada de C-ENVIO para {order_name}: {e}")
+
+                        if not is_shipping and qty_delivered < qty_ordered:
+                            logging.debug(f"Orden {order_name} ignorada: Falta entrega fisica (Ordenado: {qty_ordered}, Entregado: {qty_delivered})")
+                            update_audit_record(audit_id, status='IGNORED_NO_STOCK', error_type='VALIDATION_ERROR', error_log=f"Falta entrega: Ord {qty_ordered}, Entr {qty_delivered}")
+                            abortar_orden = True
+                            break 
+
+                        if qty_invoiced >= qty_ordered: continue
+
+                        tax_ids = [(6, 0, [TAX_ID_MARKETPLACES])] if line.get('tax_id') else False
+                        invoice_line_vals_list.append((0, 0, {
+                            'display_type': line.get('display_type') or 'product',
+                            'sequence': int(line['sequence']) if line.get('sequence') else 10,
+                            'name': line['name'],
+                            'product_uom_id': line['product_uom'][0] if line.get('product_uom') else False,
+                            'product_id': line['product_id'][0] if line.get('product_id') else False,
+                            'quantity': qty_ordered, 
+                            'discount': line['discount'],
+                            'price_unit': line['price_unit'],
+                            'tax_ids': tax_ids,
+                            'sale_line_ids': [(4, line['id'])],
+                        }))
+
+                    if invoice_line_vals_list and not abortar_orden:
+                        invoice_vals = {
+                            'ref': '', 'move_type': 'out_invoice', 'partner_id': PARTNER_ID_PUBLICO_GENERAL, 
+                            'invoice_origin': order_name, 'invoice_line_ids': invoice_line_vals_list,
+                            'l10n_mx_edi_usage': 'S01', 'l10n_mx_edi_payment_method_id': 3, 
+                            'l10n_mx_edi_payment_policy': 'PUE', 'team_id': team_id,
+                        }
+                        if invoice_date_first_of_month: invoice_vals['invoice_date'] = invoice_date_first_of_month
+
+                        try:
+                            invoice_id = models.execute_kw(db_name, uid, password, 'account.move', 'create', [invoice_vals])
+                            models.execute_kw(db_name, uid, password, 'account.move', 'message_post', [invoice_id], {'body': f'Factura 1 a 1 para {order_name}. Creada via API.', 'message_type': 'comment'})
+                            models.execute_kw(db_name, uid, password, 'account.move', 'action_post', [[invoice_id]])    
+                            
+                            inv_data = models.execute_kw(db_name, uid, password, 'account.move', 'read', [[invoice_id]], {'fields': ['name']})
+                            real_invoice_name = inv_data[0]['name'] if inv_data else str(invoice_id)
+                            
+                        except xmlrpc.client.Fault as e_create:
+                            logging.error(f"Fallo al CREAR factura {order_name}: {e_create.faultString}")
+                            update_audit_record(audit_id, status='ERROR', error_type='CREATION_ERROR', error_log=e_create.faultString)
+                            continue 
+
+                        try:
+                            wizard_context = {'active_model': 'account.move', 'active_ids': [invoice_id]}
+                            wizard_id = models.execute_kw(db_name, uid, password, 'account.move.send.wizard', 'create', [{'is_download_only': False}], {'context': wizard_context})
+                            models.execute_kw(db_name, uid, password, 'account.move.send.wizard', 'action_send_and_print', [[wizard_id]], {'context': wizard_context})
+                            
+                            update_audit_record(audit_id, status='SUCCESS', invoice_name=real_invoice_name, invoice_id=invoice_id, automation_status='STAMPED')
+                            
+                            success_count += 1
+                            # Cambiado a DEBUG para que no se imprima en el archivo INFO de Google Sheets
+                            logging.debug(f"[{success_count}/{total_orders}] Factura individual {real_invoice_name} creada y timbrada para {order_name}")
+                            tm.sleep(0.3)
+                            
+                        except xmlrpc.client.Fault as e_stamp:
+                            logging.error(f"Fallo al TIMBRAR factura de {order_name}: {e_stamp.faultString}")
+                            update_audit_record(audit_id, status='ERROR', error_type='STAMPING_ERROR', error_log=e_stamp.faultString, invoice_name=real_invoice_name, invoice_id=invoice_id, automation_status='POSTED')
+                            continue
+
+                except Exception as e:
+                    logging.error(f"Error general procesando orden {order_name}: {e}")
+                    update_audit_record(audit_id, status='ERROR', error_type='UNKNOWN_ERROR', error_log=str(e))
+                    continue
+                    
+    return success_count # Retornamos la cantidad de exitos para el resumen
+
+def search_sales_with_message(start_day,end_day):
+    try:
+        first_day, last_day = adjust_to_cdmx_time(datetime.strptime(start_day, '%Y-%m-%d'), datetime.strptime(end_day, '%Y-%m-%d'))
+        first_day_of_year_cdmx, last_day_of_year_cdmx = get_current_year_cdmx()
+        domain = [('state', '=', 'sale'), ('effective_date', '>=', first_day), ('effective_date', '<=', last_day), 
+                  ('message_ids.body', 'ilike', 'serialize'), ('effective_date', 'ilike', '-'),
+                  ('create_date', '>=', first_day_of_year_cdmx), ('create_date', '<=', last_day_of_year_cdmx)]
+        sales_orders = models.execute_kw(db_name, uid, password, 'sale.order', 'search_read', [domain], {'fields': ['name'], 'limit':0})
+        return [order_name['name'] for order_name in sales_orders]
+    except Exception as e:
+        logging.error(f"Error en query serialize: {e}")
+        return []
+
+def search_sales_with_stock_insufficient_message(start_day, end_day):
+    try:
+        first_day, last_day = adjust_to_cdmx_time(datetime.strptime(start_day, '%Y-%m-%d'), datetime.strptime(end_day, '%Y-%m-%d'))
+        domain = [('state', '=', 'sale'), ('message_ids.body', 'ilike', 'insufficient stock 0'),
+                  ('date_order', '>=', first_day), ('date_order', '<=', last_day), ('invoice_count', '<', '2')]
+        sales_orders = models.execute_kw(db_name, uid, password, 'sale.order', 'search_read', [domain], {'fields': ['name'], 'limit': 0})
+        return [order['name'] for order in sales_orders]
+    except Exception as e:
+        logging.error(f"Error en query stock insuficiente: {e}")
+        return []
+
+if __name__ == '__main__':
+    try:
+        start_time = tm.time()
+        main()
+        logging.info(f'Tiempo de ejecucion SOLO FACTURAS: {round(tm.time() - procees_invoices_start_time, 2)} segundos')
+        logging.info(f'Tiempo de ejecucion TOTAL: {round(tm.time() - start_time, 2)} segundos')
+        
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for handler in logger.handlers:
+            handler.close()
+            logger.removeHandler(handler)
+        log_file_path = f'{today_date_for_log}.log'
+        insert_log_in_sheets(log_file_path, file_id='1y6dgwAk0uHmJ7DPVTVTb5ZiGom1gK0nQem0LAz6C9Zs')
+        delete_file(log_file_path)

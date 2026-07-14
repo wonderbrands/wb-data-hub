@@ -15,13 +15,13 @@ __description__ = """
 - * EXCLUSIÓN DE ML como parte de la facturación a partir del 1ro de junio 2026. *
 """
 
-#dotenv_path = "/var/lib/jenkins/m1/.env"
-#credentials_json = '/var/lib/jenkins/m1/credenciales_reportes.json'
 
-#dotenv_path = 'C:/Users/Sergio Gil Guerrero/Documents/WonderBrands/Repos/wonderbrands/.env'
-credentials_json = '/var/lib/credentials/credenciales_reportes.json'
+dotenv_path = 'C:/Users/Sergio Gil Guerrero/Documents/WonderBrands/Repos/wonderbrands/.env'
+load_dotenv(dotenv_path)
+credentials_json = r'C:\Users\Sergio Gil Guerrero\PycharmProjects\Herramientas propias\Invoices\google_cred.json'
 
-#load_dotenv()
+# PROD KESTRA
+#credentials_json = '/var/lib/credentials/credenciales_reportes.json'
 
 # --- CONFIGURACIÓN CONTABLE GLOBAL ---
 # ID del impuesto "IVA 16% Marketplaces" (Apunta a IVA Cobrado, sin Base de Efectivo)
