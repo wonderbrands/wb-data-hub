@@ -64,7 +64,7 @@ class OdooModelProxy:
     Proxy para envolver las llamadas a Odoo con reintentos automáticos,
     renovación de sesión TLS y un TIMEOUT estricto para evitar procesos colgados.
     """
-    def __init__(self, url, db, user, pwd, timeout=45):
+    def __init__(self, url, db, user, pwd, timeout=60):
         self.url = url
         self.db = db
         self.user = user
@@ -100,7 +100,7 @@ class OdooModelProxy:
                 raise e
             except (xmlrpc.client.ProtocolError, TimeoutError, OSError) as e:
                 # Capturamos ProtocolError (502), TimeoutError y caídas de socket (OSError)
-                log.warning(f"Error de red/Timeout en Odoo [{model}.{method}]: {str(e)}. Intento {attempt}/{max_retries}...")
+                log.warning(f"Error de red/Timeout: {e.errcode} / {e.errmsg}) en Odoo [{model}.{method}]: {str(e)}. Intento {attempt}/{max_retries}...")
                 if attempt == max_retries:
                     raise e
                 time.sleep(delay * attempt)

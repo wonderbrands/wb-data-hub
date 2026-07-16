@@ -57,7 +57,7 @@ class TimeoutTransport(xmlrpc.client.SafeTransport):
 class OdooModelProxy:
     """
     Proxy para envolver las llamadas a Odoo con reintentos automáticos,
-    renovación de sesión TLS, TIMEOUT estricto y DEBUGGING de latencia/payloads.
+    renovación de sesión TLS y un TIMEOUT estricto para evitar procesos colgados.
     """
     def __init__(self, url, db, user, pwd, timeout=60):
         self.url = url
@@ -66,6 +66,7 @@ class OdooModelProxy:
         self.pwd = pwd
         self.timeout = timeout
         
+        # Instanciamos un transporte con timeout para evitar que la conexión se quede zombi
         transport = TimeoutTransport(timeout=self.timeout)
         self.common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', transport=transport)
         self.uid = self.common.authenticate(db, user, pwd, {})
@@ -84,42 +85,17 @@ class OdooModelProxy:
 
     def execute_kw(self, db, uid, pwd, model, method, args, kwargs=None, max_retries=3, delay=2):
         for attempt in range(1, max_retries + 1):
-            t_start = time.time()
             try:
-                # [DEBUG LOG] Registrar inicio de operaciones críticas o pesadas
-                if method in ('create', 'write', 'action_post'):
-                    log.debug(f"[API-START] {model}.{method} | Intentando llamada (Intento {attempt}/{max_retries})...")
-
                 if kwargs is not None:
-                    res = self.models.execute_kw(self.db, self.uid, self.pwd, model, method, args, kwargs)
+                    return self.models.execute_kw(self.db, self.uid, self.pwd, model, method, args, kwargs)
                 else:
-                    res = self.models.execute_kw(self.db, self.uid, self.pwd, model, method, args)
-                
-                # [DEBUG LOG] Registrar tiempo de respuesta exitoso si demoró más de 3 segundos
-                elapsed = time.time() - t_start
-                if elapsed > 3.0 or method in ('create', 'action_post'):
-                    log.info(f"[API-SUCCESS] {model}.{method} respondió en {elapsed:.2f}s | Result ID/Type: {type(res)}")
-                
-                return res
-
+                    return self.models.execute_kw(self.db, self.uid, self.pwd, model, method, args)
             except xmlrpc.client.Fault as e:
-                elapsed = time.time() - t_start
-                log.error(f"[API-FAULT ODOO] {model}.{method} falló en {elapsed:.2f}s | Código: {e.faultCode} | Mensaje: {e.faultString}")
+                # Errores de negocio de Odoo no se reintentan
                 raise e
             except (xmlrpc.client.ProtocolError, TimeoutError, OSError) as e:
-                elapsed = time.time() - t_start
-                # [DEBUG LOG ENRIQUECIDO] Cuando ocurre el 502, imprimimos la estructura exacta que mató al worker
-                log.warning(f"[API-FAIL RED/502] {model}.{method} abortado tras {elapsed:.2f}s de espera en servidor | Error: {str(e)}. Intento {attempt}/{max_retries}...")
-                
-                if method == 'create' and model == 'account.move' and args:
-                    try:
-                        # Extraer un resumen limpio del payload para no inundar la consola pero ver qué lo causa
-                        payload_dump = args[0]
-                        line_summary = [(l[2].get('product_id'), l[2].get('quantity'), l[2].get('price_unit')) for l in payload_dump.get('invoice_line_ids', [])]
-                        log.error(f"[PAYLOAD MORTAL] Origen: {payload_dump.get('invoice_origin')} | Partner: {payload_dump.get('partner_id')} | UsoCFDI: {payload_dump.get('l10n_mx_edi_usage')} | Líneas (ProdID, Qty, Precio): {line_summary}")
-                    except Exception:
-                        log.error(f"[PAYLOAD MORTAL RAW] {args}")
-
+                # Capturamos ProtocolError (502), TimeoutError y caídas de socket (OSError)
+                log.warning(f"Error de red/Timeout: {e.errcode if hasattr(e, 'errcode') else ''} / {e.errmsg if hasattr(e, 'errmsg') else ''}) en Odoo [{model}.{method}]: {str(e)}. Intento {attempt}/{max_retries}...")
                 if attempt == max_retries:
                     raise e
                 time.sleep(delay * attempt)
@@ -128,8 +104,7 @@ class OdooModelProxy:
                 except Exception as auth_e:
                     log.warning(f"Error al reautenticar con Odoo: {str(auth_e)}")
             except Exception as e:
-                elapsed = time.time() - t_start
-                log.warning(f"[API-FAIL GENERAL] {model}.{method} falló tras {elapsed:.2f}s | Intento {attempt}/{max_retries}: {str(e)}")
+                log.warning(f"Error de comunicación en Odoo [{model}.{method}]. Intento {attempt}/{max_retries}: {str(e)}")
                 if attempt == max_retries:
                     raise e
                 time.sleep(delay * attempt)
@@ -381,17 +356,6 @@ def process_single_invoice(record, context):
                 if invoice_date:
                     invoice_vals['invoice_date_due'] = invoice_date 
 
-            # [DEBUG LOG PRE-CREATE] Inspección detallada del payload antes de tocar Odoo
-            total_qty_lines = sum(l[2]['quantity'] for l in invoice_lines)
-            products_in_payload = [l[2]['product_id'] for l in invoice_lines]
-            log.info(f"[{thread_name}] [PRE-CREATE AUDIT] Preparando account.move para {so_data['name']} (ML: {mkp_order}):")
-            log.info(f" -> Partner ID: {partner_invoice_id} | Team ID: {so_data['team_id'][0]} | Fecha: {invoice_date}")
-            log.info(f" -> CFDI Usage: {uso_cfdi} | Pago: {metodo_pago} | FormaPago ID: {payment_method_id}")
-            log.info(f" -> Total Líneas: {len(invoice_lines)} (Unidades totales: {total_qty_lines}) | Productos ID: {products_in_payload}")
-            log.info(f" -> Total Estimado en Odoo: ${total_odoo:,.2f} | Total XML: ${total_xml:,.2f}")
-
-            # Llamada al ORM
-            t_create_start = time.time()
             # --- context 'tracking_disable': True -----------------
             # Le indica a Odoo que NO ejecute las funciones de mail.thread (chatter):
             # auto-suscripción, historial de "campo X cambió de A a B", mensaje de
@@ -405,7 +369,6 @@ def process_single_invoice(record, context):
             inv_id = models.execute_kw(
                 odoo_db, uid, odoo_pwd, 'account.move', 'create', [invoice_vals]
             )
-            log.info(f"[{thread_name}] [CREATE-SUCCESS] Factura {inv_id} creada en {time.time() - t_create_start:.2f}s.")
             
             # ---------------------------------------------------------------------------------
         # Buscar líneas para CxC (se ejecuta SIEMPRE: factura nueva O reanudada)

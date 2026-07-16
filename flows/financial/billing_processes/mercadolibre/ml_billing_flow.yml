@@ -1,6 +1,6 @@
 id: ml_billing_flow
 namespace: wonderbrands.finance.mercadolibre
-description: "Pipeline Facturación: Extrae XMLs de ML y los inyecta a Odoo (Producción)"
+description: "Pipeline Facturación: Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
@@ -23,6 +23,7 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
+      # ── PASO 01: Extracción de XMLs de Mercado Libre a BD ──
       - id: run_miner_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-etl:v1
@@ -41,19 +42,16 @@ tasks:
         commands:
           - python processes/financial/billing_processes/mercadolibre/01_miner_ml_billing.py
 
+      # ── PASO 02: Inyección de Facturas a Odoo (Lotes controlados) ──
       - id: run_loader_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-etl:v1
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
-        retry:
-          type: constant
-          interval: PT5M
-          maxAttempt: 3
         env:
-          odoo_urlV18: "{{ vars.odoo_url}}" 
-          odoo_dbV18: "{{ vars.odoo_db}}"
+          odoo_urlV18: "{{ vars.odoo_url }}" 
+          odoo_dbV18: "{{ vars.odoo_db }}"
           odoo_user_dataV18: "{{ secret('odoo_user_dataV18') }}"
           odoo_password_dataV18: "{{ secret('odoo_password_dataV18') }}"
           DB_HOST: "{{ vars.db1_host }}"
@@ -61,12 +59,13 @@ tasks:
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
         commands:
-          - python processes/financial/billing_processes/mercadolibre/02_loader_ml_billing.py
+          - python processes/financial/billing_processes/mercadolibre/02_loader_ml_billing_prod.py
 
 triggers:
-  - id: hourly_schedule
+  # Distribución de carga: Se ejecuta cada 3 horas (00:00, 03:00, 06:00, etc. UTC)
+  - id: micro_lotes_cada_3_horas
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 * * * *" # Cada hora en punto
+    cron: "0 0,3,6,9,12,15,18,21 * * *"
 
 errors:
   - id: slack_alert
@@ -74,5 +73,5 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *¡Fallo en Pipeline de Facturación ML!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`\n<http://<tu-url-de-kestra>/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}|🔍 Ver logs completos en Kestra>"
+        "text": "🚨 *¡Fallo en Pipeline de Facturación ML (Scripts 01-02)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`\n<http://<tu-url-de-kestra>/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}|🔍 Ver logs en Kestra>"
       }

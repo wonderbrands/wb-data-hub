@@ -1,6 +1,6 @@
 id: ml_payments_flow
 namespace: wonderbrands.finance.mercadolibre
-description: "Pipeline Pagos: Extrae cobros liberados y los concilia en Odoo (Producción)"
+description: "Pipeline Pagos: Extrae cobros liberados (03) y los concilia en Odoo (04). Arranca al terminar la facturación."
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
@@ -23,6 +23,7 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
+      # ── PASO 03: Extracción y validación de cobros liberados (MP) ──
       - id: run_miner_ml_payments
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-etl:v1
@@ -42,6 +43,7 @@ tasks:
         commands:
           - python processes/financial/billing_processes/mercadolibre/03_miner_ml_payments.py
 
+      # ── PASO 04: Aplicación y conciliación nativa de cobros en Odoo ──
       - id: run_loader_ml_payments
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-etl:v1
@@ -51,12 +53,12 @@ tasks:
         retry:
           type: constant
           interval: PT5M
-          maxAttempt: 3
+          maxAttempt: 2
         env:
-          odoo_urlV18: "{{ vars.odoo_url}}" 
-          odoo_dbV18: "{{ vars.odoo_db}}"
-          odoo_user_dataV18: "{{ secret('odoo_user_dataV18') }}"
-          odoo_password_dataV18: "{{ secret('odoo_password_dataV18') }}"
+          odoo_urlV18: "{{ vars.odoo_url }}" 
+          odoo_dbV18: "{{ vars.odoo_db }}"
+          odoo_user_dataV18: "{{ secret('odoo_user_dataV18')}}"
+          odoo_password_dataV18: "{{ secret('odoo_password_dataV18')}}"
           DB_HOST: "{{ vars.db1_host }}"
           DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
@@ -65,9 +67,23 @@ tasks:
           - python processes/financial/billing_processes/mercadolibre/04_loader_ml_payments.py
 
 triggers:
-  - id: hourly_offset_schedule
+  # Se ejecuta automáticamente en cuanto termina la Facturación
+  - id: listen_to_billing_flow
+    type: io.kestra.plugin.core.trigger.Flow
+    conditions:
+      - type: io.kestra.plugin.core.condition.ExecutionStatus
+        in:
+          - SUCCESS
+      - type: io.kestra.plugin.core.condition.ExecutionNamespace
+        namespace: wonderbrands.finance.mercadolibre
+      - type: io.kestra.plugin.core.condition.ExecutionFlow
+        flowId: ml_billing_flow
+
+  # DISPARADOR DE RESPALDO: Una corrida de barrido a las 5:00 AM UTC (11:00 PM CDMX) 
+  # por si algún cobro se liberó tarde en Mercado Pago sin requerir nueva factura.
+  - id: barrido_nocturno_pagos
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 * * * *" # Cada hora, desfasado al minuto 30
+    cron: "0 5 * * *"
 
 errors:
   - id: slack_alert
@@ -75,5 +91,5 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *¡Fallo en Pipeline de Pagos ML!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`\n<http://<tu-url-de-kestra>/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}|🔍 Ver logs completos en Kestra>"
+        "text": "🚨 *¡Fallo en Pipeline de Pagos ML (Scripts 03-04)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`\n<http://<tu-url-de-kestra>/ui/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}|🔍 Ver logs en Kestra>"
       }
