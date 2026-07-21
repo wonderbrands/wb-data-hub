@@ -33,7 +33,10 @@ class ErrorsAndSummaryFilter(logging.Filter):
         return False
 
 # Bandera para habilitar/deshabilitar el filtro (True = solo errores + resumen, False = todo)
-LOG_ERRORS_AND_SUMMARY = True  # Cambiar a False para ver todos los logs
+# --------------
+LOG_ERRORS_AND_SUMMARY = False  
+# --------------
+
 if LOG_ERRORS_AND_SUMMARY:
     log.addFilter(ErrorsAndSummaryFilter())
 

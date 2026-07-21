@@ -20,4 +20,5 @@ RUN pip install --no-cache-dir \
     requests \
     python-dotenv \
     python-dateutil \
-    tzdata
+    tzdata \
+    pandas

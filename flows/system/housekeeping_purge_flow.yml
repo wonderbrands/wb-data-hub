@@ -1,0 +1,41 @@
+id: housekeeping_purge
+namespace: wonderbrands.system
+description: |
+  Purga diaria de ejecuciones, logs y outputs con más de 45 días de antigüedad.
+  Referencia oficial: https://kestra.io/docs/administrator-guide/purge
+
+tasks:
+  - id: purge_executions
+    type: io.kestra.plugin.core.execution.PurgeExecutions
+    endDate: "{{ now() | dateAdd(-45, 'DAYS') }}"
+    states:
+      - SUCCESS
+      - WARNING
+    purgeLog: false   # los logs se purgan aparte con PurgeLogs
+
+  - id: purge_failed_executions
+    type: io.kestra.plugin.core.execution.PurgeExecutions
+    # Conservamos más tiempo los fallos, útiles para auditoría de incidentes
+    endDate: "{{ now() | dateAdd(-90, 'DAYS') }}"
+    states:
+      - FAILED
+      - KILLED
+    purgeLog: false
+
+  - id: purge_logs
+    type: io.kestra.plugin.core.log.PurgeLogs
+    endDate: "{{ now() | dateAdd(-45, 'DAYS') }}"
+
+triggers:
+  - id: daily_housekeeping
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "15 9 * * *"   # 3:15 AM CDMX
+
+errors:
+  - id: slack_alert_purge_failed
+    type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "⚠️ Falló el housekeeping diario de Kestra. Revisar espacio en disco del servidor."
+      }
