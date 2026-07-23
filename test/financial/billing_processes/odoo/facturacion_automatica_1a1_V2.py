@@ -4,27 +4,94 @@ import time as tm
 import logging
 import gspread
 import os
+import mysql.connector
+from mysql.connector import Error
 from dotenv import load_dotenv
 
 __description__ = """
-                **** V18 - FACTURACIÓN 1 A 1 (CANTIDAD ORDENADA) OPTIMIZADA & DEBUG ****
+                **** V18 - FACTURACIÓN 1 A 1 OPTIMIZADA CON AUDITORÍA BD & RESUMEN ****
 """
 
 dotenv_path = 'C:/Users/Sergio Gil Guerrero/Documents/WonderBrands/Repos/wonderbrands/.env'
 load_dotenv(dotenv_path)
 credentials_json = r'C:\Users\Sergio Gil Guerrero\PycharmProjects\Herramientas propias\Invoices\google_cred.json'
 
-# PROD KESTRA
-#credentials_json = '/var/lib/credentials/credenciales_reportes.json'
-
 # --- CONFIGURACIÓN CONTABLE GLOBAL ---
 TAX_ID_MARKETPLACES = 38
 PARTNER_ID_PUBLICO_GENERAL = 13436
 
 # =======================================================================
-# ⚙️ CONFIGURACIÓN DE PRUEBAS 
-TEST_ORDER_LIMIT = 1  # Cambia a 10, 100, o ponlo en None para correr histórico.
+# CONFIGURACIÓN DE PRUEBAS 
+TEST_ORDER_LIMIT = 10  # None -> histórico.
 # =======================================================================
+
+# --- CONFIGURACIÓN BD AUDITORÍA ---
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_USER = os.getenv('DB_USER', 'root')
+DB_PASS = os.getenv('DB_PASSWORD', '')
+DB_NAME = os.getenv('DB_NAME', 'finance')
+
+def get_db_connection():
+    try:
+        return mysql.connector.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME
+        )
+    except Error as e:
+        logging.error(f"Error conectando a la BD de auditoría: {e}")
+        return None
+
+def insert_audit_record(order_name, order_id, team_name):
+    """Inserta la orden o la actualiza si ya existe (Upsert), incrementando los intentos."""
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        cursor = conn.cursor()
+        
+        # INSERT ... ON DUPLICATE KEY UPDATE
+        query = """
+            INSERT INTO finance.billing_audit_log (odoo_order_name, odoo_order_id, team_name, status, attempt_count) 
+            VALUES (%s, %s, %s, 'PROCESSING', 1)
+            ON DUPLICATE KEY UPDATE 
+                status = 'PROCESSING',
+                attempt_count = attempt_count + 1,
+                updated_at = CURRENT_TIMESTAMP
+        """
+        cursor.execute(query, (order_name, order_id, team_name))
+        conn.commit()
+        
+        # Recuperamos el ID del registro para que update_audit_record sepa cuál actualizar
+        cursor.execute("SELECT id FROM finance.billing_audit_log WHERE odoo_order_id = %s", (order_id,))
+        record = cursor.fetchone()
+        
+        return record[0] if record else None
+        
+    except Error as e:
+        logging.error(f"Error insertando/actualizando auditoría para {order_name}: {e}")
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+    return None
+
+def update_audit_record(record_id, status, error_type='NONE', error_log=None, invoice_name=None, invoice_id=None, automation_status='NONE'):
+    if not record_id: return
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cursor = conn.cursor()
+        invoiced_at = datetime.now() if status == 'SUCCESS' else None
+        query = """UPDATE finance.billing_audit_log 
+                   SET status = %s, error_type = %s, error_log = %s, 
+                       invoice_name = %s, invoice_id = %s, invoice_automation_status = %s, invoiced_at = %s
+                   WHERE id = %s"""
+        cursor.execute(query, (status, error_type, error_log, invoice_name, invoice_id, automation_status, invoiced_at, record_id))
+        conn.commit()
+    except Error as e:
+        logging.error(f"Error actualizando auditoría ID {record_id}: {e}")
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
 
 def insert_log_in_sheets(_path, file_id):
     print("Actualizando GOOGLE DRIVE...")
@@ -33,13 +100,13 @@ def insert_log_in_sheets(_path, file_id):
         sh = gc.open_by_key(file_id)
         worksheet = sh.worksheet('log')
         log_filename = _path
-        with open(log_filename, 'r') as file:
+        with open(log_filename, 'r', encoding='utf-8') as file:
             lines = file.readlines()
             lines.reverse() 
         current_data = worksheet.get_all_values()
         updated_data = [[line.strip()] for line in lines] + current_data
         worksheet.clear()
-        worksheet.update('A1', updated_data)
+        worksheet.update(values=updated_data, range_name='A1')
     except Exception as e:
         print(f"Error subiendo log a Sheets: {e}")
 
@@ -47,16 +114,27 @@ def delete_file(file_path):
     if os.path.exists(file_path):
         os.remove(file_path)
 
+def get_account_id(models, db, uid, pwd, code):
+    acc = models.execute_kw(db, uid, pwd, 'account.account', 'search', [[('code', '=', code)]], {'limit': 1})
+    if not acc:
+        raise Exception(f"¡ALERTA! No se encontró la cuenta contable con código {code} en Odoo.")
+    return acc[0]
+
 UTC_local = -6
 today_date_datetime = datetime.now()
 today_date = today_date_datetime.strftime("%Y-%m-%d %H:%M:%S")
 today_date_for_log = today_date_datetime + timedelta(hours=UTC_local)
 today_date_for_log = today_date_for_log.strftime("%Y-%m-%d -- %H-%M-%S")
 
+# --- CONFIGURACIÓN DE LOGS (SILENCIANDO RUIDO EXTERNO) ---
+for noisy_logger in ['urllib3', 'google.auth', 'googleapiclient', 'gspread', 'google.auth.transport.requests']:
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG) # Cambiado a DEBUG para mayor detalle
-file_handler = logging.FileHandler(f'{today_date_for_log}.log')
-file_handler.setLevel(logging.DEBUG)
+logger.setLevel(logging.DEBUG) 
+# Dejamos el archivo en INFO para que Sheets solo reciba el resumen ejecutivo
+file_handler = logging.FileHandler(f'{today_date_for_log}.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -67,7 +145,7 @@ logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 class TimeoutTransport(xmlrpc.client.Transport):
-    def __init__(self, timeout=300): # Aumentado a 300 por si acaso
+    def __init__(self, timeout=300):
         super().__init__()
         self.timeout = timeout
 
@@ -77,14 +155,13 @@ class TimeoutTransport(xmlrpc.client.Transport):
         return conn
 
 def get_chunks(lst, n):
-    """Divide una lista en sublistas de tamaño n para no saturar XML-RPC"""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 logging.info('================================================================')
 logging.info('BIENVENIDO AL PROCESO DE FACTURACIÓN PARA MARKETPLACES (1 a 1)')
 if TEST_ORDER_LIMIT:
-    logging.info(f'MODO PRUEBA ACTIVADO: Límite de {TEST_ORDER_LIMIT} órdenes VÁLIDAS')
+    logging.info(f'MODO PRUEBA ACTIVADO: Limite de {TEST_ORDER_LIMIT} ordenes VALIDAS')
 logging.info('================================================================')
 
 def main():
@@ -96,13 +173,13 @@ def main():
         except ConnectionResetError as e:
             conections_count += 1
             if conections_count < 3:
-                logging.error(f"Error de conexión: {e}. Reintentando...")
+                logging.error(f"Error de conexion: {e}. Reintentando...")
                 tm.sleep(5)  
             else:
                 break
 
 def run():
-    global uid, models, db_name, password, today_date, orders_list_not_serialize_message, invoice_date_first_of_month, last_day_of_year_flag
+    global uid, models, db_name, password, today_date, orders_list_not_serialize_message, invoice_date_first_of_month, last_day_of_year_flag, acc_cxc_amazon, acc_cxc_walmart, acc_cxc_walmart_1p, acc_cxc_coppel, acc_cxc_elektra, acc_cxc_tiktok, acc_cxc_mayoreo
 
     server_url = os.getenv('odoo_urlV18')
     db_name = os.getenv('odoo_dbV18')
@@ -113,7 +190,15 @@ def run():
     common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(server_url), transport=transport, allow_none=True, use_datetime=True)
     uid = common.authenticate(db_name, username, password, {})
     models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(server_url), transport=transport, allow_none=True, use_datetime=True)
-    logging.info('✅ Conexión con Odoo establecida')
+    logging.info('Conexion con Odoo establecida')
+
+    acc_cxc_amazon = get_account_id(models, db_name, uid, password, '105.01.006')
+    acc_cxc_walmart = get_account_id(models, db_name, uid, password, '105.01.007')
+    acc_cxc_walmart_1p = get_account_id(models, db_name, uid, password, '105.01.008')
+    acc_cxc_coppel = get_account_id(models, db_name, uid, password, '105.01.009')
+    acc_cxc_elektra = get_account_id(models, db_name, uid, password, '105.01.010')
+    acc_cxc_tiktok = get_account_id(models, db_name, uid, password, '105.01.011')
+    acc_cxc_mayoreo = get_account_id(models, db_name, uid, password, '105.01.012')
 
     formated_date = today_date.split(' ')[0].split('-') 
 
@@ -130,13 +215,12 @@ def run():
         invoice_date_first_of_month = None
         last_day_of_year_flag = False
 
-    # Medición de las consultas pesadas
-    logging.info("Iniciando búsqueda de órdenes con mensaje 'serialize'...")
+    logging.info("Iniciando busqueda de ordenes con mensaje 'serialize'...")
     t0 = tm.time()
     orders_list_not_serialize_message = search_sales_with_message(start_date, end_date)
     logging.info(f"Terminado en {round(tm.time()-t0, 2)}s. Encontradas: {len(orders_list_not_serialize_message)}")
 
-    logging.info("Iniciando búsqueda de stock insuficiente...")
+    logging.info("Iniciando busqueda de stock insuficiente...")
     t1 = tm.time()
     search_sales_with_stock_insufficient_message(start_date, end_date)
     logging.info(f"Terminado en {round(tm.time()-t1, 2)}s.")
@@ -144,17 +228,17 @@ def run():
     all_records = []
     date_range = generate_date_range(start_date, end_date)
 
-    logging.info(f"Extrayendo órdenes diarias desde {start_date} hasta {end_date}...")
+    logging.info(f"Extrayendo ordenes diarias desde {start_date} hasta {end_date}...")
     for number_day, single_date in enumerate(date_range):
         t_day = tm.time()
         day_start, day_end = adjust_to_cdmx_time(single_date)
         day_records = fetch_records(day_start, day_end)
         all_records.extend(day_records)
-        logging.debug(f"Día {number_day + 1} ({single_date.strftime('%Y-%m-%d')}): {len(day_records)} registros recuperados en {round(tm.time()-t_day, 2)}s")
+        logging.debug(f"Dia {number_day + 1} ({single_date.strftime('%Y-%m-%d')}): {len(day_records)} registros recuperados en {round(tm.time()-t_day, 2)}s")
 
-    logging.info(f'Total de registros extraídos antes de filtros: {len(all_records)}')
+    logging.info(f'Total de registros extraidos antes de filtros: {len(all_records)}')
     process_records(all_records, delta_days)
-    logging.info('PROCESO DE FACTURACIÓN TERMINADO')
+    logging.info('PROCESO DE FACTURACION TERMINADO')
 
 def generate_date_range(start_date, end_date):
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
@@ -184,7 +268,7 @@ def fetch_records(day_start, day_end):
         return []
 
 def process_records(records, delta_days):
-    global today_date, invoice_date_first_of_month
+    global today_date, invoice_date_first_of_month, procees_invoices_start_time
     today_date = datetime.strptime(today_date, '%Y-%m-%d %H:%M:%S') if isinstance(today_date, str) else today_date
 
     teams_dict = {}
@@ -212,15 +296,27 @@ def process_records(records, delta_days):
             else:
                 skipped_grace += 1
 
-    logging.info(f"Filtros: {skipped_ml} excluidas por ML, {skipped_grace} excluidas por periodo de gracia (1 día).")
+    logging.info(f"Filtros: {skipped_ml} excluidas por ML, {skipped_grace} excluidas por periodo de gracia (1 dia).")
 
-    # Exclusión de equipos
     walmart_removed = teams_dict.pop('Team_Walmart', None)
     facebook_removed = teams_dict.pop('Salderos / Facebook', None) 
+    
     if walmart_removed: logging.info(f"Excluidas {len(walmart_removed)} de Team_Walmart.")
-    if facebook_removed: logging.info(f"Excluidas {len(facebook_removed)} de Salderos.")
+    if facebook_removed: logging.info(f"Excluidas {len(facebook_removed)} de Salderos / Facebook.")
+    
+    # ======================  TEST ==============================================
+    tiktok_removed = teams_dict.pop('Team_TikTok', None)
+    #amazon_removed = teams_dict.pop('Team_Amazon', None) 
+    coppel_removed = teams_dict.pop('Team_Coppel', None)
+    web_removed = teams_dict.pop('Team_Sitioweb', None)
+    
+    if tiktok_removed: logging.info(f"Excluidas {len(tiktok_removed)} de Team_TikTok.")
+    #if amazon_removed: logging.info(f"Excluidas {len(amazon_removed)} de Team_Amazon.")
+    if coppel_removed: logging.info(f"Excluidas {len(coppel_removed)} de Team_Coppel.")
+    if web_removed: logging.info(f"Excluidas {len(web_removed)} de Team_Sitioweb.")
+    # ====================================================================
+    
 
-    # APLICAR LÍMITE DE PRUEBA SOBRE ÓRDENES VÁLIDAS
     if TEST_ORDER_LIMIT:
         valid_count = 0
         for team, orders in list(teams_dict.items()):
@@ -233,24 +329,42 @@ def process_records(records, delta_days):
             else:
                 valid_count += len(orders)
         
-        # Limpiar equipos vacíos
         teams_dict = {k: v for k, v in teams_dict.items() if v}
-        logging.info(f"Límite aplicado: Se procesarán {valid_count} órdenes válidas en total.")
-
+        logging.info(f"Limite aplicado: Se procesaran {valid_count} ordenes validas en total.")
+        
+    procees_invoices_start_time = tm.time()
     for team_name, orders_list in teams_dict.items():
-        logging.info(f"Procesando equipo: {team_name} ({len(orders_list)} órdenes)")
-        execute_invoice(team_name, orders_list)
+        logging.info(f"Procesando equipo: {team_name} ({len(orders_list)} ordenes)")
+        # Recuperamos cuántas facturas se lograron crear de este equipo
+        invoiced_qty = execute_invoice(team_name, orders_list)
+        
+        if invoiced_qty > 0:
+            logging.info(f"-> {invoiced_qty} ordenes facturadas exitosamente de {team_name}.")
 
 def execute_invoice(team_name, orders_list):
-    if not orders_list: return
+    global acc_cxc_amazon, acc_cxc_walmart, acc_cxc_walmart_1p, acc_cxc_coppel, acc_cxc_elektra, acc_cxc_tiktok, acc_cxc_mayoreo
+    if not orders_list: return 0
         
     team_id = orders_list[0]['team_id'][0] 
     total_orders = len(orders_list)
     success_count = 0
 
-    # =========================================================================
-    # OPTIMIZACIÓN 1: BÚSQUEDA DE DUPLICADOS EN CHUNKS DE 500
-    # =========================================================================
+    acc_cxc_team = None
+    if 'Amazon' in team_name:
+        acc_cxc_team = acc_cxc_amazon
+    elif 'Walmart_1P' in team_name or '1P' in team_name:
+        acc_cxc_team = acc_cxc_walmart_1p
+    elif 'Walmart' in team_name:
+        acc_cxc_team = acc_cxc_walmart
+    elif 'Coppel' in team_name:
+        acc_cxc_team = acc_cxc_coppel
+    elif 'Elektra' in team_name:
+        acc_cxc_team = acc_cxc_elektra
+    elif 'TikTok' in team_name:
+        acc_cxc_team = acc_cxc_tiktok
+    elif 'Mayoreo' in team_name:
+        acc_cxc_team = acc_cxc_mayoreo
+
     order_names = [order['name'] for order in orders_list]
     existing_invoices_data = []
     for chunk in get_chunks(order_names, 500):
@@ -261,12 +375,8 @@ def execute_invoice(team_name, orders_list):
     
     invoiced_origins = {inv['invoice_origin']: inv['name'] for inv in existing_invoices_data if inv['invoice_origin']}
 
-    # =========================================================================
-    # OPTIMIZACIÓN 2: LECTURA DE LÍNEAS DE ORDEN EN CHUNKS DE 1000
-    # =========================================================================
     all_line_ids = [line_id for order in orders_list for line_id in order['order_line']]
     all_lines_data = []
-    
     for chunk in get_chunks(all_line_ids, 1000):
         data = models.execute_kw(db_name, uid, password, 'sale.order.line', 'search_read', [[('id', 'in', chunk)]])
         all_lines_data.extend(data)
@@ -275,9 +385,13 @@ def execute_invoice(team_name, orders_list):
 
     for index, order in enumerate(orders_list): 
         order_name = order['name']
+        order_id = order['id']
+        
+        audit_id = insert_audit_record(order_name, order_id, team_name)
         
         if order_name in invoiced_origins:
-            logging.warning(f"BUCLE EVITADO: {order_name} YA TIENE la factura {invoiced_origins[order_name]}. Se ignorará.")
+            logging.warning(f"BUCLE EVITADO: {order_name} YA TIENE la factura {invoiced_origins[order_name]}. Se ignorara.")
+            update_audit_record(audit_id, status='IGNORED_DUPLICATE', error_log=f"Ya tiene factura {invoiced_origins[order_name]}")
             continue
 
         if (order['state'] == 'sale' and order['locked']) or (order_name in orders_list_not_serialize_message):
@@ -297,8 +411,18 @@ def execute_invoice(team_name, orders_list):
                         product_name = line['product_id'][1].upper() if line.get('product_id') else ""
                         is_shipping = 'C-ENVIO' in product_name
 
+                        # Si es envío y falta entregar, FORZAMOS la entrega en Odoo
+                        if is_shipping and qty_delivered < qty_ordered:
+                            try:
+                                models.execute_kw(db_name, uid, password, 'sale.order.line', 'write', [[line['id']], {'qty_delivered': qty_ordered}])
+                                qty_delivered = qty_ordered  # Actualizamos localmente
+                                logging.debug(f"Actualizada qty_delivered para C-ENVIO en la orden {order_name}")
+                            except Exception as e:
+                                logging.error(f"No se pudo actualizar la cantidad entregada de C-ENVIO para {order_name}: {e}")
+
                         if not is_shipping and qty_delivered < qty_ordered:
-                            logging.debug(f"Orden {order_name} ignorada: Falta entrega física (Ordenado: {qty_ordered}, Entregado: {qty_delivered})")
+                            logging.debug(f"Orden {order_name} ignorada: Falta entrega fisica (Ordenado: {qty_ordered}, Entregado: {qty_delivered})")
+                            update_audit_record(audit_id, status='IGNORED_NO_STOCK', error_type='VALIDATION_ERROR', error_log=f"Falta entrega: Ord {qty_ordered}, Entr {qty_delivered}")
                             abortar_orden = True
                             break 
 
@@ -327,23 +451,50 @@ def execute_invoice(team_name, orders_list):
                         }
                         if invoice_date_first_of_month: invoice_vals['invoice_date'] = invoice_date_first_of_month
 
-                        # Crear, Publicar y Timbrar
-                        invoice_id = models.execute_kw(db_name, uid, password, 'account.move', 'create', [invoice_vals])
-                        models.execute_kw(db_name, uid, password, 'account.move', 'message_post', [invoice_id], 
-                                          {'body': f'Factura 1 a 1 para {order_name}. Creada vía API.', 'message_type': 'comment'})
-                        models.execute_kw(db_name, uid, password, 'account.move', 'action_post', [[invoice_id]])    
-                        
-                        wizard_context = {'active_model': 'account.move', 'active_ids': [invoice_id]}
-                        wizard_id = models.execute_kw(db_name, uid, password, 'account.move.send.wizard', 'create', [{'is_download_only': False}], {'context': wizard_context})
-                        models.execute_kw(db_name, uid, password, 'account.move.send.wizard', 'action_send_and_print', [[wizard_id]], {'context': wizard_context})
+                        try:
+                            invoice_id = models.execute_kw(db_name, uid, password, 'account.move', 'create', [invoice_vals])
+                            
+                            if acc_cxc_team:
+                                move_lines = models.execute_kw(db_name, uid, password, 'account.move.line', 'search_read', 
+                                                               [[('move_id', '=', invoice_id)]], {'fields': ['id', 'account_type']})
+                                lines_to_update = [(1, m_line['id'], {'account_id': acc_cxc_team}) for m_line in move_lines if m_line['account_type'] == 'asset_receivable']
+                                if lines_to_update:
+                                    models.execute_kw(db_name, uid, password, 'account.move', 'write', [[invoice_id], {'line_ids': lines_to_update}])
+                            
+                            models.execute_kw(db_name, uid, password, 'account.move', 'message_post', [invoice_id], {'body': f'Factura 1 a 1 para {order_name}. Creada via API.', 'message_type': 'comment'})
+                            models.execute_kw(db_name, uid, password, 'account.move', 'action_post', [[invoice_id]])    
+                            
+                            inv_data = models.execute_kw(db_name, uid, password, 'account.move', 'read', [[invoice_id]], {'fields': ['name']})
+                            real_invoice_name = inv_data[0]['name'] if inv_data else str(invoice_id)
+                            
+                        except xmlrpc.client.Fault as e_create:
+                            logging.error(f"Fallo al CREAR factura {order_name}: {e_create.faultString}")
+                            update_audit_record(audit_id, status='ERROR', error_type='CREATION_ERROR', error_log=e_create.faultString)
+                            continue 
 
-                        success_count += 1
-                        logging.info(f"[{success_count}/{total_orders}] ✅ Factura individual creada y timbrada para {order_name}")
-                        tm.sleep(0.3)
+                        try:
+                            wizard_context = {'active_model': 'account.move', 'active_ids': [invoice_id]}
+                            wizard_id = models.execute_kw(db_name, uid, password, 'account.move.send.wizard', 'create', [{'is_download_only': False}], {'context': wizard_context})
+                            models.execute_kw(db_name, uid, password, 'account.move.send.wizard', 'action_send_and_print', [[wizard_id]], {'context': wizard_context})
+                            
+                            update_audit_record(audit_id, status='SUCCESS', invoice_name=real_invoice_name, invoice_id=invoice_id, automation_status='STAMPED')
+                            
+                            success_count += 1
+                            # Cambiado a DEBUG para que no se imprima en el archivo INFO de Google Sheets
+                            logging.debug(f"[{success_count}/{total_orders}] Factura individual {real_invoice_name} creada y timbrada para {order_name}")
+                            tm.sleep(0.3)
+                            
+                        except xmlrpc.client.Fault as e_stamp:
+                            logging.error(f"Fallo al TIMBRAR factura de {order_name}: {e_stamp.faultString}")
+                            update_audit_record(audit_id, status='ERROR', error_type='STAMPING_ERROR', error_log=e_stamp.faultString, invoice_name=real_invoice_name, invoice_id=invoice_id, automation_status='POSTED')
+                            continue
 
                 except Exception as e:
-                    logging.error(f"❌ Error al procesar la orden {order_name}: {e}")
+                    logging.error(f"Error general procesando orden {order_name}: {e}")
+                    update_audit_record(audit_id, status='ERROR', error_type='UNKNOWN_ERROR', error_log=str(e))
                     continue
+                    
+    return success_count # Retornamos la cantidad de exitos para el resumen
 
 def search_sales_with_message(start_day,end_day):
     try:
@@ -373,7 +524,9 @@ if __name__ == '__main__':
     try:
         start_time = tm.time()
         main()
-        logging.info(f'Tiempo de ejecución total: {round(tm.time() - start_time, 2)} segundos')
+        logging.info(f'Tiempo de ejecucion SOLO FACTURAS: {round(tm.time() - procees_invoices_start_time, 2)} segundos')
+        logging.info(f'Tiempo de ejecucion TOTAL: {round(tm.time() - start_time, 2)} segundos')
+        
     except KeyboardInterrupt:
         pass
     finally:

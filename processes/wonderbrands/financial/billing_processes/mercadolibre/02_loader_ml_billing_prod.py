@@ -8,7 +8,6 @@ import xml.etree.ElementTree as ET
 import concurrent.futures
 from dotenv import load_dotenv
 import threading
-from tqdm import tqdm 
 
 # Almacenamiento local por hilo para manejar sesiones TLS independientes si MAX_WORKERS > 1
 thread_local_proxy = threading.local()
@@ -21,25 +20,6 @@ retried_lock = threading.Lock()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-# Filtro personalizado para mostrar únicamente errores y el resumen del lote
-class ErrorsAndSummaryFilter(logging.Filter):
-    def filter(self, record):
-        # Permitir logs de nivel ERROR o superior
-        if record.levelno >= logging.ERROR:
-            return True
-        # Permitir el mensaje de resumen (aunque sea INFO)
-        if 'Resumen lote:' in record.getMessage():
-            return True
-        return False
-
-# Bandera para habilitar/deshabilitar el filtro (True = solo errores + resumen, False = todo)
-# --------------
-LOG_ERRORS_AND_SUMMARY = False  
-# --------------
-
-if LOG_ERRORS_AND_SUMMARY:
-    log.addFilter(ErrorsAndSummaryFilter())
-
 # LOCAL
 load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
 
@@ -48,8 +28,8 @@ TAX_ID_MARKETPLACES     = 38
 BATCH_LIMIT             = 40   # Facturas por lote
 MAX_WORKERS             = 1    # Hilos concurrentes
 SLEEP_BETWEEN_BATCHES   = 10   # Segundos de respiro tras cada lote
-MAX_EMPTY_RUNS          = 2    # Intentos vacíos antes de terminar
-SLEEP_SECONDS           = 15   # Espera entre intentos vacíos
+MAX_EMPTY_RUNS          = 5    # Intentos vacíos antes de terminar
+SLEEP_SECONDS           = 10   # Espera entre intentos vacíos
 # ----------------------------------------------------------------------------
 
 # ----------------Reintentos para registros en estado ERROR -----------------------------
@@ -59,12 +39,12 @@ SLEEP_SECONDS           = 15   # Espera entre intentos vacíos
 # a resolverse sola) se reintente para siempre. Confirmado que la tabla
 # finance.mkp_billing_prod tiene las columnas retry_count_loader y created_at.
 MAX_ERROR_RETRIES        = 2    # "cierto número de veces"
-ERROR_RETRY_WINDOW_DAYS  = 30   # "lapso de tiempo de creación"
+ERROR_RETRY_WINDOW_DAYS  = 60   # "lapso de tiempo de creación"
 # -----------------------------------------------------------------------------
 
 class TimeoutTransport(xmlrpc.client.SafeTransport):
     """Transporte personalizado para forzar un timeout en XML-RPC."""
-    def __init__(self, timeout=120, *args, **kwargs):
+    def __init__(self, timeout=60, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.timeout = timeout
 
@@ -79,36 +59,20 @@ class OdooModelProxy:
     Proxy para envolver las llamadas a Odoo con reintentos automáticos,
     renovación de sesión TLS y un TIMEOUT estricto para evitar procesos colgados.
     """
-    def __init__(self, url, db, user, pwd, timeout=120, max_retries_init=3, delay_init=2):
+    def __init__(self, url, db, user, pwd, timeout=60):
         self.url = url
         self.db = db
         self.user = user
         self.pwd = pwd
         self.timeout = timeout
-        self.max_retries_init = max_retries_init
-        self.delay_init = delay_init
-
-        # Bucle de reintentos para la conexión inicial y autenticación
-        for attempt in range(1, self.max_retries_init + 1):
-            try:
-                # Instanciamos un transporte con timeout para evitar que la conexión se quede zombi
-                transport = TimeoutTransport(timeout=self.timeout)
-                self.common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', transport=transport)
-                self.uid = self.common.authenticate(db, user, pwd, {})
-                
-                transport_models = TimeoutTransport(timeout=self.timeout)
-                self.models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', transport=transport_models)
-                log.info(f"Conectado a Odoo correctamente (intento {attempt}).")
-                return  # Salir del bucle si todo fue bien
-            except (xmlrpc.client.ProtocolError, TimeoutError, OSError, ConnectionError) as e:
-                log.warning(f"Error de red/Timeout en conexión inicial (intento {attempt}/{self.max_retries_init}): {e}")
-                if attempt == self.max_retries_init:
-                    raise  # Re-lanzar la excepción para que el script falle tras agotar reintentos
-                time.sleep(self.delay_init * attempt)
-            except Exception as e:
-                # Otros errores (autenticación fallida, etc.) no se reintentan
-                log.error(f"Error fatal en conexión inicial (no reintentable): {e}")
-                raise
+        
+        # Instanciamos un transporte con timeout para evitar que la conexión se quede zombi
+        transport = TimeoutTransport(timeout=self.timeout)
+        self.common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', transport=transport)
+        self.uid = self.common.authenticate(db, user, pwd, {})
+        
+        transport_models = TimeoutTransport(timeout=self.timeout)
+        self.models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', transport=transport_models)
 
     def reauthenticate(self):
         log.info("Cerrando sesión TLS y abriendo una nueva conexión con Odoo...")
@@ -746,8 +710,9 @@ def process_batch_concurrently():
     # Mantenemos 1 worker para no estresar el CPU de Odoo con el action_post simultáneo
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_single_invoice, rec, context) for rec in records]
-        # Barra de progreso con tqdm
-        for f in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Procesando lote", unit="factura"):
+        concurrent.futures.wait(futures)
+        
+        for f in futures:
             try:
                 res = f.result()
                 if res and res.get('status') == 'READY_TO_POST':
@@ -820,36 +785,6 @@ def process_batch_concurrently():
                 db_ok.close()
             except Exception as db_ex:
                 log.error(f"Error guardando éxito de action_post() en BD: {db_ex}")
-
-    # --- Resumen de estados del lote (NUEVO) ---
-    try:
-        db_summary = mysql.connector.connect(
-            host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
-        )
-        cursor_summary = db_summary.cursor(dictionary=True)
-        format_strings = ','.join(['%s'] * len(record_ids))
-        cursor_summary.execute(f"""
-            SELECT status, COUNT(*) as count
-            FROM finance.mkp_billing_prod
-            WHERE id IN ({format_strings})
-            GROUP BY status
-        """, record_ids)
-        summary = cursor_summary.fetchall()
-        cursor_summary.close()
-        db_summary.close()
-        status_counts = {row['status']: row['count'] for row in summary}
-        total = len(record_ids)
-        success = status_counts.get('ODOO_INVOICED', 0)
-        already = status_counts.get('ALREADY_ODOO_INVOICED', 0)
-        error_bg = status_counts.get('ERROR_BG', 0)
-        order_not = status_counts.get('ORDER_NOT_ODOO_YET', 0)
-        total_diff = status_counts.get('TOTAL_DIFF', 0)
-        error = status_counts.get('ERROR', 0)
-        processing = status_counts.get('PROCESSING', 0)
-        log.info(f"Resumen lote: Total={total}, Éxitos publicados={success}, Ya facturadas={already}, ERROR_BG={error_bg}, ORDER_NOT_ODOO_YET={order_not}, TOTAL_DIFF={total_diff}, ERROR={error}, PROCESSING={processing}")
-    except Exception as e:
-        log.warning(f"No se pudo obtener resumen de estados del lote: {e}")
 
     # Aumentamos ligeramente el respiro para que el Garbage Collector de Odoo actúe
     log.info(f"Lote terminado. Dando {SLEEP_BETWEEN_BATCHES} segundos de respiro a la RAM de Odoo...")

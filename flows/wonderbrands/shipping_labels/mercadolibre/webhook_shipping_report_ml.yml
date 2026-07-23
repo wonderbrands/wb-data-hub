@@ -1,5 +1,5 @@
 id: ml_daily_shipping_report
-namespace: wonderbrands.mercadolibre.shipping_label
+namespace: wonderbrands.shipping_labels.mercadolibre
 description: "Genera reporte a demanda a partir de un Slash Command de Slack"
 
 variables:
@@ -22,7 +22,7 @@ tasks:
 
       - id: generate_ondemand_csv
         type: io.kestra.plugin.scripts.shell.Commands
-        containerImage: wonderbrands-etl:v1
+        containerImage: wonderbrands-python:v1
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
@@ -48,7 +48,7 @@ tasks:
           - fecha_fin=$(echo $text_input | awk '{print $2}')
           
           # --- RUTA ---
-          - python processes/shipping_labels/mercadolibre/ml_labels_report.py "$fecha_inicio" "$fecha_fin"
+          - python processes/wonderbrands/mercadolibre/ml_labels_report.py "$fecha_inicio" "$fecha_fin"
 triggers:
   - id: slack_webhook
     type: io.kestra.plugin.core.trigger.Webhook
