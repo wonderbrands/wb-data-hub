@@ -1,5 +1,5 @@
 id: daily_dispatch_alerts
-namespace: wonderbrands.finance.odoo
+namespace: wonderbrands.financial.odoo
 description: "Genera y envía el reporte diario de inconsistencias operativas (salidas pendientes y discrepancias)."
 
 variables:

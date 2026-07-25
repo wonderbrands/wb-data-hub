@@ -23,7 +23,7 @@ PARTNER_ID_PUBLICO_GENERAL = 13436
 
 # =======================================================================
 # CONFIGURACIÓN DE PRUEBAS 
-TEST_ORDER_LIMIT = 5  # None -> histórico.
+TEST_ORDER_LIMIT = 4000  # None -> histórico.
 # =======================================================================
 
 # --- VARIABLES DE ENTORNO (Inyectadas por Kestra) ---
