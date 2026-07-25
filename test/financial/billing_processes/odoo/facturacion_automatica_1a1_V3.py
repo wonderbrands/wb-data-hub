@@ -22,7 +22,7 @@ PARTNER_ID_PUBLICO_GENERAL = 13436
 
 # =======================================================================
 # CONFIGURACIÓN DE PRUEBAS 
-TEST_ORDER_LIMIT = 2  # None -> histórico.
+TEST_ORDER_LIMIT = 50  # None -> histórico.
 # =======================================================================
 
 # --- CONFIGURACIÓN BD AUDITORÍA ---
@@ -459,15 +459,15 @@ def process_records(records, delta_days, failed_ids=None):
     if facebook_removed: logging.info(f"Excluidas {len(facebook_removed)} de Salderos / Facebook.")
     
     # ======================  TEST ==============================================
-    tiktok_removed = teams_dict.pop('Team_TikTok', None)
-    amazon_removed = teams_dict.pop('Team_Amazon', None) 
-    coppel_removed = teams_dict.pop('Team_Coppel', None)
-    web_removed = teams_dict.pop('Team_Sitioweb', None)
+    #tiktok_removed = teams_dict.pop('Team_TikTok', None)
+    #amazon_removed = teams_dict.pop('Team_Amazon', None) 
+    #coppel_removed = teams_dict.pop('Team_Coppel', None)
+    #web_removed = teams_dict.pop('Team_Sitioweb', None)
     
-    if tiktok_removed: logging.info(f"Excluidas {len(tiktok_removed)} de Team_TikTok.")
-    if amazon_removed: logging.info(f"Excluidas {len(amazon_removed)} de Team_Amazon.")
-    if coppel_removed: logging.info(f"Excluidas {len(coppel_removed)} de Team_Coppel.")
-    if web_removed: logging.info(f"Excluidas {len(web_removed)} de Team_Sitioweb.")
+    #if tiktok_removed: logging.info(f"Excluidas {len(tiktok_removed)} de Team_TikTok.")
+    #if amazon_removed: logging.info(f"Excluidas {len(amazon_removed)} de Team_Amazon.")
+    #if coppel_removed: logging.info(f"Excluidas {len(coppel_removed)} de Team_Coppel.")
+    #if web_removed: logging.info(f"Excluidas {len(web_removed)} de Team_Sitioweb.")
     # ====================================================================
     
     if TEST_ORDER_LIMIT:
@@ -638,7 +638,9 @@ def execute_invoice(team_name, orders_list):
                             if invoice_date_first_of_month: invoice_vals['invoice_date'] = invoice_date_first_of_month
 
                             try:
+                                # ============================================================================================
                                 inv_id = models.execute_kw(db_name, uid, password, 'account.move', 'create', [invoice_vals])
+                                # ============================================================================================
                             except xmlrpc.client.Fault as e_create:
                                 logging.error(f"Fallo al CREAR factura {order_name}: {e_create.faultString}")
                                 update_audit_record(audit_id, status='ERROR', error_type='CREATION_ERROR', error_log=e_create.faultString)

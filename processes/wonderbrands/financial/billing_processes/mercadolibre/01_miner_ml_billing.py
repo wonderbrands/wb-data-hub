@@ -5,9 +5,11 @@ import base64
 import time
 import json
 from datetime import datetime
-from dotenv import load_dotenv
 import os
 import logging
+from dotenv import load_dotenv
+load_dotenv() 
+
 
 # ── Logging setup ──────────────────────────────────────────────
 logging.basicConfig(
@@ -20,7 +22,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
 
 def xml_to_dict(element):
     """Convierte un elemento XML a dict recursivamente."""

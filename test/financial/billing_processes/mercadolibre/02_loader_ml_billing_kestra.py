@@ -35,6 +35,7 @@ class ErrorsAndSummaryFilter(logging.Filter):
 # Bandera para habilitar/deshabilitar el filtro (True = solo errores + resumen, False = todo)
 # --------------
 LOG_ERRORS_AND_SUMMARY = False  
+PARTNER_ID_PUBLICO_GENERAL = 13436
 # --------------
 
 if LOG_ERRORS_AND_SUMMARY:
@@ -328,7 +329,9 @@ def process_single_invoice(record, context):
             # hasta 2 llamadas a Odoo por factura a, en el peor caso, 2 llamadas
             # para el LOTE COMPLETO.
             partner_invoice_id = so_data['partner_id'][0]
-            if rfc_receptor and rfc_receptor != 'XAXX010101000':
+            if rfc_receptor and rfc_receptor == 'XAXX010101000':
+                partner_invoice_id = PARTNER_ID_PUBLICO_GENERAL
+            else:
                 partner_invoice_id = partner_map.get(rfc_receptor, partner_invoice_id)
 
             # Armar líneas desde caché
@@ -411,20 +414,7 @@ def process_single_invoice(record, context):
             # permitir el mensaje inicial en el chatter, y se agrega un mensaje custom.
             inv_id = models.execute_kw(
                 odoo_db, uid, odoo_pwd, 'account.move', 'create', [invoice_vals],
-                {'context': {'tracking_disable': True}}
             )
-            # Mensaje inicial "manual" y liviano en el chatter, sin el costo de
-            # computar tracking de cada campo trackeado ni de recalcular followers/notificaciones:
-            try:
-                models.execute_kw(
-                    odoo_db, uid, odoo_pwd, 'account.move', 'message_post', [[inv_id]],
-                    {'kwargs': {
-                        'body': f"Factura generada automáticamente desde pedido Mercado Libre {mkp_order}.",
-                        'subtype_xmlid': 'mail.mt_note',
-                    }}
-                )
-            except Exception as ex:
-                log.debug(f"No se pudo postear mensaje de chatter en factura {inv_id}: {ex} (Ignorando)")
             
             # ---------------------------------------------------------------------------------
         # Buscar líneas para CxC (se ejecuta SIEMPRE: factura nueva O reanudada)

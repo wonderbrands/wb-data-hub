@@ -48,7 +48,7 @@ tasks:
           - fecha_fin=$(echo $text_input | awk '{print $2}')
           
           # --- RUTA ---
-          - python processes/wonderbrands/mercadolibre/ml_labels_report.py "$fecha_inicio" "$fecha_fin"
+          - python processes/wonderbrands/shipping_labels/mercadolibre/ml_labels_report.py "$fecha_inicio" "$fecha_fin"
 triggers:
   - id: slack_webhook
     type: io.kestra.plugin.core.trigger.Webhook

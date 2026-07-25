@@ -53,8 +53,8 @@ tasks:
         env:
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"
-          ODOO_USER: "{{ secret('ODOO_USER_PROD') }}"
-          ODOO_PASSWORD: "{{ secret('ODOO_PASSWORD_PROD') }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
           DB_HOST: "{{ vars.db1_host }}"
           DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"

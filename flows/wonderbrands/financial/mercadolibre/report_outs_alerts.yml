@@ -1,5 +1,5 @@
 id: daily_dispatch_alerts
-namespace: wonderbrands.finance
+namespace: wonderbrands.finance.odoo
 description: "Genera y envía el reporte diario de inconsistencias operativas (salidas pendientes y discrepancias)."
 
 variables:
@@ -31,7 +31,7 @@ tasks:
 
       - id: generate_csv_report
         type: io.kestra.plugin.scripts.shell.Commands
-        containerImage: wonderbrands-etl:v1
+        containerImage: wonderbrands-python:v1
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
@@ -45,7 +45,7 @@ tasks:
            odoo_user_dataV18: "{{ secret('odoo_user_dataV18') }}"
            odoo_password_dataV18: "{{ secret('odoo_password_dataV18') }}"
         commands:
-          - python processes/financial/billing_processes/mercadolibre/dispatchs_alerts.py
+          - python processes/wonderbrands/financial/billing_processes/odoo/dispatchs_alerts.py
         outputFiles:
           - "Reporte_Inconsistencias_*.csv"
 

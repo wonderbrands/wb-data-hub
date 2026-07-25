@@ -1,6 +1,6 @@
-id: ml_billing_flow
-namespace: wonderbrands.finance.mercadolibre
-description: "Pipeline Facturación: Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
+id: odoo_facturacion_1a1_pipeline
+namespace: wonderbrands.financial.odoo
+description: "Pipeline de facturación 1 a 1 para órdenes de marketplaces en Odoo"
 
 # Configuración por defecto para todas las tareas Commands de este flujo
 pluginDefaults:
@@ -12,7 +12,7 @@ pluginDefaults:
         pullPolicy: NEVER
       retry:
         type: constant
-        interval: PT2M
+        interval: PT1M
         maxAttempt: 3
 
 variables:
@@ -22,13 +22,13 @@ variables:
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
   db_name: "finance"
-  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
 
 tasks:
   - id: working_env_billing
     type: io.kestra.plugin.core.flow.WorkingDirectory
     tasks:
-      
+
       - id: clone_repo
         type: io.kestra.plugin.git.Clone
         url: "{{ vars.repo_url }}"
@@ -36,37 +36,28 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
-      # ── PASO 01: Extracción de XMLs de Mercado Libre a BD ──
-      - id: run_miner_ml_billing
+      - id: execute_invoicing_1a1
         type: io.kestra.plugin.scripts.shell.Commands
         env:
-          DB_HOST: "{{ vars.db1_host }}"
-          DB_USER: "{{ vars.db_user }}"
-          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
-          DB_NAME: "{{ vars.db_name }}"
-        commands:
-          - python processes/wonderbrands/financial/billing_processes/mercadolibre/01_miner_ml_billing.py
-
-      # ── PASO 02: Inyección de Facturas a Odoo (Lotes controlados) ──
-      - id: run_loader_ml_billing
-        type: io.kestra.plugin.scripts.shell.Commands
-        env:
-          ODOO_URL: "{{ vars.odoo_url }}" 
+          ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"
           ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
           ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
-          DB_HOST: "{{ vars.db1_host }}"
+          DB_HOST: "{{ vars.db_host }}"
           DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
         commands:
-          - python processes/wonderbrands/financial/billing_processes/mercadolibre/02_loader_ml_billing.py
+          - python processes/wonderbrands/financial/billing_processes/odoo/facturacion_automatica_1a1.py
 
 triggers:
-  # Distribución de carga: Se ejecuta cada 3 horas (00:00, 03:00, 06:00, etc. UTC)
-  - id: micro_lotes_cada_3_horas
+  - id: ejecucion_diaria_noche     # Ejecuta todos los días a las 11:30 PM CDMX
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 0,3,6,9,12,15,18,21 * * *"
+    cron: "30 23 * * *"
+
+  - id: ejecucion_mediodia           # Ejecuta a las 1:30 PM CDMX
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 13 * * *"
 
 errors:
   - id: slack_alert
@@ -74,5 +65,5 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *¡Fallo en Pipeline de Facturación ML (Scripts 01-02)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
+        "text": "🚨 *Fallo crítico en el pipeline de Facturación 1 a 1 (Odoo)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
       }
