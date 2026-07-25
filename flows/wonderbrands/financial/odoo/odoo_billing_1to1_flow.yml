@@ -10,6 +10,10 @@ pluginDefaults:
       taskRunner:
         type: io.kestra.plugin.scripts.runner.docker.Docker
         pullPolicy: NEVER
+        memory:
+          memory: "512MB"       # Límite de RAM física para el script Python
+          memorySwap: "2048MB"   # Límite total (RAM + Swap del host)
+        cpus: 1.5                # (Opcional) Limita el uso de CPU a 1.5 núcleos
       retry:
         type: constant
         interval: PT1M
@@ -53,11 +57,11 @@ tasks:
 triggers:
   - id: ejecucion_diaria_noche     # Ejecuta todos los días a las 11:30 PM CDMX
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 23 * * *"
+    cron: "30 05 * * *"
 
-  - id: ejecucion_mediodia           # Ejecuta a las 1:30 PM CDMX
+  - id: ejecucion_mediodia           # Ejecuta a las 4:30 AM CDMX
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 13 * * *"
+    cron: "30 10 * * *"
 
 errors:
   - id: slack_alert
