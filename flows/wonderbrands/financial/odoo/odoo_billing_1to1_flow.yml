@@ -1,4 +1,4 @@
-id: odoo_facturacion_1a1_pipeline
+id: odoo_facturacion_1a1_mkp_pipeline
 namespace: wonderbrands.financial.odoo
 description: "Pipeline de facturación 1 a 1 para órdenes de marketplaces en Odoo"
 

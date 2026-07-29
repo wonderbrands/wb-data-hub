@@ -1,4 +1,4 @@
-id: housekeeping_purge
+id: housekeeping_daily_purge
 namespace: wonderbrands.system
 description: |
   Purga diaria de ejecuciones, logs y outputs con más de 45 días de antigüedad.
