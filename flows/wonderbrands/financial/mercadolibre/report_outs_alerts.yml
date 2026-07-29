@@ -73,7 +73,7 @@ tasks:
         username: "{{ secret('SMTP_USERNAME') }}" 
         password: "{{ secret('SMTP_PASSWORD') }}" 
         from: "data@wonderbrands.co"
-        to: "sergio@wonderbrands.co, jeronimo@wonderbrands.co, carlos.hinojosa@wonderbrands.co, martin.barone@somos-reyes.com"
+        to: "sergio@wonderbrands.co, jeronimo@wonderbrands.co, carlos.hinojosa@wonderbrands.co, martin.barone@somos-reyes.com, penhos@somos-reyes.com"
         subject: "⚠️ Reporte diario: Inconsistencias de despacho y facturación"
         htmlTextContent: |
           <h3>Reporte Diario de Control de Despachos</h3>

@@ -1,8 +1,10 @@
 import os
 import sys
 import gc
+import json
 import time as tm
 import logging
+import urllib.request
 from datetime import datetime, timedelta
 import xmlrpc.client
 import mysql.connector
@@ -11,13 +13,54 @@ from mysql.connector import Error
 __description__ = """
     **** V18 - FACTURACION 1 A 1 OPTIMIZADA (KESTRA COMPATIBLE) ****
     **** Version con perfil de memoria plano (streaming / chunking) ****
-    
+
     Automatiza la facturación 1 a 1 de marketplaces en Odoo 18 mediante procesamiento
     incremental por día y por lotes, optimizando el consumo de memoria sin alterar la
     lógica contable. Incluye reintentos automáticos ante errores 502/Timeout, auditoría
     de ejecución, asignación de cuentas por marketplace, timbrado automático y gestión
     eficiente de órdenes fallidas, preservando la integridad del proceso de facturación.
- 
+
+
+    ###################################################################
+    #  BLINDAJE ANTI DOBLE FACTURACION  (incidente del 26-jul-2026)   #
+    ###################################################################
+
+    CAUSA RAIZ: dos ejecuciones concurrentes del flujo (2WBdjxnN, iniciada
+    23:30 del 25-jul y matada 06:21 del 26-jul, contra 5pD4GWFm, iniciada
+    04:30 del 26-jul) se traslaparon 1h51m. Cada una tomo su propio snapshot
+    de facturas existentes al inicio de cada lote y ninguna vio a la otra:
+    549 ordenes con doble CFDI timbrado, folios 61332-62441 (1,110 folios
+    consecutivos / 549 ordenes = 2.02 por orden).
+
+    La exclusion mutua entre ejecuciones ahora vive en Kestra
+    (concurrency: limit 1, behavior FAIL).
+    Este archivo aporta las cinco defensas que corresponden al script:
+
+      1. RE-VALIDACION antes del create. El snapshot de facturas existentes
+         se toma una vez por lote y puede tener hasta N minutos de
+         antiguedad. Se vuelve a preguntar a Odoo inmediatamente antes de
+         crear. FAIL-CLOSED: si la comprobacion falla, NO se crea.
+
+      2. CLAVE DE IDEMPOTENCIA en account.move.ref ('AUTOINV:<orden>').
+         El campo estaba sin usar. Permite localizar una factura huerfana
+         cuando se pierde la respuesta del create.
+
+      3. RETRY CONSCIENTE DEL METODO. Solo se reintentan lecturas. Un 502 o
+         un timeout en una escritura NO dice si Odoo hizo commit: se lanza
+         OdooWriteUncertain y se reconcilia leyendo, nunca reintentando.
+
+      4. DETECCION REAL DE DUPLICADOS. invoiced_origins era un dict
+         {origen: factura}: un dict no puede guardar dos valores con la misma
+         llave, asi que cuando una orden tenia dos facturas una desaparecia
+         en silencio. Por eso el log reportaba siempre la primera y nunca
+         supo de la segunda. Ahora es {origen: [facturas]} y len>1 es un
+         incidente fiscal que se alerta y se aparta.
+
+      5. SIN RETRY CIEGO EN main(). Relanzar run() a media corrida vuelve a
+         recorrer la misma lista. Un fallo ahora es visible, no automatico.
+
+    Ver tambien: frontera de dia corregida (<= -> <) y limpieza de registros
+    'PROCESSING' con antiguedad minima.
 """
 
 # --- CONFIGURACION DE LOGS PARA DOCKER / KESTRA ---
@@ -32,7 +75,7 @@ PARTNER_ID_PUBLICO_GENERAL = 13436
 
 # =======================================================================
 # CONFIGURACION DE PRUEBAS
-TEST_ORDER_LIMIT = 2000  # None -> historico.
+TEST_ORDER_LIMIT = 5  # None -> historico.
 # =======================================================================
 
 # --- TAMANOS DE LOTE (controlan el techo de memoria) ---
@@ -40,6 +83,12 @@ ORDER_LINE_BATCH_SIZE = 100      # ordenes por lote al descargar sale.order.line
 FAILED_ORDERS_BATCH_SIZE = 500   # ordenes fallidas por lote (search_read por id)
 LOG_PROGRESS_EVERY = 50          # cada cuantas ordenes se imprime avance
 MESSAGE_QUERY_SAFETY_LIMIT = 20000  # limite de seguridad para queries de mensajes
+
+# --- BLINDAJE: prefijo de la clave de idempotencia escrita en account.move.ref ---
+IDEMPOTENCY_PREFIX = 'AUTOINV:'
+
+# --- BLINDAJE: antiguedad minima para dar por muerto un registro 'PROCESSING' ---
+STUCK_PROCESSING_MIN_AGE_HOURS = 6
 
 # --- VARIABLES DE ENTORNO (Inyectadas por Kestra) ---
 ODOO_URL = os.getenv('ODOO_URL')
@@ -52,13 +101,48 @@ DB_USER = os.getenv('DB_USER', 'root')
 DB_PASS = os.getenv('DB_PASSWORD', '')
 DB_NAME = os.getenv('DB_NAME', 'finance')
 
+SLACK_WEBHOOK = os.getenv('SLACK_WEBHOOK')
+KESTRA_EXECUTION_ID = os.getenv('KESTRA_EXECUTION_ID', 'local')
+
 ERROR_502_COUNTER = 0
 
 UTC_local = -6
 
 
+class OdooWriteUncertain(Exception):
+    """Una ESCRITURA en Odoo fallo por red: se desconoce si hubo commit.
+
+    Es lo que permite distinguir
+    "Odoo rechazo la operacion" (xmlrpc Fault: hubo rollback, no hay factura)
+    de "no se sabe si Odoo la aplico" (502 / timeout: puede haber factura).
+    La primera se puede dar por fallida; la segunda JAMAS se reintenta a
+    ciegas, se reconcilia leyendo.
+    """
+
+
 # =======================================================================
-# AUDITORIA MYSQL (INTACTA - misma firma, mismo comportamiento)
+# ALERTA A SLACK DESDE EL SCRIPT
+#   El webhook del YAML solo dispara en 'errors:', es decir cuando el
+#   pipeline falla. Las dos corridas que timbraron 549 CFDI de mas
+#   terminaron con exit code 0 y nadie se entero.
+# =======================================================================
+
+def notify_slack(text):
+    if not SLACK_WEBHOOK:
+        log.warning('SLACK_WEBHOOK no configurado: la alerta no se envio.')
+        return
+    try:
+        req = urllib.request.Request(
+            SLACK_WEBHOOK,
+            data=json.dumps({'text': text}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        log.warning(f"No se pudo enviar la alerta a Slack: {e}")
+
+
+# =======================================================================
+# AUDITORIA MYSQL
 # =======================================================================
 
 def get_db_connection():
@@ -123,20 +207,32 @@ def update_audit_record(record_id, status, error_type='NONE', error_log=None, in
 
 
 def reset_stuck_processing_records():
+    """Devuelve a 'ERROR' los registros trabados en 'PROCESSING'.
+
+    BLINDAJE: se agrego la condicion de antiguedad minima. La version
+    anterior hacia UPDATE sobre TODOS los 'PROCESSING' sin filtro alguno,
+    de modo que un proceso al arrancar borraba el marcador de trabajo en
+    vuelo de cualquier otro proceso activo y reinyectaba sus ordenes en
+    get_failed_order_ids() como candidatas a reintento. Era la unica
+    estructura que podia haber funcionado como semaforo y la desarmaba el
+    segundo proceso al iniciar.
+    """
     conn = get_db_connection()
     if not conn:
         return
     try:
         cursor = conn.cursor()
-        cursor.execute("""
+        cursor.execute(f"""
             UPDATE finance.billing_audit_log
             SET status = 'ERROR', error_type = '502_BAD_GATEWAY', error_log = 'Proceso interrumpido abruptamente (reseteado por limpieza inicial)'
             WHERE status = 'PROCESSING'
+              AND updated_at < (CURRENT_TIMESTAMP - INTERVAL {STUCK_PROCESSING_MIN_AGE_HOURS} HOUR)
         """)
         affected = cursor.rowcount
         conn.commit()
         if affected:
-            log.warning(f"Limpieza inicial: {affected} registro(s) trabados en 'PROCESSING' regresados a 'ERROR' para reintento.")
+            log.warning(f"Limpieza inicial: {affected} registro(s) trabados en 'PROCESSING' "
+                        f"por mas de {STUCK_PROCESSING_MIN_AGE_HOURS}h regresados a 'ERROR' para reintento.")
     except Error as e:
         log.error(f"No se pudo ejecutar la limpieza de registros 'PROCESSING': {e}")
     finally:
@@ -179,7 +275,7 @@ def get_account_id(models, db, uid, pwd, code):
 
 
 # =======================================================================
-# PROXY Y TRANSPORTE DE RESILIENCIA ANTE ERRORES 502 / TIMEOUTS (INTACTO)
+# PROXY Y TRANSPORTE DE RESILIENCIA ANTE ERRORES 502 / TIMEOUTS
 # =======================================================================
 
 class TimeoutTransport(xmlrpc.client.SafeTransport):
@@ -194,6 +290,19 @@ class TimeoutTransport(xmlrpc.client.SafeTransport):
 
 
 class OdooModelProxy:
+
+    # BLINDAJE: metodos de LECTURA. Son idempotentes y se pueden reintentar
+    # sin ningun riesgo. Cualquier otro metodo (create, write, action_post,
+    # action_send_and_print, message_post, button_*) MODIFICA datos: si la
+    # respuesta se pierde por red, el cliente NO sabe si Odoo hizo commit.
+    # Odoo ejecuta el create en su propia transaccion y la confirma aunque
+    # el cliente ya no escuche. Reintentar a ciegas es exactamente lo que
+    # produjo las facturas duplicadas.
+    IDEMPOTENT_METHODS = frozenset({
+        'search', 'search_read', 'read', 'search_count', 'read_group',
+        'fields_get', 'default_get', 'name_search', 'name_get',
+    })
+
     def __init__(self, url, db, user, pwd, timeout=300, max_retries_init=3, delay_init=2):
         global ERROR_502_COUNTER
         self.url = url
@@ -235,16 +344,28 @@ class OdooModelProxy:
 
     def execute_kw(self, db, uid, pwd, model, method, args, kwargs=None, max_retries=3, delay=2):
         global ERROR_502_COUNTER
+
+        is_write = method not in self.IDEMPOTENT_METHODS
+        if is_write:
+            max_retries = 1   # BLINDAJE: las escrituras NO se reintentan
+
         for attempt in range(1, max_retries + 1):
             try:
                 if kwargs is not None:
                     return self.models.execute_kw(self.db, self.uid, self.pwd, model, method, args, kwargs)
                 else:
                     return self.models.execute_kw(self.db, self.uid, self.pwd, model, method, args)
+
             except xmlrpc.client.Fault as e:
+                # Error de negocio de Odoo: determinista, la transaccion hizo rollback. Se propaga tal cual.
                 raise e
+
             except (xmlrpc.client.ProtocolError, TimeoutError, OSError) as e:
                 ERROR_502_COUNTER += 1
+                if is_write:
+                    log.error(f"Error de red en ESCRITURA [{model}.{method}]: {e}. "
+                              f"NO se reintenta: el resultado en Odoo es INDETERMINADO.")
+                    raise OdooWriteUncertain(f"{model}.{method}: {e}") from e
                 log.warning(f"Error de red/Timeout en Odoo [{model}.{method}]: {str(e)}. Intento {attempt}/{max_retries}...")
                 if attempt == max_retries:
                     raise e
@@ -253,9 +374,14 @@ class OdooModelProxy:
                     self.reauthenticate()
                 except Exception as auth_e:
                     log.warning(f"Error al reautenticar con Odoo: {str(auth_e)}")
+
             except Exception as e:
-                log.warning(f"Error de comunicacion en Odoo [{model}.{method}]. Intento {attempt}/{max_retries}: {str(e)}")
                 ERROR_502_COUNTER += 1
+                if is_write:
+                    log.error(f"Error de comunicacion en ESCRITURA [{model}.{method}]: {e}. "
+                              f"NO se reintenta: el resultado en Odoo es INDETERMINADO.")
+                    raise OdooWriteUncertain(f"{model}.{method}: {e}") from e
+                log.warning(f"Error de comunicacion en Odoo [{model}.{method}]. Intento {attempt}/{max_retries}: {str(e)}")
                 if attempt == max_retries:
                     raise e
                 tm.sleep(delay * attempt)
@@ -308,6 +434,11 @@ class BillingContext:
         self.skipped_grace = 0
         self.test_limit_remaining = TEST_ORDER_LIMIT  # None o int
 
+        # --- BLINDAJE: metricas de duplicidad ---
+        self.duplicates_found = []      # ordenes que YA tienen 2+ facturas vivas
+        self.duplicates_avoided = 0     # creates abortados por la re-validacion
+        self.invoices_adopted = 0       # facturas recuperadas tras un create incierto
+
         self.start_time = tm.time()
 
     def account_for_team(self, team_name):
@@ -326,6 +457,65 @@ class BillingContext:
         if 'Mayoreo' in team_name:
             return self.accounts.get('mayoreo')
         return None
+
+
+# =======================================================================
+# BLINDAJE: HELPERS DE IDEMPOTENCIA
+# =======================================================================
+
+def count_live_invoices(context, order_name):
+    """Cuantas facturas de cliente VIVAS tiene ya esta orden en Odoo, AHORA.
+
+    Se llama inmediatamente antes del create. El snapshot de facturas
+    existentes del lote se toma una sola vez y puede tener hasta ~68 minutos
+    de antiguedad (medido en la corrida del 26-jul: el lote Amazon del Dia 17
+    tardo de 04:57 a 06:05).
+
+    Devuelve -1 si la comprobacion no se pudo realizar, para que el llamador
+    aborte por seguridad (FAIL-CLOSED).
+    """
+    try:
+        return context.models.execute_kw(
+            ODOO_DB, context.uid, ODOO_PWD, 'account.move', 'search_count',
+            [[('invoice_origin', '=', order_name),
+              ('move_type', '=', 'out_invoice'),
+              ('state', '!=', 'cancel')]])
+    except Exception as e:
+        log.error(f"No se pudo re-validar {order_name} contra Odoo antes de crear: {e}")
+        return -1
+
+
+def find_invoice_by_key(context, order_name):
+    """Localiza la factura de una orden tras un create de resultado incierto.
+
+    Busca primero por la clave de idempotencia en 'ref' y, como respaldo
+    (facturas anteriores a esta convencion), por invoice_origin.
+
+    Es la alternativa al reintento ciego: si Odoo confirmo la transaccion y
+    la respuesta se perdio, la factura EXISTE y hay que adoptarla, no crear
+    otra.
+    """
+    domains = [
+        [('ref', '=', f'{IDEMPOTENCY_PREFIX}{order_name}'),
+         ('move_type', '=', 'out_invoice'), ('state', '!=', 'cancel')],
+        [('invoice_origin', '=', order_name),
+         ('move_type', '=', 'out_invoice'), ('state', '!=', 'cancel')],
+    ]
+    for domain in domains:
+        try:
+            found = context.models.execute_kw(
+                ODOO_DB, context.uid, ODOO_PWD, 'account.move', 'search_read', [domain],
+                {'fields': ['id', 'name', 'state', 'l10n_mx_edi_cfdi_uuid'], 'order': 'id asc'})
+        except Exception as e:
+            log.error(f"Reconciliacion de {order_name} fallida: {e}")
+            return None
+        if found:
+            if len(found) > 1:
+                log.error(f"ALERTA: durante la reconciliacion, {order_name} presenta "
+                          f"{len(found)} facturas vivas: {[f.get('name') for f in found]}")
+                context.duplicates_found.append(order_name)
+            return found[0]
+    return None
 
 
 # =======================================================================
@@ -398,7 +588,12 @@ def search_sales_with_stock_insufficient_message(context, start_day, end_day):
 
 
 def fetch_records(context, day_start, day_end):
-    so_domain = [('invoice_status', '=', 'to invoice'), ('locked', '=', 'True'), ('date_order', '>=', day_start), ('date_order', '<=', day_end)]
+    # BLINDAJE: day_end era inclusivo ('<=') y coincide exactamente con el
+    # day_start del dia siguiente, tambien inclusivo. Una orden con
+    # date_order justo en la frontera se procesaba DOS veces, en dos lotes
+    # distintos. Ahora el extremo superior es exclusivo.
+    so_domain = [('invoice_status', '=', 'to invoice'), ('locked', '=', 'True'),
+                 ('date_order', '>=', day_start), ('date_order', '<', day_end)]
     try:
         return context.models.execute_kw(ODOO_DB, context.uid, ODOO_PWD, 'sale.order', 'search_read', [so_domain])
     except Exception as e:
@@ -489,10 +684,20 @@ def execute_invoice(context, team_name, orders_list):
         data = context.models.execute_kw(
             ODOO_DB, context.uid, ODOO_PWD, 'account.move', 'search_read',
             [[('invoice_origin', 'in', chunk), ('move_type', '=', 'out_invoice'), ('state', '!=', 'cancel')]],
-            {'fields': ['id', 'invoice_origin', 'name', 'state', 'l10n_mx_edi_cfdi_uuid']})
+            {'fields': ['id', 'invoice_origin', 'name', 'state', 'l10n_mx_edi_cfdi_uuid'],
+             'order': 'id asc'})
         existing_invoices_data.extend(data)
 
-    invoiced_origins = {inv['invoice_origin']: inv for inv in existing_invoices_data if inv['invoice_origin']}
+    # BLINDAJE: antes era {inv['invoice_origin']: inv}. Un dict NO puede
+    # guardar dos valores con la misma llave: si una orden tenia dos
+    # facturas, una desaparecia en silencio. Como account.move._order
+    # termina en 'id desc', sobrevivia la mas ANTIGUA, y de ahi que el log
+    # siempre reportara la primera factura y nunca supiera de la segunda.
+    # Ahora se conserva la lista completa y len>1 es detectable.
+    invoiced_origins = {}
+    for inv in existing_invoices_data:
+        if inv.get('invoice_origin'):
+            invoiced_origins.setdefault(inv['invoice_origin'], []).append(inv)
     del existing_invoices_data, order_names
 
     # --- Procesamiento en sub-lotes de ORDER_LINE_BATCH_SIZE ordenes ---
@@ -522,8 +727,23 @@ def execute_invoice(context, team_name, orders_list):
             needs_post = True
             needs_stamping = True
 
-            if order_name in invoiced_origins:
-                existing_inv = invoiced_origins[order_name]
+            facturas_previas = invoiced_origins.get(order_name) or []
+
+            # --- BLINDAJE: duplicidad ya materializada ---
+            # La orden tiene dos o mas CFDI vivos: no se puede resolver desde aqui (requiere
+            # cancelacion fiscal ante el SAT), asi que se aparta y se alerta.
+            if len(facturas_previas) > 1:
+                nombres = [f.get('name') for f in facturas_previas]
+                log.error(f"DUPLICADO FISCAL: {order_name} tiene {len(facturas_previas)} facturas "
+                          f"vivas {nombres}. Se aparta; requiere cancelacion manual.")
+                context.duplicates_found.append(order_name)
+                update_audit_record(audit_id, status='IGNORED_DUPLICATE', error_type='VALIDATION_ERROR',
+                                    error_log=f"DUPLICADO FISCAL: {len(facturas_previas)} facturas vivas: {nombres}",
+                                    invoice_name=nombres[0], invoice_id=facturas_previas[0]['id'])
+                continue
+
+            if facturas_previas:
+                existing_inv = facturas_previas[0]
                 inv_id = existing_inv['id']
                 inv_state = existing_inv['state']
                 inv_name = existing_inv.get('name')
@@ -602,7 +822,12 @@ def execute_invoice(context, team_name, orders_list):
 
                             if invoice_line_vals_list and not abortar_orden:
                                 invoice_vals = {
-                                    'ref': '', 'move_type': 'out_invoice', 'partner_id': PARTNER_ID_PUBLICO_GENERAL,
+                                    # BLINDAJE: clave de idempotencia. El campo
+                                    # 'ref' se enviaba vacio y estaba disponible.
+                                    # Permite localizar la factura si se pierde
+                                    # la respuesta del create.
+                                    'ref': f'{IDEMPOTENCY_PREFIX}{order_name}',
+                                    'move_type': 'out_invoice', 'partner_id': PARTNER_ID_PUBLICO_GENERAL,
                                     'invoice_origin': order_name, 'invoice_line_ids': invoice_line_vals_list,
                                     'l10n_mx_edi_usage': 'S01', 'l10n_mx_edi_payment_method_id': 3,
                                     'l10n_mx_edi_payment_policy': 'PUE', 'team_id': team_id,
@@ -610,12 +835,64 @@ def execute_invoice(context, team_name, orders_list):
                                 if context.invoice_date_first_of_month:
                                     invoice_vals['invoice_date'] = context.invoice_date_first_of_month
 
+                                # ===== BLINDAJE: RE-VALIDACION PRE-CREATE =====
+                                # invoiced_origins se calculo al inicio del lote
+                                # y puede tener hasta N min de antiguedad. Esta
+                                # es la ultima oportunidad de ver una factura que
+                                # aparecio despues del snapshot.
+                                live = count_live_invoices(context, order_name)
+                                if live < 0:
+                                    # FAIL-CLOSED: sin poder verificar, no se crea.
+                                    log.error(f"{order_name}: re-validacion no concluyente. "
+                                              f"Se omite para no arriesgar duplicidad.")
+                                    update_audit_record(audit_id, status='ERROR', error_type='VALIDATION_ERROR',
+                                                        error_log='Re-validacion previa al create no concluyente')
+                                    continue
+                                if live > 0:
+                                    context.duplicates_avoided += 1
+                                    log.warning(f"DUPLICADO EVITADO EN CARRERA: {order_name} adquirio "
+                                                f"{live} factura(s) despues del snapshot del lote. No se crea otra.")
+                                    update_audit_record(audit_id, status='IGNORED_DUPLICATE',
+                                                        error_log=f"Re-validacion previa: ya existian {live} factura(s) vivas")
+                                    continue
+                                # ==============================================
+
                                 try:
                                     inv_id = context.models.execute_kw(ODOO_DB, context.uid, ODOO_PWD, 'account.move', 'create', [invoice_vals])
                                 except xmlrpc.client.Fault as e_create:
                                     log.error(f"Fallo al CREAR factura {order_name}: {e_create.faultString}")
                                     update_audit_record(audit_id, status='ERROR', error_type='CREATION_ERROR', error_log=e_create.faultString)
                                     continue
+                                except OdooWriteUncertain as e_create:
+                                    # BLINDAJE: el create pudo haberse aplicado en
+                                    # Odoo aunque la respuesta se perdiera. En vez
+                                    # de reintentar (lo que duplicaba la factura),
+                                    # se le pregunta a Odoo por la clave de
+                                    # idempotencia y se adopta lo que exista.
+                                    log.error(f"CREATE de resultado INDETERMINADO en {order_name}: {e_create}")
+                                    adoptada = find_invoice_by_key(context, order_name)
+                                    if not adoptada:
+                                        log.error(f"{order_name}: no existe factura en Odoo. Se reintentara en la proxima corrida.")
+                                        update_audit_record(audit_id, status='ERROR', error_type='502_BAD_GATEWAY',
+                                                            error_log=f"Create indeterminado, sin factura en Odoo: {e_create}")
+                                        continue
+
+                                    inv_id = adoptada['id']
+                                    context.invoices_adopted += 1
+                                    _name = adoptada.get('name')
+                                    _uuid = adoptada.get('l10n_mx_edi_cfdi_uuid')
+                                    _is_stamped = bool(_uuid and _uuid != 'False')
+                                    log.warning(f"FACTURA RECUPERADA: {order_name} SI se habia creado en Odoo "
+                                                f"(id={inv_id}, state={adoptada.get('state')}). Se adopta en lugar de crear otra.")
+
+                                    if adoptada.get('state') == 'posted':
+                                        needs_post = False
+                                        real_invoice_name = _name if _name not in (False, 'False') else None
+                                        needs_stamping = not _is_stamped
+                                        if not needs_stamping:
+                                            update_audit_record(audit_id, status='SUCCESS', invoice_name=real_invoice_name,
+                                                                invoice_id=inv_id, automation_status='STAMPED')
+                                            continue
                                 except Exception as e_create:
                                     log.error(f"Error al CREAR factura {order_name}: {e_create}")
                                     update_audit_record(audit_id, status='ERROR', error_type='502_BAD_GATEWAY' if '502' in str(e_create) else 'CREATION_ERROR', error_log=str(e_create))
@@ -644,6 +921,14 @@ def execute_invoice(context, team_name, orders_list):
                                 log.error(f"Fallo al CONFIRMAR factura {order_name}: {e_post.faultString}")
                                 update_audit_record(audit_id, status='ERROR', error_type='POSTING_ERROR', error_log=e_post.faultString, invoice_id=inv_id, automation_status='DRAFT')
                                 continue
+                            except OdooWriteUncertain as e_post:
+                                # La factura EXISTE (inv_id conocido). Si quedo
+                                # posteada o no lo dira la proxima corrida al
+                                # leerla por invoice_origin. Nunca se recrea.
+                                log.error(f"CONFIRMACION de resultado INDETERMINADO en {order_name}: {e_post}")
+                                update_audit_record(audit_id, status='ERROR', error_type='502_BAD_GATEWAY',
+                                                    error_log=f"Posting indeterminado: {e_post}", invoice_id=inv_id, automation_status='DRAFT')
+                                continue
                             except Exception as e_post:
                                 log.error(f"Error al CONFIRMAR factura {order_name}: {e_post}")
                                 update_audit_record(audit_id, status='ERROR', error_type='502_BAD_GATEWAY' if '502' in str(e_post) else 'POSTING_ERROR', error_log=str(e_post), invoice_id=inv_id, automation_status='DRAFT')
@@ -671,10 +956,34 @@ def execute_invoice(context, team_name, orders_list):
                                 log.error(f"Fallo al TIMBRAR factura de {order_name}: {e_stamp.faultString}")
                                 update_audit_record(audit_id, status='ERROR', error_type='STAMPING_ERROR', error_log=e_stamp.faultString, invoice_name=real_invoice_name, invoice_id=inv_id, automation_status='POSTED')
                                 continue
+                            except OdooWriteUncertain as e_stamp:
+                                # El timbrado pudo haberse enviado al PAC. NO se
+                                # reintenta aqui: la proxima corrida leera el UUID
+                                # real y decidira si falta timbrar.
+                                log.error(f"TIMBRADO de resultado INDETERMINADO en {order_name}: {e_stamp}")
+                                update_audit_record(audit_id, status='ERROR', error_type='502_BAD_GATEWAY',
+                                                    error_log=f"Timbrado indeterminado: {e_stamp}", invoice_name=real_invoice_name, invoice_id=inv_id, automation_status='POSTED')
+                                continue
                             except Exception as e_stamp:
                                 log.error(f"Error al TIMBRAR factura de {order_name}: {e_stamp}")
                                 update_audit_record(audit_id, status='ERROR', error_type='502_BAD_GATEWAY' if '502' in str(e_stamp) else 'STAMPING_ERROR', error_log=str(e_stamp), invoice_name=real_invoice_name, invoice_id=inv_id, automation_status='POSTED')
                                 continue
+                    else:
+                        # BLINDAJE: antes no habia rama 'else' y el registro de
+                        # auditoria se quedaba en 'PROCESSING' para siempre; la
+                        # limpieza inicial de la corrida siguiente lo pasaba a
+                        # 'ERROR' y entraba en la cola de reintentos de forma
+                        # indefinida.
+                        log.debug(f"Orden {order_name} no elegible: invoice_status="
+                                  f"{order['invoice_status']}, invoice_count={order['invoice_count']}")
+                        update_audit_record(audit_id, status='IGNORED_NO_STOCK', error_type='VALIDATION_ERROR',
+                                            error_log=f"No elegible: invoice_status={order['invoice_status']}, "
+                                                      f"invoice_count={order['invoice_count']}")
+                else:
+                    # Mismo motivo que la rama anterior: cerrar el registro.
+                    log.debug(f"Orden {order_name} no elegible: state={order['state']}, locked={order.get('locked')}")
+                    update_audit_record(audit_id, status='IGNORED_NO_STOCK', error_type='VALIDATION_ERROR',
+                                        error_log=f"No elegible: state={order['state']}, locked={order.get('locked')}")
 
             except Exception as e:
                 log.error(f"Error general procesando orden {order_name}: {e}")
@@ -714,19 +1023,15 @@ def process_batch(context, records, delta_days, failed_ids_set, batch_label):
 # =======================================================================
 
 def main():
-    connections_count = 0
+    # BLINDAJE: se elimino el bucle 'while True' que reintentaba run()
+    # completo ante ConnectionResetError. Relanzar el proceso a media
+    # corrida vuelve a recorrer la misma lista de ordenes. Junto con el
+    # retry de Kestra (ya retirado del YAML) y el de execute_kw, habia tres
+    # capas anidadas: en el peor caso, 27 ejecuciones del mismo trabajo.
+    # Un fallo ahora termina el proceso, alerta por Slack y espera decision
+    # humana.
     reset_stuck_processing_records()
-    while True:
-        try:
-            run()
-            break
-        except ConnectionResetError as e:
-            connections_count += 1
-            if connections_count < 3:
-                log.error(f"Error de conexion: {e}. Reintentando...")
-                tm.sleep(5)
-            else:
-                raise e
+    run()
 
 
 def run():
@@ -811,6 +1116,27 @@ def run():
     log.info('PROCESO DE FACTURACION TERMINADO')
     log.info(f"Total de ordenes facturadas exitosamente: {context.success_count}")
     log.info(f"ERROR_502_COUNTER FINAL: {ERROR_502_COUNTER}")
+
+    # --- BLINDAJE: resumen y alerta de duplicidad ---
+    log.info(f"Duplicados evitados por re-validacion previa al create: {context.duplicates_avoided}")
+    log.info(f"Facturas recuperadas tras create indeterminado: {context.invoices_adopted}")
+
+    if context.duplicates_found:
+        unicos = sorted(set(context.duplicates_found))
+        msg = (f":rotating_light: *{len(unicos)} orden(es) con CFDI DUPLICADO detectadas* "
+               f"en facturacion 1 a 1.\n"
+               f"Requieren cancelacion fiscal manual; el script las aparto sin tocarlas.\n"
+               f"Ejecucion Kestra: `{KESTRA_EXECUTION_ID}`\n"
+               f"Ordenes: {', '.join(unicos[:20])}"
+               + (f" (+{len(unicos) - 20} mas)" if len(unicos) > 20 else ""))
+        log.error(f"DUPLICADOS FISCALES DETECTADOS: {len(unicos)} orden(es): {unicos[:20]}")
+        notify_slack(msg)
+
+    if context.duplicates_avoided:
+        notify_slack(f":warning: Se evitaron *{context.duplicates_avoided}* creaciones duplicadas "
+                     f"por re-validacion previa en la ejecucion `{KESTRA_EXECUTION_ID}`. "
+                     f"Indica que hubo facturas apareciendo durante la corrida: revisar si "
+                     f"otro proceso esta facturando en paralelo.")
 
 
 if __name__ == '__main__':
