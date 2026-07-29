@@ -75,7 +75,7 @@ PARTNER_ID_PUBLICO_GENERAL = 13436
 
 # =======================================================================
 # CONFIGURACION DE PRUEBAS
-TEST_ORDER_LIMIT = 5  # None -> historico.
+TEST_ORDER_LIMIT = 100  # None -> historico.
 # =======================================================================
 
 # --- TAMANOS DE LOTE (controlan el techo de memoria) ---
