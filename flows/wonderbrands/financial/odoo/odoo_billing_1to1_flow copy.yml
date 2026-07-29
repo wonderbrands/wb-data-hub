@@ -1,0 +1,73 @@
+id: odoo_facturacion_1a1_pipeline
+namespace: wonderbrands.financial.odoo
+description: "Pipeline de facturación 1 a 1 para órdenes de marketplaces en Odoo"
+
+# Configuración por defecto para todas las tareas Commands de este flujo
+pluginDefaults:
+  - type: io.kestra.plugin.scripts.shell.Commands
+    values:
+      containerImage: wonderbrands-python:v1
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        pullPolicy: NEVER
+        memory:
+          memory: "512MB"       # Límite de RAM física para el script Python
+          memorySwap: "2048MB"   # Límite total (RAM + Swap del host)
+        cpus: 1.5                # (Opcional) Limita el uso de CPU a 1.5 núcleos
+      retry:
+        type: constant
+        interval: PT1M
+        maxAttempt: 3
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+
+tasks:
+  - id: working_env_billing
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: execute_invoicing_1a1
+        type: io.kestra.plugin.scripts.shell.Commands
+        env:
+          ODOO_URL: "{{ vars.odoo_url }}"
+          ODOO_DB: "{{ vars.odoo_db }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          DB_HOST: "{{ vars.db_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+        commands:
+          - python processes/wonderbrands/financial/billing_processes/odoo/facturacion_automatica_1a1.py
+
+triggers:
+  - id: ejecucion_diaria_noche     # Ejecuta todos los días a las 11:30 PM CDMX
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 05 * * *"
+
+  - id: ejecucion_mediodia           # Ejecuta a las 4:30 AM CDMX
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 10 * * *"
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *Fallo crítico en el pipeline de Facturación 1 a 1 (Odoo)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+      }

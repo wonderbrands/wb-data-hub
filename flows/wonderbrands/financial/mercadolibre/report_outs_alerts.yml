@@ -2,6 +2,22 @@ id: daily_dispatch_alerts
 namespace: wonderbrands.financial.odoo
 description: "Genera y envía el reporte diario de inconsistencias operativas (salidas pendientes y discrepancias)."
 
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+pluginDefaults:
+  - type: io.kestra.plugin.scripts.shell.Commands
+    values:
+      containerImage: wonderbrands-python:v1
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        pullPolicy: NEVER
+        memory:
+          memory: "512MB"
+          memorySwap: "2048MB"
+        cpus: 1
+
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
@@ -57,13 +73,13 @@ tasks:
         username: "{{ secret('SMTP_USERNAME') }}" 
         password: "{{ secret('SMTP_PASSWORD') }}" 
         from: "data@wonderbrands.co"
-        to: "sergio@wonderbrands.co"
+        to: "sergio@wonderbrands.co, jeronimo@wonderbrands.co, carlos.hinojosa@wonderbrands.co, martin.barone@somos-reyes.com"
         subject: "⚠️ Reporte diario: Inconsistencias de despacho y facturación"
         htmlTextContent: |
           <h3>Reporte Diario de Control de Despachos</h3>
           <p>Buen día, equipo:</p>
           <p>Adjunto encontrarán el reporte automatizado de inconsistencias detectadas en Odoo correspondiente al día de hoy.</p>
-          <p>Este reporte audita los siguientes puntos de control (Roadmap - Paso 5):</p>
+          <p>Este reporte audita los siguientes puntos de control (Roadmap - Paso 6):</p>
           <ul>
             <li>Órdenes confirmadas hace más de 5 días sin despacho físico.</li>
             <li>Órdenes con mercancía facturada, pero sin salida de almacén.</li>

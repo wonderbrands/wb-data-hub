@@ -2,7 +2,17 @@ id: odoo_facturacion_1a1_pipeline
 namespace: wonderbrands.financial.odoo
 description: "Pipeline de facturación 1 a 1 para órdenes de marketplaces en Odoo"
 
-# Configuración por defecto para todas las tareas Commands de este flujo
+# =====================================================================
+# EXCLUSION MUTUA
+# ---------------------------------------------------------------------
+# behavior: FAIL  -> la ejecución nueva falla de inmediato y dispara la
+#                    alerta de Slack. No QUEUE, porque encolar
+#                    una corrida solo pospone la colisión.
+# =====================================================================
+concurrency:
+  limit: 1
+  behavior: FAIL
+
 pluginDefaults:
   - type: io.kestra.plugin.scripts.shell.Commands
     values:
@@ -11,13 +21,20 @@ pluginDefaults:
         type: io.kestra.plugin.scripts.runner.docker.Docker
         pullPolicy: NEVER
         memory:
-          memory: "512MB"       # Límite de RAM física para el script Python
-          memorySwap: "2048MB"   # Límite total (RAM + Swap del host)
-        cpus: 1.5                # (Opcional) Limita el uso de CPU a 1.5 núcleos
-      retry:
-        type: constant
-        interval: PT1M
-        maxAttempt: 3
+          memory: "512MB"
+          memorySwap: "2048MB"
+        cpus: 1.5
+      # =================================================================
+      # CAMBIO CRITICO #2 — SE ELIMINA EL RETRY AUTOMATICO
+      # -----------------------------------------------------------------
+      # Antes: retry {type: constant, interval: PT1M, maxAttempt: 3}
+      # Reintentar a ciegas un script de facturación relanza TODO el
+      # proceso: si murió después de timbrar, la corrida nueva vuelve a
+      # recorrer la misma lista. Con las tres capas anidadas que existían
+      # (execute_kw x3, main() x3, Kestra x3) el peor caso eran 27
+      # ejecuciones del mismo trabajo.
+      # Un fallo ahora es visible y humano, no silencioso y automático.
+      # =================================================================
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
@@ -42,6 +59,7 @@ tasks:
 
       - id: execute_invoicing_1a1
         type: io.kestra.plugin.scripts.shell.Commands
+        timeout: PT8H
         env:
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"
@@ -51,17 +69,28 @@ tasks:
           DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
+          SLACK_WEBHOOK: "{{ secret('SLACK_WEBHOOK') }}"
+          KESTRA_EXECUTION_ID: "{{ execution.id }}"
         commands:
           - python processes/wonderbrands/financial/billing_processes/odoo/facturacion_automatica_1a1.py
 
 triggers:
-  - id: ejecucion_diaria_noche     # Ejecuta todos los días a las 11:30 PM CDMX
+  - id: ejecucion_diaria_noche       # 19:30 CDMX
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 05 * * *"
+    cron: "30 19 * * *"
+    timezone: America/Mexico_City
+    # =================================================================
+    # Con el default (ALL_MISSED), un reinicio del executor dispara en
+    # ráfaga todos los schedules perdidos: varias ejecuciones casi
+    # simultáneas del mismo flujo.
+    # =================================================================
+    recoverMissedSchedules: LAST
 
-  - id: ejecucion_mediodia           # Ejecuta a las 4:30 AM CDMX
+  - id: ejecucion_madrugada          # 04:30 CDMX
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 10 * * *"
+    cron: "30 04 * * *"
+    timezone: America/Mexico_City
+    recoverMissedSchedules: LAST
 
 errors:
   - id: slack_alert
@@ -69,5 +98,5 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *Fallo crítico en el pipeline de Facturación 1 a 1 (Odoo)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+        "text": "🚨 *Fallo en el pipeline de Facturación 1 a 1 (Odoo)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}\n_Si la causa es CONCURRENCY_LIMIT, otra ejecución sigue activa: NO relanzar a mano._"
       }
