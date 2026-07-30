@@ -1,4 +1,4 @@
-id: ml_billing_flow
+id: ml_billing_process_flow_test
 namespace: wonderbrands.finance.mercadolibre
 description: "Pipeline Facturación: Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
 
@@ -14,6 +14,10 @@ pluginDefaults:
         type: constant
         interval: PT2M
         maxAttempt: 3
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"

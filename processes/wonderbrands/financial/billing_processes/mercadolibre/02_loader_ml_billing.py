@@ -7,10 +7,6 @@ import base64
 import xml.etree.ElementTree as ET
 import concurrent.futures
 import threading
-from tqdm import tqdm 
-from dotenv import load_dotenv
-load_dotenv() 
-
 
 # Almacenamiento local por hilo para manejar sesiones TLS independientes si MAX_WORKERS > 1
 thread_local_proxy = threading.local()
@@ -19,11 +15,16 @@ thread_local_proxy = threading.local()
 retried_special_ids = set()
 retried_lock = threading.Lock()
 
-
-
 # ── Configuración de Logs ──────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# Sin tqdm: la barra de progreso escribe con \r sobre stderr y Kestra la interpreta
+# como miles de líneas de log por lote. El avance se reporta como resumen por lote.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 log = logging.getLogger(__name__)
+
 
 # Filtro personalizado para mostrar únicamente errores y el resumen del lote
 class ErrorsAndSummaryFilter(logging.Filter):
@@ -36,22 +37,36 @@ class ErrorsAndSummaryFilter(logging.Filter):
             return True
         return False
 
-# Bandera para habilitar/deshabilitar el filtro (True = solo errores + resumen, False = todo)
-# --------------
-LOG_ERRORS_AND_SUMMARY = False  
-# --------------
+
+# ── Parámetros por variables de entorno ────────────────────────
+# Credenciales Odoo (definidas en flows/wonderbrands/financial/mercadolibre/ml_billing_flow.yml)
+ODOO_URL      = os.getenv("ODOO_URL")
+ODOO_DB       = os.getenv("ODOO_DB")
+ODOO_USER     = os.getenv("ODOO_USER")
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+
+# Credenciales de la BD de staging
+DB_HOST     = os.getenv("DB_HOST")
+DB_USER     = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME     = os.getenv("DB_NAME")
+
+# Filtro de logs (True = solo errores + resumen, False = todo)
+LOG_ERRORS_AND_SUMMARY = os.getenv("LOG_ERRORS_AND_SUMMARY", "false").lower() == "true"
 
 if LOG_ERRORS_AND_SUMMARY:
     log.addFilter(ErrorsAndSummaryFilter())
 
-
 # ----------------------------------------------------------------------------
-TAX_ID_MARKETPLACES     = 38 
-BATCH_LIMIT             = 40   # Facturas por lote
-MAX_WORKERS             = 1    # Hilos concurrentes
-SLEEP_BETWEEN_BATCHES   = 10   # Segundos de respiro tras cada lote
-MAX_EMPTY_RUNS          = 2    # Intentos vacíos antes de terminar
-SLEEP_SECONDS           = 15   # Espera entre intentos vacíos
+PARTNER_ID_PUBLICO_GENERAL = int(os.getenv("PARTNER_ID_PUBLICO_GENERAL", "13436"))
+TAX_ID_MARKETPLACES     = int(os.getenv("TAX_ID_MARKETPLACES", "38"))
+ACCOUNT_CODE_CXC_ML     = os.getenv("ACCOUNT_CODE_CXC_ML", "105.01.004")
+BATCH_LIMIT             = int(os.getenv("BATCH_LIMIT", "40"))            # Facturas por lote
+MAX_WORKERS             = int(os.getenv("MAX_WORKERS", "1"))             # Hilos concurrentes
+SLEEP_BETWEEN_BATCHES   = int(os.getenv("SLEEP_BETWEEN_BATCHES", "10"))  # Segundos de respiro tras cada lote
+MAX_EMPTY_RUNS          = int(os.getenv("MAX_EMPTY_RUNS", "2"))          # Intentos vacíos antes de terminar
+SLEEP_SECONDS           = int(os.getenv("SLEEP_SECONDS", "15"))          # Espera entre intentos vacíos
+ODOO_TIMEOUT            = int(os.getenv("ODOO_TIMEOUT", "120"))          # Timeout XML-RPC en segundos
 # ----------------------------------------------------------------------------
 
 ERROR_502_COUNTER = 0
@@ -61,13 +76,36 @@ ERROR_502_COUNTER = 0
 # orden con un error permanente (p.ej. "SO no encontrada en Odoo", que jamás va
 # a resolverse sola) se reintente para siempre. Confirmado que la tabla
 # finance.mkp_billing_prod tiene las columnas retry_count_loader y created_at.
-MAX_ERROR_RETRIES        = 2    # "cierto número de veces"
-ERROR_RETRY_WINDOW_DAYS  = 30   # "lapso de tiempo de creación"
+MAX_ERROR_RETRIES        = int(os.getenv("MAX_ERROR_RETRIES", "2"))          # "cierto número de veces"
+ERROR_RETRY_WINDOW_DAYS  = int(os.getenv("ERROR_RETRY_WINDOW_DAYS", "30"))   # "lapso de tiempo de creación"
 # -----------------------------------------------------------------------------
+
+
+def get_db_connection():
+    """Conexión a la BD de staging usando las variables de entorno del flujo."""
+    return mysql.connector.connect(
+        host=DB_HOST, user=DB_USER,
+        password=DB_PASSWORD, database=DB_NAME
+    )
+
+
+def validate_env():
+    """Aborta temprano si el flujo no inyectó alguna variable obligatoria."""
+    required = {
+        "ODOO_URL": ODOO_URL, "ODOO_DB": ODOO_DB,
+        "ODOO_USER": ODOO_USER, "ODOO_PASSWORD": ODOO_PASSWORD,
+        "DB_HOST": DB_HOST, "DB_USER": DB_USER,
+        "DB_PASSWORD": DB_PASSWORD, "DB_NAME": DB_NAME
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        log.error(f"Faltan variables de entorno obligatorias: {', '.join(missing)}")
+        raise SystemExit(1)
+
 
 class TimeoutTransport(xmlrpc.client.SafeTransport):
     """Transporte personalizado para forzar un timeout en XML-RPC."""
-    def __init__(self, timeout=120, *args, **kwargs):
+    def __init__(self, timeout=ODOO_TIMEOUT, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.timeout = timeout
 
@@ -77,12 +115,13 @@ class TimeoutTransport(xmlrpc.client.SafeTransport):
         conn.timeout = self.timeout
         return conn
 
+
 class OdooModelProxy:
     """
     Proxy para envolver las llamadas a Odoo con reintentos automáticos,
     renovación de sesión TLS y un TIMEOUT estricto para evitar procesos colgados.
     """
-    def __init__(self, url, db, user, pwd, timeout=120, max_retries_init=3, delay_init=2):
+    def __init__(self, url, db, user, pwd, timeout=ODOO_TIMEOUT, max_retries_init=3, delay_init=2):
         global ERROR_502_COUNTER
         self.url = url
         self.db = db
@@ -99,10 +138,10 @@ class OdooModelProxy:
                 transport = TimeoutTransport(timeout=self.timeout)
                 self.common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', transport=transport)
                 self.uid = self.common.authenticate(db, user, pwd, {})
-                
+
                 transport_models = TimeoutTransport(timeout=self.timeout)
                 self.models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', transport=transport_models)
-                log.info(f"Conectado a Odoo correctamente (intento {attempt}).")
+                log.debug(f"Conectado a Odoo correctamente (intento {attempt}).")
                 return  # Salir del bucle si todo fue bien
             except (xmlrpc.client.ProtocolError, TimeoutError, OSError, ConnectionError) as e:
                 log.warning(f"Error de red/Timeout en conexión inicial (intento {attempt}/{self.max_retries_init}): {e}")
@@ -116,11 +155,11 @@ class OdooModelProxy:
                 raise
 
     def reauthenticate(self):
-        log.info("Cerrando sesión TLS y abriendo una nueva conexión con Odoo...")
+        log.debug("Cerrando sesión TLS y abriendo una nueva conexión con Odoo...")
         transport = TimeoutTransport(timeout=self.timeout)
         self.common = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/common', transport=transport)
         self.uid = self.common.authenticate(self.db, self.user, self.pwd, {})
-        
+
         transport_models = TimeoutTransport(timeout=self.timeout)
         self.models = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object', transport=transport_models)
 
@@ -157,6 +196,7 @@ class OdooModelProxy:
                 except Exception:
                     pass
 
+
 def get_account_id(models, db, uid, pwd, code):
     acc = models.execute_kw(db, uid, pwd, 'account.account', 'search', [[('code', '=', code)]], {'limit': 1})
     if not acc:
@@ -178,14 +218,11 @@ def reset_stuck_processing_records(marketplace='MERCADO_LIBRE'):
     iteración" en la que reaparezcan registros trabados de ESTA misma corrida).
     """
     try:
-        db = mysql.connector.connect(
-            host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
-        )
+        db = get_db_connection()
         cursor = db.cursor()
         cursor.execute("""
-            UPDATE finance.mkp_billing_prod 
-            SET status = 'PENDING' 
+            UPDATE finance.mkp_billing_prod
+            SET status = 'PENDING'
             WHERE status = 'PROCESSING' AND marketplace = %s
         """, (marketplace,))
         affected = cursor.rowcount
@@ -200,9 +237,12 @@ def reset_stuck_processing_records(marketplace='MERCADO_LIBRE'):
 
 
 def process_single_invoice(record, context):
+    """
+    Procesa una factura. NO loguea el detalle por registro (Kestra): devuelve un
+    dict con el resultado y process_batch_concurrently lo agrega al resumen del lote.
+    """
     global ERROR_502_COUNTER
-    thread_name = threading.current_thread().name
-    
+
     odoo_db = context['odoo_db']
     uid = context['uid']
     odoo_pwd = context['odoo_pwd']
@@ -217,26 +257,26 @@ def process_single_invoice(record, context):
     # process_batch_concurrently (Python cachea la conexión HTTP subyacente entre
     # llamadas de un mismo ServerProxy), lo que reduce handshakes TLS repetidos
     # contra el proxy/nginx de Odoo.sh.
-    
+
     # Advertencia si algún día subes MAX_WORKERS por encima de 1: compartir un
     # mismo ServerProxy/socket entre hilos que llaman a la vez SÍ puede corromper
     # el tráfico HTTP (no es thread-safe para uso concurrente real). Con
     # MAX_WORKERS=1 (uso secuencial) esto es seguro. Si subes los workers, cada
     # hilo necesitaría su propio ServerProxy.
-    
+
     # -------------------------------------------------------------------------------
     # MODIFICACIÓN PARA MAX_WORKERS > 1 (Manejo de múltiples sesiones TLS):
     # Se utiliza threading.local() para garantizar que cada hilo trabajador del pool
     # tenga y reutilice su propia instancia independiente de ServerProxy (y por ende su
     # propia sesión/socket TLS), evitando colisiones y corrupción de tráfico HTTP.
-    
+
     # if odoo_url and odoo_user:
     #     if not hasattr(thread_local_proxy, 'models'):
     #         thread_local_proxy.models = OdooModelProxy(odoo_url, odoo_db, odoo_user, odoo_pwd)
     #     models = thread_local_proxy.models
     # else:
     #     models = context['models']
-        
+
     # -------------------------------------------------------------------------------
     models = context['models']   # Usa el proxy creado en process_batch_concurrently
 
@@ -244,24 +284,21 @@ def process_single_invoice(record, context):
     so_data = context['so_map'].get(record['mkp_order_id'])
     lines_map = context['lines_map']
     existing_invoices = context['invoice_map']
-    partner_map = context['partner_map']                          
+    partner_map = context['partner_map']
     xml_parsed = context['xml_parsed_map'].get(record['id'], {})
     payment_methods_cache = context['payment_methods_cache']
-    
+
     mkp_order = record['mkp_order_id']
     uuid = record['cfdi_uuid']
     xml_data = record['xml_data']
     record_id = record['id']
 
     try:
-        db = mysql.connector.connect(
-            host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
-        )
+        db = get_db_connection()
         cursor = db.cursor(dictionary=True)
     except Exception as e:
         log.error(f"Error de BD en Hilo (Orden {mkp_order}): {e}")
-        return
+        return {'status': 'DB_ERROR', 'mkp_order': mkp_order}
 
     try:
         if not so_data:
@@ -290,7 +327,6 @@ def process_single_invoice(record, context):
             invoice_is_orphan_draft = (inv_name is False or inv_name == 'False' or inv_state == 'draft')
 
             if not invoice_is_orphan_draft:
-                log.warning(f"Bucle evitado: La orden {so_data['name']} ({mkp_order}) YA TIENE la factura {inv_name}.")
                 # CAMBIO adicional: ahora también se guarda odoo_so_name aquí. Antes
                 # esta rama NO lo guardaba, y eso deja el registro en mkp_billing_prod
                 # sin so_name -> el script 04 luego busca la factura con so_name=NULL
@@ -301,11 +337,10 @@ def process_single_invoice(record, context):
                     (so_data['name'], record_id)
                 )
                 db.commit()
-                return
+                return {'status': 'ALREADY_ODOO_INVOICED', 'mkp_order': mkp_order}
             else:
                 resuming_draft = True
                 inv_id = existing_inv['id']
-                log.warning(f"[{thread_name}] Factura huérfana (borrador sin postear) para {so_data['name']} ({mkp_order}) -> move ID {inv_id}. Reanudando sin recrear.")
             # -----------------------------------------------------------------------
 
         if not resuming_draft:
@@ -330,7 +365,9 @@ def process_single_invoice(record, context):
             # hasta 2 llamadas a Odoo por factura a, en el peor caso, 2 llamadas
             # para el LOTE COMPLETO.
             partner_invoice_id = so_data['partner_id'][0]
-            if rfc_receptor and rfc_receptor != 'XAXX010101000':
+            if rfc_receptor and rfc_receptor == 'XAXX010101000':
+                partner_invoice_id = PARTNER_ID_PUBLICO_GENERAL
+            else:
                 partner_invoice_id = partner_map.get(rfc_receptor, partner_invoice_id)
 
             # Armar líneas desde caché
@@ -341,24 +378,23 @@ def process_single_invoice(record, context):
             for line_id in so_data['order_line']:
                 line = lines_map.get(line_id)
                 if not line: continue
-                
+
                 # Excluir líneas de envío (por SKU/nombre o por producto específico si lo tienes cacheado)
                 # Si en display_type es nota o sección, o si es el producto de envío, lo saltamos:
                 nombre_linea = str(line.get('name', '')).upper()
                 if 'ENVIO' in nombre_linea or 'C-ENVIO' in nombre_linea:
-                    log.info(f"[{thread_name}] Saltando línea de envío en SO {so_data['name']}: {nombre_linea}")
                     continue
 
                 inv_line = {
                     'display_type': line.get('display_type') or 'product',
                     'product_id': line['product_id'][0] if line.get('product_id') else False,
-                    'quantity': line['product_uom_qty'], 
+                    'quantity': line['product_uom_qty'],
                     'price_unit': line['price_unit'],
-                    'tax_ids': [(6, 0, [TAX_ID_MARKETPLACES])], 
+                    'tax_ids': [(6, 0, [TAX_ID_MARKETPLACES])],
                     'sale_line_ids': [(4, line['id'])]
                 }
                 invoice_lines.append((0, 0, inv_line))
-                
+
                 # Calcular total estimado (Costo * Qty * 1.16 de IVA marketplace)
                 total_odoo += (line['product_uom_qty'] * line['price_unit']) * 1.16
 
@@ -370,36 +406,37 @@ def process_single_invoice(record, context):
                     f"Odoo sin envío (${total_odoo:,.2f}). "
                     f"Diferencia: ${total_odoo - total_xml:,.2f}"
                 )
-                log.warning(f"[{thread_name}] ⚠️ {mensaje_log} en orden {mkp_order}. Abortando inyección.")
-                
+
                 # Actualizamos al estado TOTAL_DIFF sin tocar retry_count_loader
                 cursor.execute("""
-                    UPDATE finance.mkp_billing_prod 
-                    SET status = 'TOTAL_DIFF', error_log = %s, processed_at = NOW() 
+                    UPDATE finance.mkp_billing_prod
+                    SET status = 'TOTAL_DIFF', error_log = %s, processed_at = NOW()
                     WHERE id = %s
                 """, (mensaje_log, record_id))
                 db.commit()
-                return  # Detenemos el flujo aquí para no crear ni postear la factura en Odoo
+                # Detenemos el flujo aquí para no crear ni postear la factura en Odoo.
+                # El detalle se reporta agregado al final del lote.
+                return {'status': 'TOTAL_DIFF', 'mkp_order': mkp_order, 'detail': mensaje_log}
             # ------------------------------------------------------------------
             # Crear Factura
             invoice_vals = {
                 'move_type': 'out_invoice',
                 'invoice_origin': so_data['name'],
-                'partner_id': partner_invoice_id, 
+                'partner_id': partner_invoice_id,
                 'team_id': so_data['team_id'][0],
                 'invoice_line_ids': invoice_lines,
-                'l10n_mx_edi_usage': uso_cfdi, 
-                'l10n_mx_edi_payment_method_id': payment_method_id, 
-                'l10n_mx_edi_payment_policy': metodo_pago, 
+                'l10n_mx_edi_usage': uso_cfdi,
+                'l10n_mx_edi_payment_method_id': payment_method_id,
+                'l10n_mx_edi_payment_policy': metodo_pago,
             }
-            
+
             if invoice_date:
                 invoice_vals['invoice_date'] = invoice_date
                 invoice_vals['date'] = invoice_date
             if metodo_pago == 'PUE':
-                invoice_vals['invoice_payment_term_id'] = False 
+                invoice_vals['invoice_payment_term_id'] = False
                 if invoice_date:
-                    invoice_vals['invoice_date_due'] = invoice_date 
+                    invoice_vals['invoice_date_due'] = invoice_date
 
             # --- context 'tracking_disable': True -----------------
             # Le indica a Odoo que NO ejecute las funciones de mail.thread (chatter):
@@ -413,36 +450,23 @@ def process_single_invoice(record, context):
             # permitir el mensaje inicial en el chatter, y se agrega un mensaje custom.
             inv_id = models.execute_kw(
                 odoo_db, uid, odoo_pwd, 'account.move', 'create', [invoice_vals],
-                {'context': {'tracking_disable': True}}
             )
-            # Mensaje inicial "manual" y liviano en el chatter, sin el costo de
-            # computar tracking de cada campo trackeado ni de recalcular followers/notificaciones:
-            try:
-                models.execute_kw(
-                    odoo_db, uid, odoo_pwd, 'account.move', 'message_post', [[inv_id]],
-                    {'kwargs': {
-                        'body': f"Factura generada automáticamente desde pedido Mercado Libre {mkp_order}.",
-                        'subtype_xmlid': 'mail.mt_note',
-                    }}
-                )
-            except Exception as ex:
-                log.debug(f"No se pudo postear mensaje de chatter en factura {inv_id}: {ex} (Ignorando)")
-            
+
             # ---------------------------------------------------------------------------------
         # Buscar líneas para CxC (se ejecuta SIEMPRE: factura nueva O reanudada)
-        move_lines = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.move.line', 'search_read', 
+        move_lines = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.move.line', 'search_read',
                                        [[('move_id', '=', inv_id)]], {'fields': ['id', 'account_type']})
-        
+
         # Consolidamos la escritura de CxC, UUID y narration en una sola llamada a account.move
         lines_to_update = [(1, m_line['id'], {'account_id': acc_cxc_ml}) for m_line in move_lines if m_line['account_type'] == 'asset_receivable']
-        
+
         update_vals = {
-            'l10n_mx_edi_cfdi_uuid': uuid, 
+            'l10n_mx_edi_cfdi_uuid': uuid,
             'narration': uuid
         }
         if lines_to_update:
             update_vals['line_ids'] = lines_to_update
-            
+
         models.execute_kw(
             odoo_db, uid, odoo_pwd, 'account.move', 'write', [[inv_id], update_vals],
             {'context': {'tracking_disable': True}}
@@ -474,83 +498,84 @@ def process_single_invoice(record, context):
             models.execute_kw(odoo_db, uid, odoo_pwd, 'account.edi.document', 'create', [{
                 'move_id': inv_id, 'edi_format_id': 2, 'attachment_id': attachment_id, 'state': 'sent'
             }])
-        except Exception as ex:
-            log.debug(f"Aviso EDI en orden {mkp_order}: {ex} (Ignorando)")
+        except Exception:
+            pass  # Aviso EDI no bloqueante
 
         # Publicar Factura (Operación pesada) - Se remueve tracking_disable para ver la confirmación action_post en el chatter
         # OPTIMIZACIÓN: Se retira la ejecución individual de action_post() y la actualización de BD aquí.
         # En su lugar, retornamos un dict con la información para que process_batch_concurrently lo ejecute en un solo llamado.
-        log.info(f"[{thread_name}] Factura de {so_data['name']} (ML: {mkp_order}) creada/reanudada en borrador (ID: {inv_id}). Lista para action_post por lote.")
         return {
             'status': 'READY_TO_POST',
             'inv_id': inv_id,
             'record_id': record_id,
             'so_name': so_data['name'],
-            'mkp_order': mkp_order
+            'mkp_order': mkp_order,
+            'resumed_draft': resuming_draft
         }
 
     except Exception as e:
         db.rollback()
         error_str = str(e)
-        
+
         # 1.1 ERROR BAD GATEWAY (Captura el fallo tras haber agotado los 3 reintentos en caliente del proxy)
         if "502" in error_str or "bad gateway" in error_str.lower() or "<html" in error_str.lower() or "doctype" in error_str.lower() or "protocolerror" in error_str.lower():
             ERROR_502_COUNTER += 1
-            
+
             cursor.execute("""
-            UPDATE finance.mkp_billing_prod 
-            SET status = 'ERROR_BG', error_log = %s, processed_at = NOW() 
+            UPDATE finance.mkp_billing_prod
+            SET status = 'ERROR_BG', error_log = %s, processed_at = NOW()
             WHERE id = %s
             """, (error_str, record_id))
             with retried_lock:
                 retried_special_ids.add(record_id)
-            log.warning(f"[{thread_name}] Error 502 Bad Gateway persistente tras los 3 reintentos del proxy en orden {mkp_order}. Marcado como ERROR_BG. Esperando 1s...")
+            result = {'status': 'ERROR_BG', 'mkp_order': mkp_order}
             time.sleep(1)
-            
+
         # 1.2 ORDEN AÚN NO EXISTENTE EN ODOO
         elif "no encontrada en odoo" in error_str.lower() or "not found in odoo" in error_str.lower():
             cursor.execute("""
-            UPDATE finance.mkp_billing_prod 
-            SET status = 'ORDER_NOT_ODOO_YET', error_log = %s, processed_at = NOW() 
+            UPDATE finance.mkp_billing_prod
+            SET status = 'ORDER_NOT_ODOO_YET', error_log = %s, processed_at = NOW()
             WHERE id = %s
             """, (error_str, record_id))
             with retried_lock:
                 retried_special_ids.add(record_id)
-            log.warning(f"[{thread_name}] Orden de venta con referencia {mkp_order} no encontrada en Odoo. Marcada como ORDER_NOT_ODOO_YET.")
-            
+            result = {'status': 'ORDER_NOT_ODOO_YET', 'mkp_order': mkp_order}
+
         # 1.5 CUALQUIER OTRO ERROR (Conserva lógica de retry_count_loader)
         else:
             cursor.execute("""
-            UPDATE finance.mkp_billing_prod 
-            SET status = 'ERROR', error_log = %s, retry_count_loader = retry_count_loader + 1, processed_at = NOW() 
+            UPDATE finance.mkp_billing_prod
+            SET status = 'ERROR', error_log = %s, retry_count_loader = retry_count_loader + 1, processed_at = NOW()
             WHERE id = %s
             """, (error_str, record_id))
-            log.error(f"[{thread_name}] ❌ ERROR en orden ML {mkp_order}: {e}")
-            
+            log.error(f"ERROR en orden ML {mkp_order}: {e}")
+            result = {'status': 'ERROR', 'mkp_order': mkp_order}
+
         db.commit()
+        return result
     finally:
         cursor.close()
         db.close()
 
+
 def process_batch_concurrently():
     global ERROR_502_COUNTER
-    odoo_url = os.getenv("ODOO_URL")
-    odoo_db = os.getenv("ODOO_DB")
-    odoo_user = os.getenv("ODOO_USER")
-    odoo_pwd = os.getenv("ODOO_PASSWORD")
-    
+
     # Forzar renovación del proxy para el hilo actual
     if hasattr(thread_local_proxy, 'models'):
         del thread_local_proxy.models
-    
+
     try:
-        models = OdooModelProxy(odoo_url, odoo_db, odoo_user, odoo_pwd)
+        models = OdooModelProxy(ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD)
+        odoo_db = ODOO_DB
+        odoo_pwd = ODOO_PASSWORD
         uid = models.uid
-        
-        acc_cxc_ml = get_account_id(models, odoo_db, uid, odoo_pwd, '105.01.004')
+
+        acc_cxc_ml = get_account_id(models, odoo_db, uid, odoo_pwd, ACCOUNT_CODE_CXC_ML)
         mx_country_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'res.country', 'search', [[('code', '=', 'MX')]], {'limit': 1})
         mx_country_id = mx_country_search[0] if mx_country_search else False
-        
+
         # Cache de Métodos de pago
         pm_data = models.execute_kw(odoo_db, uid, odoo_pwd, 'l10n_mx_edi.payment.method', 'search_read', [[]], {'fields': ['id', 'code']})
         payment_methods_cache = {pm['code']: pm['id'] for pm in pm_data}
@@ -560,10 +585,7 @@ def process_batch_concurrently():
         return 0
 
     try:
-        db_main = mysql.connector.connect(
-            host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
-        )
+        db_main = get_db_connection()
         cursor_main = db_main.cursor(dictionary=True)
     except Exception as e:
         log.error(f"Error conectando a BD principal: {e}")
@@ -572,15 +594,15 @@ def process_batch_concurrently():
     # 1.4 Caso B: Expiración automática de órdenes aún no existentes en Odoo (> 10 días / 240 horas)
     try:
         cursor_main.execute("""
-            UPDATE finance.mkp_billing_prod 
-            SET status = 'ORDER_NEVER_IN_ODOO', processed_at = NOW() 
-            WHERE status = 'ORDER_NOT_ODOO_YET' 
+            UPDATE finance.mkp_billing_prod
+            SET status = 'ORDER_NEVER_IN_ODOO', processed_at = NOW()
+            WHERE status = 'ORDER_NOT_ODOO_YET'
               AND created_at < (UTC_TIMESTAMP() - INTERVAL 10 DAY)
         """)
-        if cursor_main.rowcount:
-            log.info(f"Expiradas {cursor_main.rowcount} órdenes de ORDER_NOT_ODOO_YET a ORDER_NEVER_IN_ODOO (>10 días).")
+        expired_orders = cursor_main.rowcount
         db_main.commit()
     except Exception as e:
+        expired_orders = 0
         log.warning(f"Aviso al expirar registros ORDER_NOT_ODOO_YET: {e}")
 
     # --- Ordenes pendientes ---------------------------------------------------------------
@@ -595,7 +617,7 @@ def process_batch_concurrently():
     # script realmente usa (antes se traía, por ejemplo, raw_json completo -- el dump
     # de todo el XML a JSON -- para cada registro, sin usarlo en ningún lado de este
     # archivo).
-    
+
     # 1.3 CAMBIOS EN LOS REINTENTOS: Excluir IDs de estados especiales ya procesados en esta ejecución completa
     query_params = [MAX_ERROR_RETRIES, ERROR_RETRY_WINDOW_DAYS]
     exclude_sql = ""
@@ -608,8 +630,8 @@ def process_batch_concurrently():
 
     cursor_main.execute(f"""
         SELECT id, mkp_order_id, cfdi_uuid, xml_data, retry_count_loader, status
-        FROM finance.mkp_billing_prod 
-        WHERE marketplace = 'MERCADO_LIBRE' 
+        FROM finance.mkp_billing_prod
+        WHERE marketplace = 'MERCADO_LIBRE'
           AND (
                 status = 'PENDING'
                 OR (
@@ -628,10 +650,12 @@ def process_batch_concurrently():
     """, tuple(query_params))
     records = cursor_main.fetchall()
     # ---------------------------------------------------------------------------------------
-    
+
     if not records:
         cursor_main.close()
         db_main.close()
+        if expired_orders:
+            log.info(f"Expiradas {expired_orders} órdenes de ORDER_NOT_ODOO_YET a ORDER_NEVER_IN_ODOO (>10 días).")
         return 0
 
     # Registrar IDs que ya vienen como ERROR_BG u ORDER_NOT_ODOO_YET para no repetirlos en otro batch de esta corrida
@@ -649,14 +673,14 @@ def process_batch_concurrently():
 
     # ── OPTIMIZACIÓN: Búsquedas en Lote (Batch Fetching) antes de los hilos ──
     mkp_orders = [r['mkp_order_id'] for r in records]
-    
+
     # 1. Buscar todas las SO de golpe
-    so_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'sale.order', 'search_read', 
-                                  [[('channel_order_reference', 'in', mkp_orders)]],  
+    so_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'sale.order', 'search_read',
+                                  [[('channel_order_reference', 'in', mkp_orders)]],
                                   {'fields': ['id', 'name', 'partner_id', 'team_id', 'order_line', 'channel_order_reference']})
-    
+
     so_map = {so['channel_order_reference']: so for so in so_search}
-    
+
     # 2. Buscar todas las líneas de golpe
     # --- Antes se pedían TODOS los campos de sale.order.line (no
     # se pasaba 'fields'), lo que obliga a Odoo a leer/computar cada campo -- incluidos
@@ -665,7 +689,7 @@ def process_batch_concurrently():
     all_line_ids = [line_id for so in so_search for line_id in so.get('order_line', [])]
     lines_search = []
     if all_line_ids:
-        lines_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'sale.order.line', 'search_read', 
+        lines_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'sale.order.line', 'search_read',
                                          [[('id', 'in', all_line_ids)]],
                                          {'fields': ['id', 'display_type', 'product_id', 'product_uom_qty', 'price_unit']})
     lines_map = {line['id']: line for line in lines_search}
@@ -676,10 +700,10 @@ def process_batch_concurrently():
     so_names = [so['name'] for so in so_search]
     invoice_map = {}
     if so_names:
-        existing_inv_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.move', 'search_read', 
-                                          [[('invoice_origin', 'in', so_names), 
-                                            ('move_type', '=', 'out_invoice'), 
-                                            ('state', '!=', 'cancel')]], 
+        existing_inv_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.move', 'search_read',
+                                          [[('invoice_origin', 'in', so_names),
+                                            ('move_type', '=', 'out_invoice'),
+                                            ('state', '!=', 'cancel')]],
                                           {'fields': ['id', 'name', 'invoice_origin', 'state']})
         invoice_map = {inv['invoice_origin']: inv for inv in existing_inv_search}
 
@@ -690,6 +714,7 @@ def process_batch_concurrently():
     # veces una creación) de res.partner POR CADA factura del lote, como hacía antes.
     xml_parsed_map = {}
     rfcs_needed = set()
+    xml_parse_errors = 0
 
     for r in records:
         parsed = {
@@ -718,16 +743,22 @@ def process_batch_concurrently():
                 tfd = root.find('.//tfd:TimbreFiscalDigital', ns)
                 if tfd is not None:
                     parsed['fecha_timbrado_str'] = tfd.get('FechaTimbrado')
-            except Exception as e:
-                log.warning(f"Error parseando XML para orden {r['mkp_order_id']}: {e}. Se usarán defaults.")
+            except Exception:
+                # Se contabiliza y se reporta agregado; se usan los defaults
+                xml_parse_errors += 1
 
         xml_parsed_map[r['id']] = parsed
         if parsed['rfc_receptor'] and parsed['rfc_receptor'] != 'XAXX010101000':
             rfcs_needed.add(parsed['rfc_receptor'])
 
+    if xml_parse_errors:
+        log.warning(f"{xml_parse_errors} XML(s) del lote no se pudieron parsear. Se usaron valores por defecto.")
+
     # Búsqueda en lote de partners existentes por RFC + creación de los faltantes
     # (secuencial, ANTES de lanzar los hilos, para no crear el mismo RFC dos veces)
     partner_map = {}
+    partners_created = 0
+    partners_failed = 0
     if rfcs_needed:
         partner_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'res.partner', 'search_read',
                                             [[('vat', 'in', list(rfcs_needed))]], {'fields': ['id', 'vat']})
@@ -748,15 +779,16 @@ def process_batch_concurrently():
                 new_id = models.execute_kw(odoo_db, uid, odoo_pwd, 'res.partner', 'create', [new_partner_vals],
                                             {'context': {'tracking_disable': True}})
                 partner_map[rfc] = new_id
-                log.info(f"Nuevo cliente creado en Odoo: {new_partner_vals['name']} (RFC: {rfc})")
+                partners_created += 1
             except Exception as e:
+                partners_failed += 1
                 log.warning(f"No se pudo crear el cliente {rfc}. Error: {e}")
     # -----------------------------------------------------------------------------------------
 
     # Contexto enriquecido para los hilos
     context = {
-        'odoo_url': odoo_url,
-        'odoo_db': odoo_db, 'uid': uid, 'odoo_user': odoo_user, 'odoo_pwd': odoo_pwd,
+        'odoo_url': ODOO_URL,
+        'odoo_db': odoo_db, 'uid': uid, 'odoo_user': ODOO_USER, 'odoo_pwd': odoo_pwd,
         'acc_cxc_ml': acc_cxc_ml,
         'models': models,
         'so_map': so_map, 'lines_map': lines_map, 'invoice_map': invoice_map,
@@ -764,14 +796,12 @@ def process_batch_concurrently():
         'payment_methods_cache': payment_methods_cache
     }
 
-    log.info(f"Lote de {len(records)} facturas pre-cargado. Iniciando Multithreading...")
-
     ready_to_post_list = []
     # Mantenemos 1 worker para no estresar el CPU de Odoo con el action_post simultáneo
+    # Sin tqdm: el resultado de cada hilo se acumula y se reporta como resumen del lote.
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_single_invoice, rec, context) for rec in records]
-        # Barra de progreso con tqdm
-        for f in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Procesando lote", unit="factura"):
+        for f in concurrent.futures.as_completed(futures):
             try:
                 res = f.result()
                 if res and res.get('status') == 'READY_TO_POST':
@@ -779,14 +809,16 @@ def process_batch_concurrently():
             except Exception as ex:
                 log.error(f"Error inesperado al recuperar resultado de hilo: {ex}")
 
+    resumed_drafts = sum(1 for item in ready_to_post_list if item.get('resumed_draft'))
+
     # 3. OPTIMIZACIÓN EL ACTION_POST() Y MANEJO DE ERRORES POR LOTE
     if ready_to_post_list:
         inv_ids = [item['inv_id'] for item in ready_to_post_list]
-        log.info(f"Ejecutando action_post() en lote para {len(inv_ids)} facturas en Odoo...")
-        
+
         MAX_ACTION_POST_RETRIES = 5
         post_success = False
         attempt = 0
+        error_str = ""
         while not post_success and attempt < MAX_ACTION_POST_RETRIES:
             attempt += 1
             try:
@@ -808,23 +840,20 @@ def process_batch_concurrently():
                     post_success = True
                     break
                 else:
-                    log.error(f"❌ Error (no 502) en action_post() por lote: {ex}")
+                    log.error(f"Error (no 502) en action_post() por lote: {ex}")
                     break
-                
+
         if not post_success and attempt >= MAX_ACTION_POST_RETRIES:
             log.error(f"action_post agotó {MAX_ACTION_POST_RETRIES} reintentos por 502 persistente. Marcando lote como ERROR para reintento en próxima corrida.")
             # Al fallar la transacción por lote, Odoo hace rollback de todas. Se actualiza la BD local a ERROR:
             try:
-                db_err = mysql.connector.connect(
-                    host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-                    password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
-                )
+                db_err = get_db_connection()
                 cursor_err = db_err.cursor()
                 err_msg = f"Error en action_post() por lote: {error_str}"
                 for item in ready_to_post_list:
                     cursor_err.execute("""
-                        UPDATE finance.mkp_billing_prod 
-                        SET status = 'ERROR', error_log = %s, retry_count_loader = retry_count_loader + 1, processed_at = NOW() 
+                        UPDATE finance.mkp_billing_prod
+                        SET status = 'ERROR', error_log = %s, retry_count_loader = retry_count_loader + 1, processed_at = NOW()
                         WHERE id = %s
                     """, (err_msg, item['record_id']))
                 db_err.commit()
@@ -833,35 +862,26 @@ def process_batch_concurrently():
             except Exception as db_ex:
                 log.error(f"Error actualizando BD tras fallo de action_post en lote: {db_ex}")
 
-
         if post_success:
             # Confirmar estado final ODOO_INVOICED para todos los registros del lote exitoso
             try:
-                db_ok = mysql.connector.connect(
-                    host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-                    password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
-                )
+                db_ok = get_db_connection()
                 cursor_ok = db_ok.cursor()
                 for item in ready_to_post_list:
                     cursor_ok.execute("""
-                        UPDATE finance.mkp_billing_prod 
-                        SET status = 'ODOO_INVOICED', odoo_so_name = %s, processed_at = NOW() 
+                        UPDATE finance.mkp_billing_prod
+                        SET status = 'ODOO_INVOICED', odoo_so_name = %s, processed_at = NOW()
                         WHERE id = %s
                     """, (item['so_name'], item['record_id']))
-                    log.info(f"✅ ÉXITO: Factura de {item['so_name']} (ML: {item['mkp_order']}) inyectada y publicada correctamente en lote.")
                 db_ok.commit()
                 cursor_ok.close()
                 db_ok.close()
-                log.info(f"ERROR_502_COUNTER POR LOTE (ACUMULADO): {ERROR_502_COUNTER}")
             except Exception as db_ex:
                 log.error(f"Error guardando éxito de action_post() en BD: {db_ex}")
 
-    # --- Resumen de estados del lote (NUEVO) ---
+    # --- Resumen de estados del lote ---
     try:
-        db_summary = mysql.connector.connect(
-            host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
-        )
+        db_summary = get_db_connection()
         cursor_summary = db_summary.cursor(dictionary=True)
         format_strings = ','.join(['%s'] * len(record_ids))
         cursor_summary.execute(f"""
@@ -882,18 +902,25 @@ def process_batch_concurrently():
         total_diff = status_counts.get('TOTAL_DIFF', 0)
         error = status_counts.get('ERROR', 0)
         processing = status_counts.get('PROCESSING', 0)
-        log.info(f"Resumen lote: Total={total}, Éxitos publicados={success}, Ya facturadas={already}, ERROR_BG={error_bg}, ORDER_NOT_ODOO_YET={order_not}, TOTAL_DIFF={total_diff}, ERROR={error}, PROCESSING={processing}")
+        log.info(
+            f"Resumen lote: Total={total}, Éxitos publicados={success}, Ya facturadas={already}, "
+            f"ERROR_BG={error_bg}, ORDER_NOT_ODOO_YET={order_not}, TOTAL_DIFF={total_diff}, "
+            f"ERROR={error}, PROCESSING={processing} | Borradores reanudados={resumed_drafts}, "
+            f"Clientes nuevos={partners_created}, Clientes fallidos={partners_failed}, "
+            f"Expiradas a ORDER_NEVER_IN_ODOO={expired_orders}, 502 acumulados={ERROR_502_COUNTER}"
+        )
     except Exception as e:
         log.warning(f"No se pudo obtener resumen de estados del lote: {e}")
 
     # Aumentamos ligeramente el respiro para que el Garbage Collector de Odoo actúe
-    log.info(f"Lote terminado. Dando {SLEEP_BETWEEN_BATCHES} segundos de respiro a la RAM de Odoo...")
     time.sleep(SLEEP_BETWEEN_BATCHES)
 
     return len(records)
 
+
 if __name__ == "__main__":
     log.info("=== Iniciando Inyección CONCURRENTE de Facturas ML a Odoo ===")
+    validate_env()
 
     # Al arrancar la ejecución, se limpia el set de IDs especiales reintentados
     with retried_lock:
@@ -904,6 +931,8 @@ if __name__ == "__main__":
 
     try:
         empty_runs = 0
+        batches = 0
+        total_processed = 0
         while empty_runs < MAX_EMPTY_RUNS:
             processed_count = process_batch_concurrently()
 
@@ -911,10 +940,16 @@ if __name__ == "__main__":
                 empty_runs += 1
                 time.sleep(SLEEP_SECONDS)
             else:
-                empty_runs = 0  
+                empty_runs = 0
+                batches += 1
+                total_processed += processed_count
 
-        log.info("=== Proceso de Inyección Finalizado (Sin registros pendientes) ===")
-        log.info(f"ERROR_502_COUNTER FINAL: {ERROR_502_COUNTER}")
+        log.info(
+            f"=== Proceso de Inyección Finalizado (Sin registros pendientes) === "
+            f"Lotes procesados={batches}, Registros tomados={total_processed}, "
+            f"ERROR_502_COUNTER FINAL={ERROR_502_COUNTER}"
+        )
 
     except Exception:
         log.exception("Error general durante la orquestación de la inyección.")
+        raise SystemExit(1)

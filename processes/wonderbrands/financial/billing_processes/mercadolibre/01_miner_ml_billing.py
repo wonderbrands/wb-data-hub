@@ -7,20 +7,31 @@ import json
 from datetime import datetime
 import os
 import logging
-from dotenv import load_dotenv
-load_dotenv() 
-
 
 # ── Logging setup ──────────────────────────────────────────────
+# Solo StreamHandler: Kestra captura stdout/stderr como logs de la ejecución,
+# un FileHandler dentro del WorkingDirectory se pierde al terminar la tarea.
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('ml_invoices_debug.log', encoding='utf-8')
-    ]
+    handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger(__name__)
+
+# ── Parámetros por variables de entorno ────────────────────────
+DB_HOST     = os.getenv("DB_HOST")
+DB_USER     = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME     = os.getenv("DB_NAME")
+
+# Vendedor de Mercado Libre y ventana de búsqueda (Paciente Cero: fecha UTC-4 exacta)
+ML_SELLER_ID       = os.getenv("ML_SELLER_ID", "25523702")
+ML_BILLING_START   = os.getenv("ML_BILLING_START", "2026-06-01 15:50:55")
+# Horas tras el pago a partir de las cuales se asume que ML jamás va a facturar (30 días)
+NEVER_BILLED_HOURS = int(os.getenv("NEVER_BILLED_HOURS", "720"))
+REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "15"))
+# Pausa entre llamadas a la API de ML para respetar rate limits
+SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "0.1"))
 
 
 def xml_to_dict(element):
@@ -37,82 +48,88 @@ def xml_to_dict(element):
         result['_text'] = element.text.strip()
     return result
 
+
 def extract_ml_invoices():
+    # ── Validación de configuración ────────────────────────────
+    missing = [k for k, v in {
+        "DB_HOST": DB_HOST, "DB_USER": DB_USER,
+        "DB_PASSWORD": DB_PASSWORD, "DB_NAME": DB_NAME
+    }.items() if not v]
+    if missing:
+        log.error(f"Faltan variables de entorno obligatorias: {', '.join(missing)}")
+        raise SystemExit(1)
+
     # ── Conexión DB ────────────────────────────────────────────
-    log.info("Conectando a la base de datos...")
     db = MySQLdb.connect(
-        host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-        passwd=os.getenv("DB_PASSWORD"), db=os.getenv("DB_NAME"),
+        host=DB_HOST, user=DB_USER,
+        passwd=DB_PASSWORD, db=DB_NAME,
         local_infile=True, charset='utf8mb4'
     )
     cursor = db.cursor()
 
     # ── Token ML ───────────────────────────────────────────────
-    cursor.execute("SELECT token FROM somos_reyes.tokens WHERE seller_id = '25523702'")
+    cursor.execute(
+        "SELECT token FROM somos_reyes.tokens WHERE seller_id = %s",
+        (ML_SELLER_ID,)
+    )
     row = cursor.fetchall()
     if not row:
-        log.error("No se encontró token para seller_id=25523702")
-        return
+        log.error(f"No se encontró token para seller_id={ML_SELLER_ID}")
+        cursor.close()
+        db.close()
+        raise SystemExit(1)
     ml_token = str(row[0][0])
     headers = {'Authorization': f'Bearer {ml_token}'}
 
-    # ── Órdenes candidatas (Paciente Cero: 2026-06-01 19:50:58 UTC) ──
-    query = """
+    # ── Órdenes candidatas ─────────────────────────────────────
+    cursor.execute("""
         SELECT o.order_id, o.date_closed, s.status as invoice_status, o.status as order_status_ml, IFNULL(s.retry_count, 0)
         FROM somos_reyes.ml_order_update o
         LEFT JOIN finance.mkp_billing_prod s ON o.order_id = s.mkp_order_id
-        WHERE o.date_created >= GREATEST('2026-06-01 15:50:55', UTC_TIMESTAMP() - INTERVAL 7 DAY)
+        WHERE o.date_created >= %s
           AND o.status IN ('paid', 'closed') -- Solo aseguramos órdenes que ya procesaron pago
           AND (s.status IS NULL OR s.status = 'NO_INVOICE_IN_ML')
         ORDER BY o.date_closed ASC;
-    """
-    
-    query = """
-        SELECT o.order_id, o.date_closed, s.status as invoice_status, o.status as order_status_ml, IFNULL(s.retry_count, 0)
-        FROM somos_reyes.ml_order_update o
-        LEFT JOIN finance.mkp_billing_prod s ON o.order_id = s.mkp_order_id
-        WHERE o.date_created >= '2026-06-01 15:50:55' -- Fecha UTC -4 exacta del Paciente Cero
-        AND o.status IN ('paid', 'closed') 
-        AND (s.status IS NULL OR s.status = 'NO_INVOICE_IN_ML')
-        ORDER BY o.date_closed ASC;
-    """
-    
-    cursor.execute(query)
+    """, (ML_BILLING_START,))
     orders = cursor.fetchall()
     log.info(f"Órdenes candidatas encontradas: {len(orders)}")
 
     if not orders:
-        log.info("No hay órdenes pendientes de facturación en ML en este momento.")
         cursor.close()
         db.close()
         return
 
-    inserts_ok  = 0
-    skipped_404 = 0
-    errors      = 0
+    # ── Contadores (los detalles por orden NO se loguean: solo el resumen final) ──
+    inserts_ok    = 0
+    waiting_404   = 0
+    never_billed  = 0
+    net_errors    = 0
+    http_errors   = 0
+    xml_errors    = 0
+    token_expired = False
 
-    for index, o in enumerate(orders):
+    for o in orders:
         order_id = o[0]
-        date_closed = o[1] # Esto es un datetime object o string (UTC 0)
+        date_closed = o[1]  # datetime object o string (UTC 0)
         retry_count = o[4]
-        
+
         url = f"https://api.mercadolibre.com/invoices/io/documents/stream/order/{order_id}/xml"
-        
+
         try:
-            r = requests.get(url, headers=headers, timeout=15)
-        except requests.exceptions.RequestException as e:
-            log.error(f"Error de red en orden {order_id}: {e}")
-            errors += 1
+            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException:
+            net_errors += 1
             continue
 
         if r.status_code == 401:
+            token_expired = True
             log.error("Token expirado (401). Abortando script.")
             break
 
         # ── Manejo Inteligente del 404 (Sin Factura Aún) ──
         if r.status_code == 404:
             new_retry_count = retry_count + 1
-            
+
             # Asegurar que date_closed sea un objeto datetime para calcular horas
             if isinstance(date_closed, str):
                 date_closed_obj = datetime.strptime(date_closed[:19], "%Y-%m-%d %H:%M:%S")
@@ -120,28 +137,26 @@ def extract_ml_invoices():
                 date_closed_obj = date_closed
 
             hours_elapsed = (datetime.utcnow() - date_closed_obj).total_seconds() / 3600
-            
-            # Si pasaron más de 720 horas = '30 DIAS', ML falló definitivamente
-            if hours_elapsed > 720:
+
+            # Si pasaron más de NEVER_BILLED_HOURS, ML falló definitivamente
+            if hours_elapsed > NEVER_BILLED_HOURS:
                 new_status = 'NEVER_BILLED_BY_ML'
-                log.warning(f"Orden {order_id} excedió 720 hrs. Marcada como NEVER_BILLED_BY_ML.")
+                never_billed += 1
             else:
                 new_status = 'NO_INVOICE_IN_ML'
-                log.debug(f"Orden {order_id} sin factura aún ({int(hours_elapsed)} hrs desde el pago).")
+                waiting_404 += 1
 
             cursor.execute("""
-                INSERT INTO finance.mkp_billing_prod 
-                (marketplace, mkp_order_id, status, retry_count) 
+                INSERT INTO finance.mkp_billing_prod
+                (marketplace, mkp_order_id, status, retry_count)
                 VALUES ('MERCADO_LIBRE', %s, %s, %s)
                 ON DUPLICATE KEY UPDATE status = VALUES(status), retry_count = VALUES(retry_count)
             """, (order_id, new_status, new_retry_count))
             db.commit()
-            skipped_404 += 1
             continue
 
         if r.status_code != 200:
-            log.warning(f"Respuesta {r.status_code} inesperada en orden {order_id}")
-            errors += 1
+            http_errors += 1
             continue
 
         # ── Parsear XML (Si llegó 200 OK) ──
@@ -156,7 +171,7 @@ def extract_ml_invoices():
             tfd_node = root.find('cfdi:Complemento/tfd:TimbreFiscalDigital', ns)
 
             if tfd_node is None:
-                errors += 1
+                xml_errors += 1
                 continue
 
             tfd = tfd_node.attrib
@@ -166,15 +181,15 @@ def extract_ml_invoices():
             raw_json_str = json.dumps(xml_to_dict(root), ensure_ascii=False)
 
             if not uuid:
-                errors += 1
+                xml_errors += 1
                 continue
 
             # Inyectar XML y marcar como PENDING para el Loader
             cursor.execute("""
-                INSERT INTO finance.mkp_billing_prod 
-                (marketplace, mkp_order_id, cfdi_uuid, total_amount, xml_data, raw_json, status, retry_count) 
+                INSERT INTO finance.mkp_billing_prod
+                (marketplace, mkp_order_id, cfdi_uuid, total_amount, xml_data, raw_json, status, retry_count)
                 VALUES ('MERCADO_LIBRE', %s, %s, %s, %s, %s, 'PENDING', %s)
-                ON DUPLICATE KEY UPDATE 
+                ON DUPLICATE KEY UPDATE
                     cfdi_uuid = VALUES(cfdi_uuid),
                     total_amount = VALUES(total_amount),
                     xml_data = VALUES(xml_data),
@@ -183,17 +198,26 @@ def extract_ml_invoices():
             """, (order_id, uuid, total, xml_base64, raw_json_str, retry_count))
             db.commit()
             inserts_ok += 1
-            log.info(f"XML descargado y listo para Loader: {order_id}")
 
-        except Exception as e:
-            log.error(f"Error procesando XML de {order_id}: {e}")
-            errors += 1
+        except Exception:
+            xml_errors += 1
 
-        time.sleep(0.1) # Respetar rate limits de ML
+        time.sleep(SLEEP_BETWEEN_CALLS)  # Respetar rate limits de ML
 
-    log.info(f"Resumen -> Extraídas: {inserts_ok} | En espera (404): {skipped_404} | Errores: {errors}")
+    # ── Resumen único de la corrida ────────────────────────────
+    total_errors = net_errors + http_errors + xml_errors
+    log.info(
+        f"Resumen -> Candidatas: {len(orders)} | XMLs extraídos: {inserts_ok} | "
+        f"En espera (404): {waiting_404} | Nunca facturadas por ML: {never_billed} | "
+        f"Errores: {total_errors} (red={net_errors}, http={http_errors}, xml={xml_errors})"
+    )
     cursor.close()
     db.close()
+
+    # Si el token murió a media corrida, la tarea debe fallar para que Kestra reintente/alerte
+    if token_expired:
+        raise SystemExit(1)
+
 
 if __name__ == "__main__":
     extract_ml_invoices()
