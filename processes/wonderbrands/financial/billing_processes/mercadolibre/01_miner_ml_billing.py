@@ -7,6 +7,7 @@ import json
 from datetime import datetime
 import os
 import logging
+import sys
 
 # ── Logging setup ──────────────────────────────────────────────
 # Solo StreamHandler: Kestra captura stdout/stderr como logs de la ejecución,
@@ -14,7 +15,7 @@ import logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
 

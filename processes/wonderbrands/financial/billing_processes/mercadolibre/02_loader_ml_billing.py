@@ -7,6 +7,7 @@ import base64
 import xml.etree.ElementTree as ET
 import concurrent.futures
 import threading
+import sys
 
 # Almacenamiento local por hilo para manejar sesiones TLS independientes si MAX_WORKERS > 1
 thread_local_proxy = threading.local()
@@ -21,7 +22,7 @@ retried_lock = threading.Lock()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
 

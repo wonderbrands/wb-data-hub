@@ -21,7 +21,7 @@ concurrency:
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
-  branch: "main"
+  branch: "mercadolibre_invoice_flows"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
