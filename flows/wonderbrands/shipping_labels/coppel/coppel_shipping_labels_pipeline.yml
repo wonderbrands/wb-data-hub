@@ -13,7 +13,7 @@ pluginDefaults:
       containerImage: wonderbrands-python:v1
       taskRunner:
         type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER=
+        pullPolicy: NEVER
       retry:
         type: constant
         interval: PT1M
@@ -68,7 +68,7 @@ tasks:
           #Nivel de Logs
           LOG_LEVEL: "INFO"
         commands:
-          - python processes/wonderbrands/shipping_labels/coppel/_02_coppel_labels_flex.py
+          - cd processes/wonderbrands/shipping_labels/coppel/ && python _02_coppel_labels_flex.py
 
 triggers:
   - id: cron_coppel_jenkins
