@@ -1,0 +1,57 @@
+id: build_and_publish_docker_image
+namespace: wonderbrands.system
+description: |
+  Construye una imagen Docker a partir de cualquier Dockerfile del repositorio,
+  la etiqueta con un tag semántico (ej. v1.0) y la deja disponible en el host.
+  Solo elimina imágenes dangling (sin tag) para mantener limpio el almacenamiento
+  sin riesgo de romper Flows activos.
+
+inputs:
+  - id: dockerfile_path
+    type: STRING
+    displayName: "Ruta del Dockerfile dentro del repositorio"
+    defaults: "docker/etl_base.Dockerfile"
+  - id: image_name
+    type: STRING
+    displayName: "Nombre de la imagen (sin tag)"
+    defaults: "wonderbrands-python"
+  - id: semantic_tag
+    type: STRING
+    displayName: "Tag semántico (ej. v1.0, v1.1, v2.0)"
+    defaults: "v1.0"
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+
+tasks:
+  - id: working_dir_build
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: build_image
+        type: io.kestra.plugin.docker.Build
+        dockerfile: "{{ read(inputs.dockerfile_path) }}"
+        tags:
+          - "{{ inputs.image_name }}:{{ inputs.semantic_tag }}"
+        push: false
+
+      # Seguro: elimina solo imágenes dangling (sin tag), que no afectan a Flows.
+      - id: prune_dangling
+        type: io.kestra.plugin.docker.Prune
+        pruneType: IMAGES
+        dangling: true
+
+      - id: notify_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK') }}"
+        payload: |
+          {
+            "text": "🐳 Imagen construida: {{ inputs.image_name }}:{{ inputs.semantic_tag }}"
+          }

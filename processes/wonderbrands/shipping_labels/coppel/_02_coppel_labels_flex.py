@@ -79,7 +79,7 @@ def get_db_connection():
             host=os.getenv("DB_HOST"),
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME")  # Asegúrate de que esta variable exista en el .env
+            database=os.getenv("DB_NAME", 'tools')
         )
     except Exception as e:
         logger.error(f"Error al conectar con la Base de Datos: {e}")
@@ -1372,7 +1372,7 @@ def procesar_ordenes_coppel():
                     status='Guias_generadas',
                     label_generated=True,
                     tracking_number=[l['tracking_number'] for l in labels_for_sku],
-                    shipping_cost=sku_shipping_cost,
+                    shipping_cost=total_shipping_cost_mxn,
                     carrier=labels_for_sku[0]['provider'],
                     carrier_service_level=None,
                     error_log=None

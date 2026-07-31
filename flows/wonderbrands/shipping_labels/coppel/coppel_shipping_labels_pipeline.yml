@@ -1,0 +1,84 @@
+id: coppel_shipping_labels_pipeline
+namespace: wonderbrands.shipping_labels.coppel
+description: "Pipeline completo: extrae guías de Coppel Flex, cotiza, genera y publica en Odoo y Mirakl"
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+# Configuración por defecto idéntica a tu flujo de ML
+pluginDefaults:
+  - type: io.kestra.plugin.scripts.shell.Commands
+    values:
+      containerImage: wonderbrands-python:v1
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        pullPolicy: NEVER
+      retry:
+        type: constant
+        interval: PT1M
+        maxAttempt: 3
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "kestra_bot"
+  db_name: "tools"
+  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+
+tasks:
+  - id: working_env_coppel
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: process_coppel_orders
+        type: io.kestra.plugin.scripts.shell.Commands
+        env:
+          #Credenciales de la API de Cotización y Generación
+          AUTH_USER: "{{ secret('AUTH_USER') }}"
+          AUTH_PASS: "{{ secret('AUTH_PASS') }}"
+          
+          #Secretos de Mirakl y Google Sheets
+          API_KEY_MIRAKL: "{{ secret('API_KEY_MIRAKL') }}"
+          SPREADSHEET_COPPEL_ID_SR: "{{ secret('SPREADSHEET_COPPEL_ID_SR') }}"
+          
+          # Base de Datos
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          
+          # Odoo
+          odoo_urlV18: "{{ vars.odoo_url }}"
+          odoo_dbV18: "{{ vars.odoo_db }}"
+          odoo_user_dataV18: "{{ secret('odoo_user_dataV18') }}"
+          odoo_password_dataV18: "{{ secret('odoo_password_dataV18') }}"
+          
+          #Nivel de Logs
+          LOG_LEVEL: "INFO"
+        commands:
+          - python processes/wonderbrands/shipping_labels/coppel/_02_coppel_labels_flex.py
+
+triggers:
+  - id: cron_coppel_jenkins
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6,10,14,18,22 * * *"
+    timezone: "America/Mexico_City"
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *Fallo crítico en el pipeline de guías de Coppel* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+      }
