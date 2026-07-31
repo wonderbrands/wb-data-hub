@@ -47,7 +47,7 @@ MIRAKL_API_BASE_URL = "https://coppel-prod.mirakl.net/api" if not is_test else "
 SPREADSHEET_ID_SR = os.getenv(f'SPREADSHEET_COPPEL_ID_SR')
 
 # Ruta de credenciales
-CREDENTIALS_JSON_PATH = '/var/lib/creds/shipping_info_coppel.json'
+CREDENTIALS_JSON_PATH = '/var/lib/credentials/shipping_info_coppel.json'
 
 CARRIER_JSON = 'carrier_map.json'
 
