@@ -1,5 +1,5 @@
-id: ml_billing_flow
-namespace: wonderbrands.finance.mercadolibre
+id: ml_billing_process_flow
+namespace: wonderbrands.financial.mercadolibre
 description: "Pipeline Facturación: Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
 
 # Configuración por defecto para todas las tareas Commands de este flujo
@@ -10,14 +10,15 @@ pluginDefaults:
       taskRunner:
         type: io.kestra.plugin.scripts.runner.docker.Docker
         pullPolicy: NEVER
-      retry:
-        type: constant
-        interval: PT2M
-        maxAttempt: 3
+
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
-  branch: "main"
+  branch: "mercadolibre_invoice_flows"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
@@ -63,10 +64,10 @@ tasks:
           - python processes/wonderbrands/financial/billing_processes/mercadolibre/02_loader_ml_billing.py
 
 triggers:
-  # Distribución de carga: Se ejecuta cada 3 horas (00:00, 03:00, 06:00, etc. UTC)
-  - id: micro_lotes_cada_3_horas
+  # Distribución de carga: Se ejecuta cada 6 horas UTC
+  - id: micro_lotes_cada_6_horas 
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 0,3,6,9,12,15,18,21 * * *"
+    cron: "0 0,6,12,18 * * *"
 
 errors:
   - id: slack_alert
