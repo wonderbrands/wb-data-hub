@@ -64,7 +64,7 @@ API_AUTH = (API_USER, API_PASS) if API_USER and API_PASS else None
 log_level_str = os.getenv('LOG_LEVEL', 'INFO').upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
 
-logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger()
 logger.info(f"Nivel de logging establecido en: {log_level_str}")
 
