@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-#load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
+load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
 
 def load_ml_payments_to_odoo():
     # ── 1. Conexión a Base de Datos ──────────────────────────────
@@ -25,7 +25,7 @@ def load_ml_payments_to_odoo():
         SELECT p.*, b.odoo_so_name 
         FROM finance.mkp_payments_prod p
         JOIN finance.mkp_billing_prod b ON p.mkp_order_id = b.mkp_order_id
-        WHERE p.status = 'PENDING'
+        WHERE p.status = 'PENDING' LIMIT 1000
     """)
     pending_payments = cursor.fetchall()
 
