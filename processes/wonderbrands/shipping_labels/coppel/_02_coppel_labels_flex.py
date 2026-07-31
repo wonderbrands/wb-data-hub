@@ -1013,8 +1013,11 @@ def generate_labels(best_rates_map: dict, recipient_data: dict, total_order_valu
                     generated_labels.append({
                         'box_id': box_id,  # Este es el package_id
                         'offer_sku': offer_sku,  # Par MIRAKL ST01
+                        'sku_child': sku_child,  # SKU hijo/caja, para el JSON de tools.shipping_labels
                         'tracking_number': str(label_data['tracking_number']),
                         'provider': provider_name,
+                        'service_name': rate.get('service_name'),  # Nombre completo del servicio (carrier_service_level)
+                        'shipping_label_cost': rate.get('total_price', 0) / 100.0,  # Costo de ESTA guía/caja
                         'pdf_url': pdf_url,  # El original (ej. de eShip)
                         'zpl': zpl_data,  # El ZPL original (como fallback)
                         'pdf_bytes': pdf_bytes_data,  # los bytes del PDF
@@ -1237,7 +1240,7 @@ def procesar_ordenes_coppel():
                     marketplace='Coppel',
                     sku=line.get('offer_sku'),
                     qty_ordered=int(line.get('quantity', 0)),
-                    status='Costo_guia_excesivo',
+                    status='LIMIT_RATIO_OVERCOME',
                     label_generated=False,
                     tracking_number=None,
                     shipping_cost=total_shipping_cost_mxn,
@@ -1261,7 +1264,8 @@ def procesar_ordenes_coppel():
                 log_data = [fecha_orden, order_id, so_name, skus_str, reason, "NINGUNA", "N/A", "N/A", "N/A", "", "N/A"]
                 smart_log('Guias_incompletas', log_data)
 
-                # --- NUEVO: registro adicional en tools.shipping_labels (no sustituye smart_log/BD existentes) ---
+                #registro adicional en tools.shipping_labels (no sustituye smart_log/BD existentes) ---
+                # Análogo a Amazon: cuando NO se generó ninguna guía para la orden -> SKU_NOT_SUPPORT
                 for line in order.get('order_lines', []):
                     insert_shipping_label(
                         conn,
@@ -1269,10 +1273,10 @@ def procesar_ordenes_coppel():
                         marketplace='Coppel',
                         sku=line.get('offer_sku'),
                         qty_ordered=int(line.get('quantity', 0)),
-                        status='Guias_incompletas',
+                        status='SKU_NOT_SUPPORT',
                         label_generated=False,
                         tracking_number=None,
-                        shipping_cost=None,
+                        shipping_cost=total_shipping_cost_mxn,
                         carrier=None,
                         carrier_service_level=None,
                         error_log=reason
@@ -1309,25 +1313,54 @@ def procesar_ordenes_coppel():
                                 file_data_b64, "Aun No"]
                     smart_log('Guias_incompletas', log_data)
 
-                    # --- NUEVO: registro adicional en tools.shipping_labels para esta guía parcial ---
-                    matching_line = next(
-                        (l for l in order.get('order_lines', []) if l.get('offer_sku') == label.get('offer_sku')),
-                        None
-                    )
-                    insert_shipping_label(
-                        conn,
-                        marketplace_id=order_id,
-                        marketplace='Coppel',
-                        sku=label.get('offer_sku'),
-                        qty_ordered=int(matching_line.get('quantity', 0)) if matching_line else None,
-                        status='Guias_incompletas',
-                        label_generated=True,
-                        tracking_number=[label.get('tracking_number')],
-                        shipping_cost=None,
-                        carrier=provider_name,
-                        carrier_service_level=None,
-                        error_log=reason
-                    )
+                #registro en tools.shipping_labels, un renglón por SKU, análogo a Amazon ---
+                # Los SKUs que sí obtuvieron guía -> LABELS_GENERATED; los que no -> NO_LABEL_FOR_SKU.
+                for line in order.get('order_lines', []):
+                    sku = line.get('offer_sku')
+                    qty = int(line.get('quantity', 0))
+                    labels_for_sku = [l for l in labels if l.get('offer_sku') == sku]
+
+                    if labels_for_sku:
+                        main_carrier = labels_for_sku[0]['provider']
+                        main_carrier = 'PAQUETEXPRESS' if main_carrier == 'PAQUETEEXPRESS' else main_carrier
+                        main_service = labels_for_sku[0].get('service_name')
+                        tracking_json_list = [{
+                            "carrier": 'PAQUETEXPRESS' if l['provider'] == 'PAQUETEEXPRESS' else l['provider'],
+                            "sku_child": l.get('sku_child'),
+                            "package_id": l.get('box_id'),
+                            "tracking_number": l['tracking_number'],
+                            "shipping_label_cost": l.get('shipping_label_cost')
+                        } for l in labels_for_sku]
+
+                        insert_shipping_label(
+                            conn,
+                            marketplace_id=order_id,
+                            marketplace='Coppel',
+                            sku=sku,
+                            qty_ordered=qty,
+                            status='LABELS_GENERATED',
+                            label_generated=True,
+                            tracking_number=tracking_json_list,
+                            shipping_cost=total_shipping_cost_mxn,
+                            carrier=main_carrier,
+                            carrier_service_level=main_service,
+                            error_log=None
+                        )
+                    else:
+                        insert_shipping_label(
+                            conn,
+                            marketplace_id=order_id,
+                            marketplace='Coppel',
+                            sku=sku,
+                            qty_ordered=qty,
+                            status='NO_LABEL_FOR_SKU',
+                            label_generated=False,
+                            tracking_number=None,
+                            shipping_cost=total_shipping_cost_mxn,
+                            carrier=None,
+                            carrier_service_level=None,
+                            error_log=reason
+                        )
             continue
 
         # --- PASO E: Actualizar Mirakl (ST01 y OR74) ---
@@ -1364,27 +1397,38 @@ def procesar_ordenes_coppel():
 
             # --- NUEVO: registro adicional en tools.shipping_labels, uno por SKU (no sustituye smart_log/BD existentes) ---
             order_lines = order.get('order_lines', [])
-            num_skus = len(order_lines) or 1
             for line in order_lines:
                 sku = line.get('offer_sku')
                 labels_for_sku = [l for l in labels if l.get('offer_sku') == sku]
                 if not labels_for_sku:
                     continue
-                # La API de cotización no desglosa el costo por SKU, solo el total de la orden;
-                # se distribuye equitativamente entre los SKUs de la orden como aproximación.
-                sku_shipping_cost = total_shipping_cost_mxn / num_skus
+
+                main_carrier = labels_for_sku[0]['provider']
+                main_carrier = 'PAQUETEXPRESS' if main_carrier == 'PAQUETEEXPRESS' else main_carrier
+                main_service = labels_for_sku[0].get('service_name')
+
+                # JSON completo por caja, igual que en el script de Amazon:
+                # carrier, sku_child, package_id, tracking_number y shipping_label_cost por guía.
+                tracking_json_list = [{
+                    "carrier": 'PAQUETEXPRESS' if l['provider'] == 'PAQUETEEXPRESS' else l['provider'],
+                    "sku_child": l.get('sku_child'),
+                    "package_id": l.get('box_id'),
+                    "tracking_number": l['tracking_number'],
+                    "shipping_label_cost": l.get('shipping_label_cost')
+                } for l in labels_for_sku]
+
                 insert_shipping_label(
                     conn,
                     marketplace_id=order_id,
                     marketplace='Coppel',
                     sku=sku,
                     qty_ordered=int(line.get('quantity', 0)),
-                    status='Guias_generadas',
+                    status='LABELS_GENERATED',
                     label_generated=True,
-                    tracking_number=[l['tracking_number'] for l in labels_for_sku],
-                    shipping_cost=total_shipping_cost_mxn,
-                    carrier=labels_for_sku[0]['provider'],
-                    carrier_service_level=None,
+                    tracking_number=tracking_json_list,
+                    shipping_cost=total_shipping_cost_mxn,  # costo TOTAL de envío de la orden
+                    carrier=main_carrier,
+                    carrier_service_level=main_service,
                     error_log=None
                 )
         except Exception as e_log_sr:
