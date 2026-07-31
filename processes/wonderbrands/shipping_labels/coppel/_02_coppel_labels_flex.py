@@ -47,7 +47,7 @@ MIRAKL_API_BASE_URL = "https://coppel-prod.mirakl.net/api" if not is_test else "
 SPREADSHEET_ID_SR = os.getenv(f'SPREADSHEET_COPPEL_ID_SR')
 
 # Ruta de credenciales
-CREDENTIALS_JSON_PATH = '/var/lib/credentials/shipping_info_coppel.json'
+GOOGLE_CREDS_JSON = os.getenv('GOOGLE_CREDS_JSON')
 
 CARRIER_JSON = 'carrier_map.json'
 
@@ -209,7 +209,8 @@ def load_dynamic_config():
 
     try:
         # 1. Autenticar (conexión separada)
-        creds = Credentials.from_service_account_file(CREDENTIALS_JSON_PATH, scopes=SCOPES)
+        creds_info = json.loads(GOOGLE_CREDS_JSON)
+        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         client = gspread.authorize(creds)
 
         # 2. Abrir el Sheet SR y la hoja 'AUT_DATA'
@@ -807,7 +808,9 @@ def upload_documents_to_mirakl(mirakl_headers_auth: dict, order_id: str, labels:
 def authenticate_google_sheets():
     """Autentica la conexión a Google Sheets."""
     try:
-        creds = Credentials.from_service_account_file(CREDENTIALS_JSON_PATH, scopes=SCOPES)
+        creds_info = json.loads(GOOGLE_CREDS_JSON)
+        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+        
         client = gspread.authorize(creds)
         logger.info("Autenticación con Google Sheets exitosa.")
         return client

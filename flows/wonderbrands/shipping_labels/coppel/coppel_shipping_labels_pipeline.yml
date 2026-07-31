@@ -13,9 +13,7 @@ pluginDefaults:
       containerImage: wonderbrands-python:v1
       taskRunner:
         type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER
-        volumes:
-          - /var/lib/creds:/var/lib/creds
+        pullPolicy: NEVER=
       retry:
         type: constant
         interval: PT1M
@@ -64,6 +62,8 @@ tasks:
           odoo_dbV18: "{{ vars.odoo_db }}"
           odoo_user_dataV18: "{{ secret('odoo_user_dataV18') }}"
           odoo_password_dataV18: "{{ secret('odoo_password_dataV18') }}"
+
+          GOOGLE_CREDS_JSON: "{{ secret('SHIPPING_INFO_COPPEL_JSON') }}"
           
           #Nivel de Logs
           LOG_LEVEL: "INFO"
