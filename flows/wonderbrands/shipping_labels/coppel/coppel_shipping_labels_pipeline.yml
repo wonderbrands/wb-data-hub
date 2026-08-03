@@ -71,7 +71,7 @@ tasks:
           - cd processes/wonderbrands/shipping_labels/coppel/ && python _02_coppel_labels_flex.py
 
 triggers:
-  - id: cron_coppel_jenkins
+  - id: cron_coppel_labels
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "0 6,10,14,18,22 * * *"
     timezone: "America/Mexico_City"

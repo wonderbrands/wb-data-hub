@@ -831,9 +831,11 @@ def execute_invoice(context, team_name, orders_list):
                                     'invoice_origin': order_name, 'invoice_line_ids': invoice_line_vals_list,
                                     'l10n_mx_edi_usage': 'S01', 'l10n_mx_edi_payment_method_id': 3,
                                     'l10n_mx_edi_payment_policy': 'PUE', 'team_id': team_id,
+                                    'invoice_payment_term_id': 1 # Pago de inmediato para que sea PUE y no PPD
                                 }
                                 if context.invoice_date_first_of_month:
                                     invoice_vals['invoice_date'] = context.invoice_date_first_of_month
+                                    invoice_vals['invoice_date_due'] = context.invoice_date_first_of_month
 
                                 # ===== BLINDAJE: RE-VALIDACION PRE-CREATE =====
                                 # invoiced_origins se calculo al inicio del lote
