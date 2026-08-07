@@ -43,29 +43,58 @@ def clasificar_venta(warehouse_tuple):
     return tipo, wh_name
 
 def obtener_ordenes_con_out_confirmado(models, db, uid, pwd, order_ids):
+    """
+    Devuelve un diccionario {sale_id: fecha_done} de las órdenes con OUT confirmado.
+    Al ser un diccionario, sigue funcionando igual que el set original para
+    validaciones de pertenencia (ej. 'if x in ordenes_ya_surtidas').
+    """
     if not order_ids:
-        return set()
+        return {}
     domain = [
         ('sale_id', 'in', order_ids), 
         ('state', '=', 'done'), 
         ('picking_type_code', '=', 'outgoing')
     ]
-    pickings = call_odoo(models, db, uid, pwd, 'stock.picking', 'search_read', [domain], {'fields': ['sale_id']})
-    return {p['sale_id'][0] for p in pickings if p.get('sale_id')}
+    pickings = call_odoo(models, db, uid, pwd, 'stock.picking', 'search_read', [domain], {'fields': ['sale_id', 'date_done']})
+    return {p['sale_id'][0]: p.get('date_done') for p in pickings if p.get('sale_id')}
 
 def obtener_ordenes_con_devolucion(models, db, uid, pwd, order_ids):
     """
     Busca si la orden tiene un movimiento de retorno (RET) en estado 'done'.
+    Devuelve un diccionario {sale_id: fecha_done} (funciona igual que el set
+    original para validaciones de pertenencia).
     """
     if not order_ids:
-        return set()
+        return {}
     domain = [
         ('sale_id', 'in', order_ids), 
         ('state', '=', 'done'), 
         ('name', 'ilike', '%RET%')  # Validamos que el folio del movimiento contenga RET
     ]
-    pickings = call_odoo(models, db, uid, pwd, 'stock.picking', 'search_read', [domain], {'fields': ['sale_id']})
-    return {p['sale_id'][0] for p in pickings if p.get('sale_id')}
+    pickings = call_odoo(models, db, uid, pwd, 'stock.picking', 'search_read', [domain], {'fields': ['sale_id', 'date_done']})
+    return {p['sale_id'][0]: p.get('date_done') for p in pickings if p.get('sale_id')}
+
+
+def obtener_fechas_factura(models, db, uid, pwd, order_names):
+    """
+    Busca la fecha de factura (account.move) cuyo invoice_origin coincide
+    con el nombre de la orden de venta. Devuelve {order_name: invoice_date}.
+    """
+    if not order_names:
+        return {}
+    domain = [
+        ('invoice_origin', 'in', order_names),
+        ('move_type', '=', 'out_invoice'),
+        ('state', '=', 'posted')
+    ]
+    facturas = call_odoo(models, db, uid, pwd, 'account.move', 'search_read', [domain], {'fields': ['invoice_origin', 'invoice_date']})
+    fechas = {}
+    for f in facturas:
+        origen = f.get('invoice_origin') or ''
+        for nombre in [o.strip() for o in origen.split(',')]:
+            if nombre:
+                fechas[nombre] = f.get('invoice_date')
+    return fechas
 
 
 def generar_reporte_alertas():
@@ -94,14 +123,24 @@ def generar_reporte_alertas():
     # ── CAMBIO CLAVE: Usamos un diccionario para consolidar por orden ──
     reporte_dict = {}
 
-    def agregar_al_reporte(orden_data, tipo_venta, almacen_nombre, tipo_alerta, detalle):
+    def agregar_al_reporte(orden_data, tipo_venta, almacen_nombre, tipo_alerta, detalle, fecha_factura=None, fecha_out=None, fecha_ret=None):
         """Función auxiliar para agregar o actualizar una orden en el reporte"""
         nombre = orden_data['name']
+        fecha_factura = fecha_factura or 'N/A'
+        fecha_out = fecha_out or 'N/A'
+        fecha_ret = fecha_ret or 'N/A'
         if nombre in reporte_dict:
             # Si la orden ya existe, concatenamos la nueva alerta para no duplicar filas
             if tipo_alerta not in reporte_dict[nombre]['Tipo_Alerta']:
                 reporte_dict[nombre]['Tipo_Alerta'] += f" + {tipo_alerta}"
                 reporte_dict[nombre]['Detalle'] += f" | {detalle}"
+            # Completamos las fechas si antes no aplicaban y ahora sí tenemos dato
+            if reporte_dict[nombre]['Fecha de factura'] == 'N/A' and fecha_factura != 'N/A':
+                reporte_dict[nombre]['Fecha de factura'] = fecha_factura
+            if reporte_dict[nombre]['Fecha OUT'] == 'N/A' and fecha_out != 'N/A':
+                reporte_dict[nombre]['Fecha OUT'] = fecha_out
+            if reporte_dict[nombre]['Fecha RET'] == 'N/A' and fecha_ret != 'N/A':
+                reporte_dict[nombre]['Fecha RET'] = fecha_ret
         else:
             # Si es la primera vez que la vemos, la creamos
             reporte_dict[nombre] = {
@@ -111,15 +150,21 @@ def generar_reporte_alertas():
                 'Tipo_Venta': tipo_venta,
                 'Almacen': almacen_nombre,
                 'Tipo_Alerta': tipo_alerta,
-                'Detalle': detalle
+                'Detalle': detalle,
+                'Valor de la orden de venta [$]': orden_data.get('amount_total', 'N/A'),
+                'Fecha de orden': orden_data.get('date_order', 'N/A'),
+                'Fecha de factura': fecha_factura,
+                'Fecha OUT': fecha_out,
+                'Fecha RET': fecha_ret
             }
 
     # ── ALERTA 1: SO confirmada sin OUT ──────────────
     log.info("Buscando Alerta 1: Retrasos > 5 días...")
     domain_retraso = [('state', '=', 'sale'), ('date_order', '<', hace_5_dias), ('delivery_status', 'in', ['pending', 'partial'])]
-    retrasos = call_odoo(models, odoo_db, uid, odoo_pwd, 'sale.order', 'search_read', [domain_retraso], {'fields': ['id', 'name', 'date_order', 'team_id', 'channel_order_reference', 'warehouse_id']})
+    retrasos = call_odoo(models, odoo_db, uid, odoo_pwd, 'sale.order', 'search_read', [domain_retraso], {'fields': ['id', 'name', 'date_order', 'team_id', 'channel_order_reference', 'warehouse_id', 'amount_total']})
     retrasos_ids = [r['id'] for r in retrasos]
     ordenes_ya_surtidas = obtener_ordenes_con_out_confirmado(models, odoo_db, uid, odoo_pwd, retrasos_ids)
+    fechas_factura_retrasos = obtener_fechas_factura(models, odoo_db, uid, odoo_pwd, [r['name'] for r in retrasos])
 
     for r in retrasos:
         if r['id'] in ordenes_ya_surtidas:
@@ -128,7 +173,8 @@ def generar_reporte_alertas():
         agregar_al_reporte(
             r, tipo_venta, almacen_nombre, 
             'RETRASO_OUT', 
-            f"Confirmada el {r['date_order']} sin OUT."
+            f"Confirmada el {r['date_order']} sin OUT.",
+            fecha_factura=fechas_factura_retrasos.get(r['name'])
         )
 
     # ── ALERTA 2: Desfase Facturación–Despacho ──────────────
@@ -155,8 +201,10 @@ def generar_reporte_alertas():
             chunk = ordenes_desfasadas_ids[i:i + chunk_size]
             domain_orders = [[('id', 'in', chunk)]]
 
-            orders_data = call_odoo(models, odoo_db, uid, odoo_pwd, 'sale.order', 'search_read', domain_orders, {'fields': ['id', 'name', 'team_id', 'channel_order_reference', 'warehouse_id']})
+            orders_data = call_odoo(models, odoo_db, uid, odoo_pwd, 'sale.order', 'search_read', domain_orders, {'fields': ['id', 'name', 'date_order', 'team_id', 'channel_order_reference', 'warehouse_id', 'amount_total']})
             ordenes_con_devolucion = obtener_ordenes_con_devolucion(models, odoo_db, uid, odoo_pwd, chunk)
+            ordenes_con_out_desfase = obtener_ordenes_con_out_confirmado(models, odoo_db, uid, odoo_pwd, chunk)
+            fechas_factura_desfase = obtener_fechas_factura(models, odoo_db, uid, odoo_pwd, [o['name'] for o in orders_data])
 
             for o in orders_data:
                 tipo_venta, almacen_nombre = clasificar_venta(o.get('warehouse_id'))
@@ -168,7 +216,12 @@ def generar_reporte_alertas():
                     tipo_alerta = 'DESFASE_FACTURACION'
                     detalle_texto = "Artículos facturados sin OUT."
 
-                agregar_al_reporte(o, tipo_venta, almacen_nombre, tipo_alerta, detalle_texto)
+                agregar_al_reporte(
+                    o, tipo_venta, almacen_nombre, tipo_alerta, detalle_texto,
+                    fecha_factura=fechas_factura_desfase.get(o['name']),
+                    fecha_out=ordenes_con_out_desfase.get(o['id']),
+                    fecha_ret=ordenes_con_devolucion.get(o['id'])
+                )
 
     # ── ALERTA 3: Entrega sin OUT (Cruce ML Shipping vs Odoo) ────────────
     log.info("Buscando Alerta 3: Entregado en ML sin OUT en Odoo...")
@@ -184,10 +237,12 @@ def generar_reporte_alertas():
             for i in range(0, len(ml_delivered), chunk_size):
                 chunk = ml_delivered[i:i + chunk_size]
                 domain_odoo = [('channel_order_reference', 'in', chunk), ('delivery_status', 'in', ['pending', 'partial'])]
-                odoo_pendientes = call_odoo(models, odoo_db, uid, odoo_pwd, 'sale.order', 'search_read', [domain_odoo], {'fields': ['id', 'name', 'team_id', 'channel_order_reference', 'warehouse_id']})
+                odoo_pendientes = call_odoo(models, odoo_db, uid, odoo_pwd, 'sale.order', 'search_read', [domain_odoo], {'fields': ['id', 'name', 'date_order', 'team_id', 'channel_order_reference', 'warehouse_id', 'amount_total']})
                 
                 pendientes_ids = [op['id'] for op in odoo_pendientes]
                 ordenes_ya_surtidas_ml = obtener_ordenes_con_out_confirmado(models, odoo_db, uid, odoo_pwd, pendientes_ids)
+                ordenes_con_devolucion_ml = obtener_ordenes_con_devolucion(models, odoo_db, uid, odoo_pwd, pendientes_ids)
+                fechas_factura_ml = obtener_fechas_factura(models, odoo_db, uid, odoo_pwd, [op['name'] for op in odoo_pendientes])
 
                 for op in odoo_pendientes:
                     if op['id'] in ordenes_ya_surtidas_ml:
@@ -197,14 +252,16 @@ def generar_reporte_alertas():
                     agregar_al_reporte(
                         op, tipo_venta, almacen_nombre, 
                         'FANTASMA_OUT_ML', 
-                        "ML entregado, Odoo sin OUT."
+                        "ML entregado, Odoo sin OUT.",
+                        fecha_factura=fechas_factura_ml.get(op['name']),
+                        fecha_ret=ordenes_con_devolucion_ml.get(op['id'])
                     )
         cursor.close()
         db.close()
 
     # ── Generar CSV ────────────
     filename = f"Reporte_Inconsistencias_{hoy.strftime('%Y%m%d')}.csv"
-    columnas = ['Orden', 'Referencia marketplace', 'Canal', 'Tipo_Venta', 'Almacen', 'Tipo_Alerta', 'Detalle']
+    columnas = ['Orden', 'Referencia marketplace', 'Canal', 'Tipo_Venta', 'Almacen', 'Tipo_Alerta', 'Detalle', 'Valor de la orden de venta [$]', 'Fecha de orden', 'Fecha de factura', 'Fecha OUT', 'Fecha RET']
     
     # Extraemos los valores del diccionario para escribirlos en el CSV
     reporte_final = list(reporte_dict.values())
