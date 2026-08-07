@@ -4,6 +4,7 @@ import csv
 import logging
 import time
 import socket
+import http.client
 from datetime import datetime, timedelta
 import mysql.connector
 
@@ -16,6 +17,8 @@ RETRYABLE_EXCEPTIONS = (
     TimeoutError,
     socket.error,
     socket.timeout,
+    http.client.HTTPException,  # Cubre BadStatusLine, RemoteDisconnected, etc. cuando
+                                 # el gateway responde con HTML/estado malformado en vez de XML-RPC
 )
 
 def call_odoo(models, db, uid, pwd, model, method, args, kwargs=None, max_retries=4, backoff_base=3):
