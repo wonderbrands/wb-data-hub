@@ -77,14 +77,26 @@ def fetch_pending_orders(conn):
 
 
 def get_order_details_from_crawler(conn, amazonorderid):
-    """Obtiene client_data, paid_by_buyer y shipping_total de la tabla crawl.amz_unshipped_checks"""
+    """Obtiene client_data, paid_by_buyer y shipping_total de la tabla tools.amz_fulfillment_v2_order_state"""
     cursor = conn.cursor(dictionary=True)
+    # query = """
+    #     SELECT client_data, paid_by_buyer, shipping_total 
+    #     FROM crawl.amz_unshipped_checks 
+    #     WHERE amazonorderid = %s 
+    #     ORDER BY inserted_at DESC LIMIT 1
+    # """
+    
+    # Nueva tabla. Solicitud de ERIC
     query = """
-        SELECT client_data, paid_by_buyer, shipping_total 
-        FROM crawl.amz_unshipped_checks 
+    SELECT
+        details_json->>'$.client_data' as client_data,
+        paid_by_buyer,
+        shipping_total
+        FROM tools.amz_fulfillment_v2_order_state
         WHERE amazonorderid = %s 
-        ORDER BY inserted_at DESC LIMIT 1
+        ORDER BY updated_at DESC LIMIT 1;
     """
+
     cursor.execute(query, (amazonorderid,))
     row = cursor.fetchone()
     cursor.close()
@@ -126,7 +138,11 @@ def update_db_label_data(conn, row_id, tracking_json_str, carrier, service_level
 
 
 def update_crawler_checks(conn, order_id, checks_status, checks_detail):
-    """Actualiza el estatus del crawler para una orden específica."""
+    """Actualiza el estatus del crawler para una orden específica.
+        
+        [UPD] Tabla en desuso, ya no require esta actualizacion
+        
+        """
     if not conn: return
     try:
         cursor = conn.cursor()
@@ -564,7 +580,7 @@ def process_amazon_self_ship_labels():
                 f"RECHAZADA: Costo de envío excesivo (${total_shipping_cost_mxn:.2f}) representa el {cost_ratio:.1%} del valor (${paid_by_buyer:.2f}) de la orden {order_id}.")
             for row in order_rows:
                 update_db_label_data(conn, row['id'], None, None, None, "LIMIT_RATIO_OVERCOME")
-                update_crawler_checks(conn, order_id, 0, "Costo de guia supera el 21%")
+                #update_crawler_checks(conn, order_id, 0, "Costo de guia supera el 21%")
 
                 # --- NUEVO: registro adicional en tools.shipping_labels (no sustituye el insert/update anterior) ---
                 insert_shipping_label(
@@ -595,7 +611,7 @@ def process_amazon_self_ship_labels():
             logger.error("No se generaron etiquetas. Se manda manual.")
             for row in order_rows:
                 update_db_label_data(conn, row['id'], None, None, None, "SKU_NOT_SUPPORT")
-                update_crawler_checks(conn, order_id, 0, "SKU no soportado por generador de guías")
+                #update_crawler_checks(conn, order_id, 0, "SKU no soportado por generador de guías")
 
                 # --- NUEVO: registro adicional en tools.shipping_labels (no sustituye el insert/update anterior) ---
                 insert_shipping_label(
