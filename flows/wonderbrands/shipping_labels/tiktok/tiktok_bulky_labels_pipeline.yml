@@ -1,0 +1,163 @@
+id: tiktok_bulky_labels_pipeline
+namespace: wonderbrands.shipping_labels.tiktok
+description: "Tiendas Bulky de TikTok: cotiza, genera guía con paqueteras en convenio, carga a Odoo, reporta el tracking a TikTok y registra en tools.shipping_labels + Google Sheets"
+
+# limit 1 / CANCEL es OBLIGATORIO aquí: dos ejecuciones simultáneas podrían
+# generar guías duplicadas para la misma orden (el candado anti-duplicados de
+# tools.shipping_labels es por corrida, no un lock distribuido).
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+pluginDefaults:
+  - type: io.kestra.plugin.scripts.shell.Commands
+    values:
+      containerImage: wonderbrands-python:v1
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        pullPolicy: NEVER
+      # El reintento es seguro: una orden que ya tiene guía queda con
+      # label_generated=1 en tools.shipping_labels y se omite en el reintento.
+      retry:
+        type: constant
+        interval: PT1M
+        maxAttempt: 3
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "tiktok_shipping_labels"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "kestra_bot"
+  db_name: "tools"
+  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  spreadsheet_tiktok_id: "1eMbXb_lb8WRYO1jr8jcBnfq495kaLc3Do9Wyf8BxTnM"
+
+tasks:
+  - id: working_env_tiktok
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: process_tiktok_bulky_orders
+        type: io.kestra.plugin.scripts.shell.Commands
+        env:
+          # ============================================================
+          # --- API interna de cotización y generación de guías ---
+          AUTH_USER: "{{ secret('AUTH_USER') }}"
+          AUTH_PASS: "{{ secret('AUTH_PASS') }}"
+
+          # --- Base de datos ---
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+
+          # --- Odoo 18 ---
+          odoo_user_dataV18: "{{ secret('odoo_user_dataV18') }}"
+          odoo_password_dataV18: "{{ secret('odoo_password_dataV18') }}"
+
+          # --- Google Sheets (JSON de la cuenta de servicio en una línea) ---
+          GOOGLE_CREDS_JSON: "{{ secret('GOOGLE_CREDS_TIKTOK_JSON') }}"
+
+          # --- Credenciales por tienda de TikTok ---
+          TIKTOK_KH_APP_KEY: "{{ secret('TIKTOK_KH_APP_KEY') }}"
+          TIKTOK_KH_APP_SECRET: "{{ secret('TIKTOK_KH_APP_SECRET') }}"
+          TIKTOK_KH_SHOP_CIPHER: "{{ secret('TIKTOK_KH_SHOP_CIPHER') }}"
+
+          TIKTOK_NEON_APP_KEY: "{{ secret('TIKTOK_NEON_APP_KEY') }}"
+          TIKTOK_NEON_APP_SECRET: "{{ secret('TIKTOK_NEON_APP_SECRET') }}"
+          TIKTOK_NEON_SHOP_CIPHER: "{{ secret('TIKTOK_NEON_SHOP_CIPHER') }}"
+
+          TIKTOK_CDH_APP_KEY: "{{ secret('TIKTOK_CDH_APP_KEY') }}"
+          TIKTOK_CDH_APP_SECRET: "{{ secret('TIKTOK_CDH_APP_SECRET') }}"
+          TIKTOK_CDH_SHOP_CIPHER: "{{ secret('TIKTOK_CDH_SHOP_CIPHER') }}"
+
+          # ============================================================
+          # PARÁMETROS (en claro; se ajustan editando este flujo)
+          # ============================================================
+          # --- Conexiones no secretas ---
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_NAME: "{{ vars.db_name }}"
+          odoo_urlV18: "{{ vars.odoo_url }}"
+          odoo_dbV18: "{{ vars.odoo_db }}"
+          SPREADSHEET_TIKTOK_ID: "{{ vars.spreadsheet_tiktok_id }}"
+
+          # --- Ejecución ---
+          # ERROR silencia el detalle técnico. El resumen operativo (una línea
+          # por orden + totales) usa su propio logger y se ve de todas formas.
+          LOG_LEVEL: "ERROR"
+          TIKTOK_BULKY_DRY_RUN: "false"
+          TEST_API_LABELS_SR: "false"
+          TIKTOK_BULKY_MAX_ORDERS: "10"
+          TIKTOK_BULKY_LOOKBACK_HOURS: "72"
+          TIKTOK_BULKY_PAGE_SIZE: "50"
+          SLEEP_BETWEEN_ORDERS: "1"
+
+          # --- Reglas de negocio ---
+          LIMIT_RATIO_PERCENTAGE: "0.21"
+          ORIGIN_ZIP: "54010"
+          SAT_BIENES_TRANSP: "50161815"
+
+          # --- Tiendas Bulky (seller_name = tiktok_shop_tokens.seller_name) ---
+          TIKTOK_KH_ENABLED: "false"
+          TIKTOK_KH_SELLER_NAME: "KingsHouse Furniture"
+
+          TIKTOK_NEON_ENABLED: "true"
+          TIKTOK_NEON_SELLER_NAME: "Neon Deportes"
+
+          # --- Tienda FULL: TikTok entrega la guía, no aplica a este flujo ---
+          TIKTOK_CDH_ENABLED: "false"
+          TIKTOK_CDH_SELLER_NAME: "ColorDreams"
+
+          # --- TikTok: reporte de la guía ---
+          TIKTOK_HANDOVER_METHOD: "DROP_OFF"
+          TIKTOK_SHIP_STRATEGY: "auto"
+          TIKTOK_WAREHOUSE_REGION: "MX"
+
+          # --- Estados: true mientras el mapeo no viva en la API de guías ---
+          MAP_STATE_TO_CODE: "true"
+        commands:
+          - cd processes/wonderbrands/shipping_labels/tiktok/ && python tiktok_bulky_fulfillment.py
+
+triggers:
+  # Desfasado de Coppel (6,10,14,18,22) para no competir por la API de guías.
+  - id: cron_tiktok_bulky_labels
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 7,11,15,19 * * *"
+    timezone: "America/Mexico_City"
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *Fallo crítico en el pipeline de guías Bulky de TikTok* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+      }
+
+# ------------------------------------------------------------------------
+# El script publica sus contadores como outputs de Kestra, disponibles en
+# {{ outputs.process_tiktok_bulky_orders.vars.processed }} (y manual, skipped,
+# found, shops_failed).
+#
+# Para avisar a CS cuando haya órdenes que requieren revisión manual, agregar
+# como última tarea dentro de working_env_tiktok (validar la sintaxis contra
+# la versión de Kestra instalada antes de habilitarlo):
+#
+#      - id: alerta_manuales
+#        type: io.kestra.plugin.core.flow.If
+#        condition: "{{ outputs.process_tiktok_bulky_orders.vars.manual > 0 }}"
+#        then:
+#          - id: slack_manuales
+#            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+#            url: "{{ secret('SLACK_WEBHOOK') }}"
+#            payload: |
+#              {
+#                "text": "⚠️ TikTok Bulky: {{ outputs.process_tiktok_bulky_orders.vars.manual }} orden(es) requieren guía manual. Revisar la pestaña Guias_automaticas_manuales."
+#              }
+# ------------------------------------------------------------------------
