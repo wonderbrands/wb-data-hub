@@ -38,7 +38,6 @@ misma orden.
 
 import json
 import logging
-from datetime import datetime
 
 logger = logging.getLogger()
 
@@ -127,8 +126,12 @@ def insert_shipping_label(
     carrier_service_level : str | None
     error_log : str | None
     label_generated_at : str | None -> si no se especifica y label_generated
-                                        es True, se usa el datetime actual.
-                                        Si el registro ya existía y no se
+                                        es True, se usa NOW() de MySQL (hora
+                                        del servidor de BD, igual que
+                                        `updated_at`/`inserted_at`; NO la hora
+                                        del host que corre el script, para
+                                        evitar mezclar zonas horarias). Si el
+                                        registro ya existía y no se
                                         especifica, se conserva la fecha
                                         original (no se borra en un UPDATE).
     """
@@ -141,8 +144,11 @@ def insert_shipping_label(
 
     tracking_json = _normalize_tracking_to_json(tracking_number)
 
-    if label_generated and not label_generated_at:
-        label_generated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # Si hay que fijar label_generated_at y el caller no dio un valor
+    # explícito, se usa NOW() directamente en el SQL (hora del servidor de
+    # BD) en vez de datetime.now() en Python (hora del host del script).
+    auto_generated_at = label_generated and not label_generated_at
+    generated_at_sql = "NOW()" if auto_generated_at else "%s"
 
     try:
         cursor = conn.cursor()
@@ -157,13 +163,13 @@ def insert_shipping_label(
         existing = cursor.fetchone()
 
         if existing:
-            query = """
+            query = f"""
                 UPDATE tools.shipping_labels
                 SET qty_ordered = %s,
                     status = %s,
                     label_generated = %s,
                     label_origin = %s,
-                    label_generated_at = COALESCE(%s, label_generated_at),
+                    label_generated_at = COALESCE({generated_at_sql}, label_generated_at),
                     tracking_number = COALESCE(%s, tracking_number),
                     shipping_cost = %s,
                     carrier = %s,
@@ -172,30 +178,29 @@ def insert_shipping_label(
                     updated_at = NOW()
                 WHERE id = %s
             """
-            cursor.execute(query, (
-                qty_ordered,
-                status,
-                label_generated,
-                label_origin,
-                label_generated_at,
+            params = [qty_ordered, status, label_generated, label_origin]
+            if not auto_generated_at:
+                params.append(label_generated_at)
+            params += [
                 tracking_json,
                 shipping_cost,
                 carrier,
                 carrier_service_level,
                 error_log,
                 existing[0],
-            ))
+            ]
+            cursor.execute(query, tuple(params))
             action = f"actualizado (id={existing[0]})"
         else:
-            query = """
+            query = f"""
                 INSERT INTO tools.shipping_labels
                     (marketplace_id, marketplace, sku, qty_ordered, status,
                      label_generated, label_origin, label_generated_at,
                      tracking_number, shipping_cost, carrier,
                      carrier_service_level, error_log)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, {generated_at_sql}, %s, %s, %s, %s, %s)
             """
-            cursor.execute(query, (
+            params = [
                 marketplace_id,
                 marketplace,
                 sku,
@@ -203,13 +208,17 @@ def insert_shipping_label(
                 status,
                 label_generated,
                 label_origin,
-                label_generated_at,
+            ]
+            if not auto_generated_at:
+                params.append(label_generated_at)
+            params += [
                 tracking_json,
                 shipping_cost,
                 carrier,
                 carrier_service_level,
                 error_log,
-            ))
+            ]
+            cursor.execute(query, tuple(params))
             action = "insertado"
 
         conn.commit()
