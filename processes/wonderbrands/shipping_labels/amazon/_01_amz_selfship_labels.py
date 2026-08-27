@@ -591,6 +591,7 @@ def process_amazon_self_ship_labels():
                     qty_ordered=row['quantity_ordered'],
                     status='LIMIT_RATIO_OVERCOME',
                     label_generated=False,
+                    label_origin='SRS_GENERATED',
                     tracking_number=None,
                     shipping_cost=total_shipping_cost_mxn,
                     carrier=None,
@@ -622,6 +623,7 @@ def process_amazon_self_ship_labels():
                     qty_ordered=row['quantity_ordered'],
                     status='SKU_NOT_SUPPORT',
                     label_generated=False,
+                    label_origin='SRS_GENERATED',
                     tracking_number=None,
                     shipping_cost=total_shipping_cost_mxn,
                     carrier=None,
@@ -670,6 +672,7 @@ def process_amazon_self_ship_labels():
                     qty_ordered=row['quantity_ordered'],
                     status='LABELS_GENERATED',
                     label_generated=True,
+                    label_origin='SRS_GENERATED',
                     tracking_number=tracking_json_str,  # ya viene serializado a JSON arriba
                     shipping_cost=total_shipping_cost_mxn,  # costo TOTAL de envío de la orden
                     carrier=main_carrier,
@@ -688,6 +691,7 @@ def process_amazon_self_ship_labels():
                     qty_ordered=row['quantity_ordered'],
                     status='NO_LABEL_FOR_SKU',
                     label_generated=False,
+                    label_origin='SRS_GENERATED',
                     tracking_number=None,
                     shipping_cost=total_shipping_cost_mxn,
                     carrier=None,

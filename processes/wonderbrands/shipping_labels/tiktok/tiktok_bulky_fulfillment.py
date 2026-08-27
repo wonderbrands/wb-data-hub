@@ -43,28 +43,9 @@ logger = cfg.configure_logging()
 # Resumen operativo: siempre visible, incluso con LOG_LEVEL=ERROR en Kestra.
 resumen = cfg.get_summary_logger()
 
-# Del helper compartido sólo se reutiliza la normalización del tracking a JSON.
-# El INSERT no: esta automatización mantiene UN registro por (orden, SKU) y lo
-# actualiza en cada corrida (ver `upsert_shipping_label`).
-try:
-    from _00_shipping_labels_db import _normalize_tracking_to_json
-except ImportError:
-    logger.warning(
-        "No se pudo importar _00_shipping_labels_db; se usa la normalización local."
-    )
-
-    def _normalize_tracking_to_json(tracking_number):
-        if tracking_number is None:
-            return None
-        if isinstance(tracking_number, (list, dict)):
-            return json.dumps(tracking_number, ensure_ascii=False)
-        if isinstance(tracking_number, str):
-            try:
-                json.loads(tracking_number)
-                return tracking_number
-            except (json.JSONDecodeError, TypeError):
-                return json.dumps([tracking_number], ensure_ascii=False)
-        return json.dumps([tracking_number], ensure_ascii=False)
+# `upsert_shipping_label` (más abajo) delega en el INSERT/UPDATE inteligente
+# del módulo compartido para mantener UN registro por (orden, SKU).
+from _00_shipping_labels_db import insert_shipping_label
 
 
 # PyPDF2 sólo se usa para consolidar guías multicaja en un único PDF. Si no
@@ -186,93 +167,32 @@ def fetch_processed_order_ids(conn, seller_name: str) -> set:
 
 
 def upsert_shipping_label(conn, marketplace_id, sku, qty_ordered, status,
-                          label_generated, tracking_number=None,
-                          shipping_cost=None, carrier=None,
+                          label_generated, label_origin='SRS_GENERATED',
+                          tracking_number=None, shipping_cost=None, carrier=None,
                           carrier_service_level=None, error_log=None):
     """
-    Mantiene UN solo registro por (marketplace, marketplace_id, sku) en
-    tools.shipping_labels: si ya existe lo actualiza, si no lo inserta.
-
-    A diferencia del INSERT del módulo compartido, aquí la tabla se trata como
-    estado operativo actual ("¿esta orden ya tiene guía?"), no como bitácora:
-    el histórico de intentos vive en las pestañas de Google Sheets.
-
-    `label_generated_at` nunca se borra: si la orden ya tenía guía, una
-    actualización posterior conserva la fecha original.
+    Wrapper delgado sobre `insert_shipping_label` del módulo compartido, que
+    ya mantiene UN solo registro por (marketplace, marketplace_id, sku)
+    (UPDATE si existe, INSERT si no). Sólo fija `marketplace`; `label_generated_at`
+    se deja en manos del módulo compartido (hora del servidor), igual que en
+    Amazon/Coppel, para no mezclar horario CDMX con la hora de servidor que
+    ya usan `updated_at`/`inserted_at` en esa misma tabla.
     """
-    if conn is None:
-        logger.error(
-            f"[tools.shipping_labels] Sin conexión a BD; no se registró "
-            f"{marketplace_id} / {sku}."
-        )
-        return
-
-    tracking_json = _normalize_tracking_to_json(tracking_number)
-    generated_at = now_cdmx_str() if label_generated else None
-
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT id FROM tools.shipping_labels
-            WHERE marketplace = %s AND marketplace_id = %s AND sku = %s
-            ORDER BY id DESC LIMIT 1
-            """,
-            (cfg.MARKETPLACE_NAME, marketplace_id, sku),
-        )
-        existing = cursor.fetchone()
-
-        if existing:
-            cursor.execute(
-                """
-                UPDATE tools.shipping_labels
-                SET qty_ordered = %s,
-                    status = %s,
-                    label_generated = %s,
-                    label_generated_at = COALESCE(%s, label_generated_at),
-                    tracking_number = COALESCE(%s, tracking_number),
-                    shipping_cost = %s,
-                    carrier = %s,
-                    carrier_service_level = %s,
-                    error_log = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                (qty_ordered, status, label_generated, generated_at,
-                 tracking_json, shipping_cost, carrier, carrier_service_level,
-                 error_log, existing[0]),
-            )
-            action = f"actualizado (id={existing[0]})"
-        else:
-            cursor.execute(
-                """
-                INSERT INTO tools.shipping_labels
-                    (marketplace_id, marketplace, sku, qty_ordered, status,
-                     label_generated, label_generated_at, tracking_number,
-                     shipping_cost, carrier, carrier_service_level, error_log)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (marketplace_id, cfg.MARKETPLACE_NAME, sku, qty_ordered, status,
-                 label_generated, generated_at, tracking_json, shipping_cost,
-                 carrier, carrier_service_level, error_log),
-            )
-            action = "insertado"
-
-        conn.commit()
-        cursor.close()
-        logger.info(
-            f"[tools.shipping_labels] Registro {action}: {marketplace_id} / "
-            f"{sku} / {status} / label_generated={label_generated}"
-        )
-    except Exception as e:
-        # Nunca debe tumbar el flujo principal por un fallo en la tabla de registro.
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        logger.error(
-            f"[tools.shipping_labels] Error registrando {marketplace_id} / {sku}: {e}"
-        )
+    insert_shipping_label(
+        conn,
+        marketplace_id=marketplace_id,
+        marketplace=cfg.MARKETPLACE_NAME,
+        sku=sku,
+        qty_ordered=qty_ordered,
+        status=status,
+        label_generated=label_generated,
+        label_origin=label_origin,
+        tracking_number=tracking_number,
+        shipping_cost=shipping_cost,
+        carrier=carrier,
+        carrier_service_level=carrier_service_level,
+        error_log=error_log,
+    )
 
 
 # =============================================================================
@@ -1546,6 +1466,7 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
             qty_ordered=item['quantity'],
             status=motivo,
             label_generated=False,
+            label_origin='SRS_GENERATED',
             tracking_number=None,
             shipping_cost=shipping_cost,
             carrier=normalize_provider(carrier) or None,
@@ -1629,6 +1550,7 @@ def register_success(conn, sheet_success, sheet_manual, ctx: dict, labels: list,
             qty_ordered=item['quantity'],
             status=status,
             label_generated=True,
+            label_origin='SRS_GENERATED',
             tracking_number=tracking_json,
             shipping_cost=shipping_cost,
             carrier=main_carrier,

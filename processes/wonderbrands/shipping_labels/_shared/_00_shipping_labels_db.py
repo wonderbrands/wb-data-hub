@@ -18,6 +18,7 @@ Uso típico:
         qty_ordered=row['quantity_ordered'],
         status='LABELS_GENERATED',
         label_generated=True,
+        label_origin='SRS_GENERATED',  # 'SRS_GENERATED' o 'MARKETPLACE_GENERATED'
         tracking_number=[...],   # lista, dict, o string ya serializado a JSON
         shipping_cost=125.50,
         carrier='FEDEX',
@@ -27,6 +28,12 @@ Uso típico:
 
 Nota: la función reutiliza la conexión (`conn`) que cada script ya abre para
 su propia base de datos; no abre ni cierra conexiones por su cuenta.
+
+Nota sobre duplicados: la función mantiene UN solo registro por
+(marketplace, marketplace_id, sku) -> si ya existe una fila para esa
+combinación se actualiza (UPDATE), si no existe se inserta (INSERT). Esto
+evita registros duplicados cuando un mismo script se reintenta sobre la
+misma orden.
 """
 
 import json
@@ -78,6 +85,7 @@ def insert_shipping_label(
     qty_ordered,
     status,
     label_generated: bool,
+    label_origin,
     tracking_number=None,
     shipping_cost=None,
     carrier=None,
@@ -86,7 +94,10 @@ def insert_shipping_label(
     label_generated_at=None,
 ):
     """
-    Inserta UN registro en `tools.shipping_labels`.
+    Mantiene UN solo registro por (marketplace, marketplace_id, sku) en
+    `tools.shipping_labels`: si ya existe una fila para esa combinación se
+    actualiza (UPDATE); si no existe, se inserta (INSERT). Esto evita
+    duplicados cuando el script que llama se reintenta sobre la misma orden.
 
     Se espera UNA llamada por SKU (a nivel línea de orden). Para SKUs
     multicaja, `tracking_number` debe incluir todos los tracking numbers
@@ -105,6 +116,11 @@ def insert_shipping_label(
     status : str          -> p. ej. 'LABELS_GENERATED', 'LIMIT_RATIO_OVERCOME',
                               'SKU_NOT_SUPPORT', 'Costo_guia_excesivo', etc.
     label_generated : bool
+    label_origin : str    -> 'SRS_GENERATED' cuando la guía la generamos
+                              nosotros vía la API de guías (SRS), o
+                              '<MARKETPLACE>_GENERATED' (p. ej.
+                              'TIKTOK_GENERATED', 'WALMART_GENERATED') cuando
+                              la guía ya la entrega el marketplace.
     tracking_number : list | dict | str | None
     shipping_cost : float | None
     carrier : str | None
@@ -112,11 +128,14 @@ def insert_shipping_label(
     error_log : str | None
     label_generated_at : str | None -> si no se especifica y label_generated
                                         es True, se usa el datetime actual.
+                                        Si el registro ya existía y no se
+                                        especifica, se conserva la fecha
+                                        original (no se borra en un UPDATE).
     """
     if conn is None:
         logger.error(
             f"[tools.shipping_labels] No hay conexión a BD; no se pudo "
-            f"insertar el registro de {marketplace} / {marketplace_id} / {sku}."
+            f"registrar {marketplace} / {marketplace_id} / {sku}."
         )
         return
 
@@ -127,38 +146,87 @@ def insert_shipping_label(
 
     try:
         cursor = conn.cursor()
-        query = """
-            INSERT INTO tools.shipping_labels
-                (marketplace_id, marketplace, sku, qty_ordered, status,
-                 label_generated, label_generated_at, tracking_number,
-                 shipping_cost, carrier, carrier_service_level, error_log)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        cursor.execute(query, (
-            marketplace_id,
-            marketplace,
-            sku,
-            qty_ordered,
-            status,
-            label_generated,
-            label_generated_at,
-            tracking_json,
-            shipping_cost,
-            carrier,
-            carrier_service_level,
-            error_log,
-        ))
+        cursor.execute(
+            """
+            SELECT id FROM tools.shipping_labels
+            WHERE marketplace = %s AND marketplace_id = %s AND sku = %s
+            ORDER BY id DESC LIMIT 1
+            """,
+            (marketplace, marketplace_id, sku),
+        )
+        existing = cursor.fetchone()
+
+        if existing:
+            query = """
+                UPDATE tools.shipping_labels
+                SET qty_ordered = %s,
+                    status = %s,
+                    label_generated = %s,
+                    label_origin = %s,
+                    label_generated_at = COALESCE(%s, label_generated_at),
+                    tracking_number = COALESCE(%s, tracking_number),
+                    shipping_cost = %s,
+                    carrier = %s,
+                    carrier_service_level = %s,
+                    error_log = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+            """
+            cursor.execute(query, (
+                qty_ordered,
+                status,
+                label_generated,
+                label_origin,
+                label_generated_at,
+                tracking_json,
+                shipping_cost,
+                carrier,
+                carrier_service_level,
+                error_log,
+                existing[0],
+            ))
+            action = f"actualizado (id={existing[0]})"
+        else:
+            query = """
+                INSERT INTO tools.shipping_labels
+                    (marketplace_id, marketplace, sku, qty_ordered, status,
+                     label_generated, label_origin, label_generated_at,
+                     tracking_number, shipping_cost, carrier,
+                     carrier_service_level, error_log)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(query, (
+                marketplace_id,
+                marketplace,
+                sku,
+                qty_ordered,
+                status,
+                label_generated,
+                label_origin,
+                label_generated_at,
+                tracking_json,
+                shipping_cost,
+                carrier,
+                carrier_service_level,
+                error_log,
+            ))
+            action = "insertado"
+
         conn.commit()
         cursor.close()
         logger.info(
-            f"[tools.shipping_labels] Registrado: marketplace={marketplace} "
+            f"[tools.shipping_labels] Registro {action}: marketplace={marketplace} "
             f"marketplace_id={marketplace_id} sku={sku} status={status} "
             f"label_generated={label_generated}"
         )
     except Exception as e:
         # Nunca debe tumbar el flujo principal del script por un fallo
-        # al insertar en esta tabla de "solo registro".
+        # al registrar en esta tabla de "solo registro".
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         logger.error(
-            f"[tools.shipping_labels] Error insertando registro para "
-            f"{marketplace} / {marketplace_id} / {sku}: {e}"
+            f"[tools.shipping_labels] Error registrando {marketplace} / "
+            f"{marketplace_id} / {sku}: {e}"
         )
