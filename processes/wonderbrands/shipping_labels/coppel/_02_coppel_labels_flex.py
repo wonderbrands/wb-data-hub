@@ -24,7 +24,11 @@ shared_dir = os.path.join(os.path.dirname(current_dir), '_shared')
 if shared_dir not in sys.path:
     sys.path.append(shared_dir)
     
-from _00_shipping_labels_db import insert_shipping_label
+from _00_shipping_labels_db import (
+    insert_shipping_label,
+    sku_shipping_cost_from_labels,
+    sku_shipping_cost_from_rates,
+)
 
 # ------------------------------------------------------------
 
@@ -1234,6 +1238,12 @@ def procesar_ordenes_coppel():
 
             # --- NUEVO: registro adicional en tools.shipping_labels (no sustituye smart_log/BD existentes) ---
             for line in order.get('order_lines', []):
+                # `tools.shipping_labels` es a nivel SKU: se registra el costo
+                # cotizado de las cajas de ESTE SKU, no el total de la orden.
+                sku_shipping_cost = sku_shipping_cost_from_rates(
+                    best_rates_map, line.get('offer_sku'),
+                    total_fallback=total_shipping_cost_mxn
+                )
                 insert_shipping_label(
                     conn,
                     marketplace_id=order_id,
@@ -1244,7 +1254,7 @@ def procesar_ordenes_coppel():
                     label_generated=False,
                     label_origin='SRS_GENERATED',
                     tracking_number=None,
-                    shipping_cost=total_shipping_cost_mxn,
+                    shipping_cost=sku_shipping_cost,
                     carrier=None,
                     carrier_service_level=None,
                     error_log=reason_int
@@ -1268,6 +1278,11 @@ def procesar_ordenes_coppel():
                 #registro adicional en tools.shipping_labels (no sustituye smart_log/BD existentes) ---
                 # Análogo a Amazon: cuando NO se generó ninguna guía para la orden -> SKU_NOT_SUPPORT
                 for line in order.get('order_lines', []):
+                    # Costo cotizado de las cajas de ESTE SKU (registro a nivel SKU).
+                    sku_shipping_cost = sku_shipping_cost_from_rates(
+                        best_rates_map, line.get('offer_sku'),
+                        total_fallback=total_shipping_cost_mxn
+                    )
                     insert_shipping_label(
                         conn,
                         marketplace_id=order_id,
@@ -1278,7 +1293,7 @@ def procesar_ordenes_coppel():
                         label_generated=False,
                         label_origin='SRS_GENERATED',
                         tracking_number=None,
-                        shipping_cost=total_shipping_cost_mxn,
+                        shipping_cost=sku_shipping_cost,
                         carrier=None,
                         carrier_service_level=None,
                         error_log=reason
@@ -1323,6 +1338,9 @@ def procesar_ordenes_coppel():
                     labels_for_sku = [l for l in labels if l.get('offer_sku') == sku]
 
                     if labels_for_sku:
+                        # Costo de envío de ESTE SKU: suma de TODAS sus cajas.
+                        sku_shipping_cost = sku_shipping_cost_from_labels(labels_for_sku)
+
                         main_carrier = labels_for_sku[0]['provider']
                         main_carrier = 'PAQUETEXPRESS' if main_carrier == 'PAQUETEEXPRESS' else main_carrier
                         main_service = labels_for_sku[0].get('service_name')
@@ -1344,12 +1362,18 @@ def procesar_ordenes_coppel():
                             label_generated=True,
                             label_origin='SRS_GENERATED',
                             tracking_number=tracking_json_list,
-                            shipping_cost=total_shipping_cost_mxn,
+                            shipping_cost=sku_shipping_cost,
                             carrier=main_carrier,
                             carrier_service_level=main_service,
                             error_log=None
                         )
                     else:
+                        # Sin guías para este SKU: se conserva el costo cotizado
+                        # de sus cajas (nunca el total de la orden).
+                        sku_shipping_cost = sku_shipping_cost_from_rates(
+                            best_rates_map, sku,
+                            total_fallback=total_shipping_cost_mxn
+                        )
                         insert_shipping_label(
                             conn,
                             marketplace_id=order_id,
@@ -1360,7 +1384,7 @@ def procesar_ordenes_coppel():
                             label_generated=False,
                             label_origin='SRS_GENERATED',
                             tracking_number=None,
-                            shipping_cost=total_shipping_cost_mxn,
+                            shipping_cost=sku_shipping_cost,
                             carrier=None,
                             carrier_service_level=None,
                             error_log=reason
@@ -1407,6 +1431,10 @@ def procesar_ordenes_coppel():
                 if not labels_for_sku:
                     continue
 
+                # Costo de envío de ESTE SKU: suma de TODAS sus cajas (mismo
+                # valor que la suma de `shipping_label_cost` del JSON de abajo).
+                sku_shipping_cost = sku_shipping_cost_from_labels(labels_for_sku)
+
                 main_carrier = labels_for_sku[0]['provider']
                 main_carrier = 'PAQUETEXPRESS' if main_carrier == 'PAQUETEEXPRESS' else main_carrier
                 main_service = labels_for_sku[0].get('service_name')
@@ -1431,7 +1459,7 @@ def procesar_ordenes_coppel():
                     label_generated=True,
                     label_origin='SRS_GENERATED',
                     tracking_number=tracking_json_list,
-                    shipping_cost=total_shipping_cost_mxn,  # costo TOTAL de envío de la orden
+                    shipping_cost=sku_shipping_cost,  # costo de envío de ESTE SKU (todas sus cajas)
                     carrier=main_carrier,
                     carrier_service_level=main_service,
                     error_log=None

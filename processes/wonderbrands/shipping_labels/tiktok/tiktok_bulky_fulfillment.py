@@ -45,7 +45,11 @@ resumen = cfg.get_summary_logger()
 
 # `upsert_shipping_label` (más abajo) delega en el INSERT/UPDATE inteligente
 # del módulo compartido para mantener UN registro por (orden, SKU).
-from _00_shipping_labels_db import insert_shipping_label
+from _00_shipping_labels_db import (
+    insert_shipping_label,
+    sku_shipping_cost_from_labels,
+    sku_shipping_cost_from_rates,
+)
 
 
 # PyPDF2 sólo se usa para consolidar guías multicaja en un único PDF. Si no
@@ -1415,7 +1419,7 @@ def normalize_provider(provider_name) -> str:
 
 def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
                     shipping_cost=None, cost_ratio=None, carrier=None,
-                    service_level=None, write_db: bool = True):
+                    service_level=None, rates_map=None, write_db: bool = True):
     """
     Marca una orden como NO automatizable: una fila en
     `Guias_automaticas_manuales` (se actualiza en cada reintento, incluyendo el
@@ -1427,6 +1431,11 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
 
     `write_db=False` se usa cuando la orden YA tiene un registro exitoso en BD
     y no debe degradarse (fallo posterior a la generación de la guía).
+
+    `shipping_cost` es el costo TOTAL de la orden y es lo que se escribe en el
+    sheet. En BD, en cambio, cada renglón es de UN SKU, así que con `rates_map`
+    (la cotización por caja) se reparte el costo por SKU; sin `rates_map` no hay
+    forma de repartirlo y se registra el total.
     """
     order_id = ctx['order_id']
     logger.warning(f"MANUAL | Orden {order_id} | {motivo}: {detalle}")
@@ -1459,6 +1468,12 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
 
     items = ctx.get('items') or [{'sku': 'N/A', 'quantity': 0}]
     for item in items:
+        # El renglón es de UN SKU: se guarda el costo cotizado de SUS cajas,
+        # no el total de la orden (que inflaría el costo por nº de SKUs).
+        sku_shipping_cost = sku_shipping_cost_from_rates(
+            rates_map, item['sku'], total_fallback=shipping_cost
+        ) if rates_map else shipping_cost
+
         upsert_shipping_label(
             conn,
             marketplace_id=order_id,
@@ -1468,7 +1483,7 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
             label_generated=False,
             label_origin='SRS_GENERATED',
             tracking_number=None,
-            shipping_cost=shipping_cost,
+            shipping_cost=sku_shipping_cost,
             carrier=normalize_provider(carrier) or None,
             carrier_service_level=service_level,
             error_log=detalle,
@@ -1535,6 +1550,9 @@ def register_success(conn, sheet_success, sheet_manual, ctx: dict, labels: list,
     # Un registro por SKU, con las guías que le corresponden.
     for item in ctx.get('items', []):
         labels_for_sku = [l for l in labels if l.get('sku_parent') == item['sku']] or labels
+        # Costo de envío de ESTE SKU: suma de TODAS sus cajas (mismo valor que
+        # la suma de `shipping_label_cost` del JSON de tracking_number).
+        sku_shipping_cost = sku_shipping_cost_from_labels(labels_for_sku)
         tracking_json = [{
             "tracking_number": l['tracking_number'],
             "carrier": normalize_provider(l['provider']),
@@ -1552,7 +1570,7 @@ def register_success(conn, sheet_success, sheet_manual, ctx: dict, labels: list,
             label_generated=True,
             label_origin='SRS_GENERATED',
             tracking_number=tracking_json,
-            shipping_cost=shipping_cost,
+            shipping_cost=sku_shipping_cost,
             carrier=main_carrier,
             carrier_service_level=main_service,
             error_log=None if (tiktok_ok and odoo_ok) else (
@@ -1645,6 +1663,8 @@ def process_order(order, shop, access_token, conn, models, uid,
         'cost_ratio': cost_ratio,
         'carrier': quoted_carrier,
         'service_level': quoted_service,
+        # Permite que el registro en BD reparta el costo por SKU.
+        'rates_map': best_rates_map,
     }
 
     if cost_ratio > cfg.LIMIT_RATIO_PERCENTAGE:
@@ -1740,7 +1760,8 @@ def process_order(order, shop, access_token, conn, models, uid,
             f"pero Odoo actualizado={odoo_ok} y TikTok actualizado={tiktok_ok}. "
             f"{tiktok_detail}".strip(),
             carrier=labels[0]['provider'], service_level=labels[0]['service_level'],
-            shipping_cost=shipping_cost, cost_ratio=cost_ratio, write_db=False,
+            shipping_cost=shipping_cost, cost_ratio=cost_ratio,
+            rates_map=best_rates_map, write_db=False,
         )
         return 'manual'
 

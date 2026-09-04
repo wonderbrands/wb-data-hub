@@ -19,7 +19,11 @@ shared_dir = os.path.join(os.path.dirname(current_dir), '_shared')
 if shared_dir not in sys.path:
     sys.path.append(shared_dir)
     
-from _00_shipping_labels_db import insert_shipping_label
+from _00_shipping_labels_db import (
+    insert_shipping_label,
+    sku_shipping_cost_from_labels,
+    sku_shipping_cost_from_rates,
+)
 
 # --- CONFIGURACIÓN DE ENTORNO ---
 dotenv.load_dotenv()
@@ -582,6 +586,12 @@ def process_amazon_self_ship_labels():
                 update_db_label_data(conn, row['id'], None, None, None, "LIMIT_RATIO_OVERCOME")
                 #update_crawler_checks(conn, order_id, 0, "Costo de guia supera el 21%")
 
+                # `tools.shipping_labels` es a nivel SKU: se registra el costo
+                # cotizado de las cajas de ESTE SKU, no el total de la orden.
+                sku_shipping_cost = sku_shipping_cost_from_rates(
+                    best_rates_map, row['sku'], total_fallback=total_shipping_cost_mxn
+                )
+
                 # --- NUEVO: registro adicional en tools.shipping_labels (no sustituye el insert/update anterior) ---
                 insert_shipping_label(
                     conn,
@@ -593,7 +603,7 @@ def process_amazon_self_ship_labels():
                     label_generated=False,
                     label_origin='SRS_GENERATED',
                     tracking_number=None,
-                    shipping_cost=total_shipping_cost_mxn,
+                    shipping_cost=sku_shipping_cost,
                     carrier=None,
                     carrier_service_level=None,
                     error_log=(
@@ -614,6 +624,11 @@ def process_amazon_self_ship_labels():
                 update_db_label_data(conn, row['id'], None, None, None, "SKU_NOT_SUPPORT")
                 #update_crawler_checks(conn, order_id, 0, "SKU no soportado por generador de guías")
 
+                # Costo cotizado de las cajas de ESTE SKU (registro a nivel SKU).
+                sku_shipping_cost = sku_shipping_cost_from_rates(
+                    best_rates_map, row['sku'], total_fallback=total_shipping_cost_mxn
+                )
+
                 # --- NUEVO: registro adicional en tools.shipping_labels (no sustituye el insert/update anterior) ---
                 insert_shipping_label(
                     conn,
@@ -625,7 +640,7 @@ def process_amazon_self_ship_labels():
                     label_generated=False,
                     label_origin='SRS_GENERATED',
                     tracking_number=None,
-                    shipping_cost=total_shipping_cost_mxn,
+                    shipping_cost=sku_shipping_cost,
                     carrier=None,
                     carrier_service_level=None,
                     error_log="No se pudo generar ninguna etiqueta para la orden; SKU no soportado por el generador de guías."
@@ -656,6 +671,10 @@ def process_amazon_self_ship_labels():
                     "shipping_label_cost": l['shipping_label_cost']
                 } for l in labels_for_this_sku])
 
+                # Costo de envío de ESTE SKU: suma de TODAS sus cajas (mismo
+                # valor que la suma de `shipping_label_cost` del JSON de arriba).
+                sku_shipping_cost = sku_shipping_cost_from_labels(labels_for_this_sku)
+
                 main_carrier = labels_for_this_sku[0]['provider']
                 main_carrier = 'PAQUETEXPRESS' if main_carrier == 'PAQUETEEXPRESS' else main_carrier
                 main_service = labels_for_this_sku[0]['service_level']
@@ -674,13 +693,19 @@ def process_amazon_self_ship_labels():
                     label_generated=True,
                     label_origin='SRS_GENERATED',
                     tracking_number=tracking_json_str,  # ya viene serializado a JSON arriba
-                    shipping_cost=total_shipping_cost_mxn,  # costo TOTAL de envío de la orden
+                    shipping_cost=sku_shipping_cost,  # costo de envío de ESTE SKU (todas sus cajas)
                     carrier=main_carrier,
                     carrier_service_level=main_service,
                     error_log=None
                 )
             else:
                 logger.warning(f"No se encontraron etiquetas para el SKU parent {row_sku} en esta orden.")
+
+                # Sin guías para este SKU: se conserva el costo cotizado de sus
+                # cajas (nunca el total de la orden).
+                sku_shipping_cost = sku_shipping_cost_from_rates(
+                    best_rates_map, row_sku, total_fallback=total_shipping_cost_mxn
+                )
 
                 # --- NUEVO: registro adicional en tools.shipping_labels para dejar rastro del fallo ---
                 insert_shipping_label(
@@ -693,7 +718,7 @@ def process_amazon_self_ship_labels():
                     label_generated=False,
                     label_origin='SRS_GENERATED',
                     tracking_number=None,
-                    shipping_cost=total_shipping_cost_mxn,
+                    shipping_cost=sku_shipping_cost,
                     carrier=None,
                     carrier_service_level=None,
                     error_log=f"Se generaron guías para la orden {order_id}, pero ninguna correspondió a este SKU parent."

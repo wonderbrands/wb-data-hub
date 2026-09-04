@@ -121,7 +121,12 @@ def insert_shipping_label(
                               'TIKTOK_GENERATED', 'WALMART_GENERATED') cuando
                               la guía ya la entrega el marketplace.
     tracking_number : list | dict | str | None
-    shipping_cost : float | None
+    shipping_cost : float | None -> costo de envío de ESTE SKU (suma de TODAS
+                              sus cajas), NO el total de la orden: la tabla
+                              guarda un renglón por SKU y escribir el total en
+                              cada uno lo infla por el número de SKUs. Usa
+                              `sku_shipping_cost_from_labels` /
+                              `sku_shipping_cost_from_rates` para calcularlo.
     carrier : str | None
     carrier_service_level : str | None
     error_log : str | None
@@ -239,3 +244,92 @@ def insert_shipping_label(
             f"[tools.shipping_labels] Error registrando {marketplace} / "
             f"{marketplace_id} / {sku}: {e}"
         )
+
+
+# =============================================================================
+# COSTO DE ENVÍO POR SKU
+# =============================================================================
+# `tools.shipping_labels` guarda UN renglón por SKU, por lo que `shipping_cost`
+# debe ser el costo de envío de ESE SKU (la suma de TODAS sus cajas), NO el
+# costo total de la orden. Cuando una orden trae varias líneas de producto,
+# escribir el total en cada renglón infla el costo por el número de SKUs
+# (p. ej. 3 SKUs x $1,000 se leían como $9,000 en vez de $3,000).
+#
+# Estas dos funciones centralizan ese cálculo para todas las automatizaciones:
+#   - `sku_shipping_cost_from_labels`: cuando YA hay guías generadas (el monto
+#     coincide con la suma de `shipping_label_cost` del JSON de tracking_number).
+#   - `sku_shipping_cost_from_rates`: cuando la orden se cayó antes de generar
+#     guías (LIMIT_RATIO_OVERCOME, SKU_NOT_SUPPORT, etc.) y sólo existe la
+#     cotización por caja.
+
+
+def sku_shipping_cost_from_labels(labels_for_sku, decimals=2):
+    """
+    Suma el costo de todas las guías/cajas de UN SKU.
+
+    Parámetros
+    ----------
+    labels_for_sku : lista de dicts de guías YA filtrada al SKU en cuestión,
+                     cada uno con `shipping_label_cost` en MXN (es el mismo
+                     valor que va en el JSON de `tracking_number`).
+
+    Devuelve None si la lista viene vacía (no hubo guías para ese SKU), para
+    distinguirlo de un costo real de $0.00.
+    """
+    if not labels_for_sku:
+        return None
+
+    total = 0.0
+    for label in labels_for_sku:
+        try:
+            total += float(label.get('shipping_label_cost') or 0)
+        except (TypeError, ValueError):
+            continue
+    return round(total, decimals)
+
+
+def sku_shipping_cost_from_rates(best_rates_map, sku, sku_key='sku_parent',
+                                 total_fallback=None, decimals=2):
+    """
+    Suma el costo cotizado de todas las cajas que pertenecen a UN SKU.
+
+    Parámetros
+    ----------
+    best_rates_map : dict {package_id: rate}; cada `rate` trae `total_price`
+                     en CENTAVOS y el SKU padre al que pertenece la caja.
+    sku            : SKU (parent / offer_sku) del renglón que se va a registrar.
+    sku_key        : llave dentro del rate que identifica al SKU padre.
+    total_fallback : costo total de la orden en MXN. Sólo se usa cuando la
+                     cotización no trae `sku_key` en NINGUNA caja (API vieja o
+                     respuesta incompleta); en ese caso no hay forma de repartir
+                     y se conserva el comportamiento anterior.
+
+    Devuelve 0.0 cuando la cotización sí identifica SKUs pero ninguna caja
+    corresponde a este SKU (ese SKU no generó costo de envío).
+    """
+    if not isinstance(best_rates_map, dict) or not best_rates_map:
+        return total_fallback
+
+    rates = list(best_rates_map.values())
+    matched = [
+        r for r in rates
+        if isinstance(r, dict) and str(r.get(sku_key)) == str(sku)
+    ]
+
+    if matched:
+        cents = 0
+        for rate in matched:
+            try:
+                cents += float(rate.get('total_price') or 0)
+            except (TypeError, ValueError):
+                continue
+        return round(cents / 100.0, decimals)
+
+    # Ninguna caja declara SKU padre -> no se puede repartir por SKU.
+    has_sku_info = any(
+        isinstance(r, dict) and r.get(sku_key) for r in rates
+    )
+    if not has_sku_info:
+        return total_fallback
+
+    return 0.0
