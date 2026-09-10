@@ -1,16 +1,6 @@
 id: ml_billing_process_flow
 namespace: wonderbrands.financial.mercadolibre
-description: "Pipeline Facturación: Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
-
-# Configuración por defecto para todas las tareas Commands de este flujo
-pluginDefaults:
-  - type: io.kestra.plugin.scripts.shell.Commands
-    values:
-      containerImage: wonderbrands-python:v1
-      taskRunner:
-        type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER
-
+description: "Pipeline Facturación ML: Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
 
 concurrency:
   limit: 1
@@ -40,6 +30,10 @@ tasks:
       # ── PASO 01: Extracción de XMLs de Mercado Libre a BD ──
       - id: run_miner_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
         env:
           DB_HOST: "{{ vars.db1_host }}"
           DB_USER: "{{ vars.db_user }}"
@@ -51,6 +45,10 @@ tasks:
       # ── PASO 02: Inyección de Facturas a Odoo (Lotes controlados) ──
       - id: run_loader_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
         env:
           ODOO_URL: "{{ vars.odoo_url }}" 
           ODOO_DB: "{{ vars.odoo_db }}"

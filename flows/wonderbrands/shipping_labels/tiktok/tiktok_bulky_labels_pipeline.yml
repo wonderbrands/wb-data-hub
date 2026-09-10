@@ -9,23 +9,9 @@ concurrency:
   limit: 1
   behavior: CANCEL
 
-pluginDefaults:
-  - type: io.kestra.plugin.scripts.shell.Commands
-    values:
-      containerImage: wonderbrands-python:v1
-      taskRunner:
-        type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER
-      # El reintento es seguro: una orden que ya tiene guía queda con
-      # label_generated=1 en tools.shipping_labels y se omite en el reintento.
-      retry:
-        type: constant
-        interval: PT1M
-        maxAttempt: 3
-
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
-  branch: "tiktok_shipping_labels"
+  branch: "main"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
@@ -47,6 +33,16 @@ tasks:
 
       - id: process_tiktok_bulky_orders
         type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        # El reintento es seguro: una orden que ya tiene guía queda con
+        # label_generated=1 en tools.shipping_labels y se omite en el reintento.
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempts: 3
         env:
           # ============================================================
           # --- API interna de cotización y generación de guías ---
@@ -93,7 +89,7 @@ tasks:
           LOG_LEVEL: "ERROR"
           TIKTOK_BULKY_DRY_RUN: "false"
           TEST_API_LABELS_SR: "false"
-          TIKTOK_BULKY_MAX_ORDERS: "10"
+          TIKTOK_BULKY_MAX_ORDERS: "0"
           TIKTOK_BULKY_LOOKBACK_HOURS: "72"
           TIKTOK_BULKY_PAGE_SIZE: "50"
           SLEEP_BETWEEN_ORDERS: "1"
@@ -104,11 +100,14 @@ tasks:
           SAT_BIENES_TRANSP: "50161815"
 
           # --- Tiendas Bulky (seller_name = tiktok_shop_tokens.seller_name) ---
-          TIKTOK_KH_ENABLED: "false"
+          TIKTOK_KH_ENABLED: "true"
           TIKTOK_KH_SELLER_NAME: "KingsHouse Furniture"
 
-          TIKTOK_NEON_ENABLED: "true"
-          TIKTOK_NEON_SELLER_NAME: "Neon Deportes"
+          TIKTOK_NEOND_ENABLED: "true"
+          TIKTOK_NEOND_SELLER_NAME: "Neon Deportes"
+
+          TIKTOK_NEON_ENABLED: "false"
+          TIKTOK_NEON_SELLER_NAME: "Neon"
 
           # --- Tienda FULL: TikTok entrega la guía, no aplica a este flujo ---
           TIKTOK_CDH_ENABLED: "false"
@@ -128,7 +127,7 @@ triggers:
   # Desfasado de Coppel (6,10,14,18,22) para no competir por la API de guías.
   - id: cron_tiktok_bulky_labels
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 7,11,15,19 * * *"
+    cron: "30 7,9,12,15,17,20,23 * * *"
     timezone: "America/Mexico_City"
 
 errors:

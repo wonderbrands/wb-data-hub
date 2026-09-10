@@ -1,19 +1,6 @@
 id: ml_shipping_labels_pipeline
 namespace: wonderbrands.shipping_labels.mercadolibre
-description: "Pipeline completo: extrae guías de ML, clasifica SLA y publica en Odoo"
-
-# Configuración por defecto para todas las tareas Commands de este flujo
-pluginDefaults:
-  - type: io.kestra.plugin.scripts.shell.Commands
-    values:
-      containerImage: wonderbrands-python:v1
-      taskRunner:
-        type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER
-      retry:
-        type: constant
-        interval: PT1M
-        maxAttempt: 3
+description: "Pipeline completo ML: extrae guías de ML, clasifica SLA y publica en Odoo"
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
@@ -36,10 +23,16 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
-      # Con pluginDefaults a nivel namespace, containerImage/taskRunner/retry
-      # ya no necesitan repetirse en cada tarea (ver sección 11).
       - id: extract_sla_orders
         type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempts: 3
         env:
           DB_HOST: "{{ vars.db1_host }}"
           DB_USER: "{{ vars.db_user }}"
@@ -50,6 +43,14 @@ tasks:
 
       - id: inject_labels_odoo
         type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempts: 3
         env:
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"

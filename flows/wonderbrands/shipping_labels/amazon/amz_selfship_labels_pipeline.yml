@@ -6,19 +6,6 @@ concurrency:
   limit: 1
   behavior: CANCEL
 
-# Configuración por defecto idéntica a tu flujo de Coppel/ML
-pluginDefaults:
-  - type: io.kestra.plugin.scripts.shell.Commands
-    values:
-      containerImage: wonderbrands-python:v1
-      taskRunner:
-        type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER
-      retry:
-        type: constant
-        interval: PT1M
-        maxAttempt: 3
-
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
@@ -42,6 +29,10 @@ tasks:
 
       - id: process_amazon_orders
         type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
         env:
           #Credenciales de la API de Cotización y Generación
           AUTH_USER: "{{ secret('AUTH_USER') }}"

@@ -2,23 +2,6 @@ id: odoo_facturacion_1a1_pipeline
 namespace: wonderbrands.financial.odoo
 description: "Pipeline de facturación 1 a 1 para órdenes de marketplaces en Odoo"
 
-# Configuración por defecto para todas las tareas Commands de este flujo
-pluginDefaults:
-  - type: io.kestra.plugin.scripts.shell.Commands
-    values:
-      containerImage: wonderbrands-python:v1
-      taskRunner:
-        type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER
-        memory:
-          memory: "512MB"       # Límite de RAM física para el script Python
-          memorySwap: "2048MB"   # Límite total (RAM + Swap del host)
-        cpus: 1.5                # (Opcional) Limita el uso de CPU a 1.5 núcleos
-      retry:
-        type: constant
-        interval: PT1M
-        maxAttempt: 3
-
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
@@ -42,6 +25,18 @@ tasks:
 
       - id: execute_invoicing_1a1
         type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          memory:
+            memory: "512MB"
+            memorySwap: "2048MB"
+          cpus: 1.5
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempt: 3
         env:
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"

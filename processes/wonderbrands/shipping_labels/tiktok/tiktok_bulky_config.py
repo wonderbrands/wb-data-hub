@@ -109,9 +109,9 @@ MARKETPLACE_NAME = 'TikTok'
 # somos_reyes.tiktok_shop_tokens (de ahí sale el access/refresh token).
 # `enabled` se apaga desde el .env con TIKTOK_<SLUG>_ENABLED=false.
 _SHOP_DEFINITIONS = [
-    {'slug': 'NEON', 'seller_name': 'Neon', 'default_enabled': 'false'},          # próximamente
+    {'slug': 'NEON', 'seller_name': 'Neon', 'default_enabled': 'true'},          # próximamente
     {'slug': 'KH', 'seller_name': 'KingsHouse', 'default_enabled': 'true'},
-    {'slug': 'CDH', 'seller_name': 'ColorDreams Home', 'default_enabled': 'true'},
+    {'slug': 'NEOND', 'seller_name': 'ColorDreams Home (NEON Deportes)', 'default_enabled': 'true'},
 ]
 
 

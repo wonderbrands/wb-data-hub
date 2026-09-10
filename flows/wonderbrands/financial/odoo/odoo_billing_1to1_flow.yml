@@ -13,29 +13,6 @@ concurrency:
   limit: 1
   behavior: FAIL
 
-pluginDefaults:
-  - type: io.kestra.plugin.scripts.shell.Commands
-    values:
-      containerImage: wonderbrands-python:v1
-      taskRunner:
-        type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER
-        memory:
-          memory: "512MB"
-          memorySwap: "2048MB"
-        cpus: 1.5
-      # =================================================================
-      # CAMBIO CRITICO #2 — SE ELIMINA EL RETRY AUTOMATICO
-      # -----------------------------------------------------------------
-      # Antes: retry {type: constant, interval: PT1M, maxAttempt: 3}
-      # Reintentar a ciegas un script de facturación relanza TODO el
-      # proceso: si murió después de timbrar, la corrida nueva vuelve a
-      # recorrer la misma lista. Con las tres capas anidadas que existían
-      # (execute_kw x3, main() x3, Kestra x3) el peor caso eran 27
-      # ejecuciones del mismo trabajo.
-      # Un fallo ahora es visible y humano, no silencioso y automático.
-      # =================================================================
-
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
@@ -60,6 +37,25 @@ tasks:
       - id: execute_invoicing_1a1
         type: io.kestra.plugin.scripts.shell.Commands
         timeout: PT8H
+        containerImage: wonderbrands-python:v1
+        # =================================================================
+        # CAMBIO CRITICO #2 — SE ELIMINA EL RETRY AUTOMATICO
+        # -----------------------------------------------------------------
+        # Antes: retry {type: constant, interval: PT1M, maxAttempt: 3}
+        # Reintentar a ciegas un script de facturación relanza TODO el
+        # proceso: si murió después de timbrar, la corrida nueva vuelve a
+        # recorrer la misma lista. Con las tres capas anidadas que existían
+        # (execute_kw x3, main() x3, Kestra x3) el peor caso eran 27
+        # ejecuciones del mismo trabajo.
+        # Un fallo ahora es visible y humano, no silencioso y automático.
+        # =================================================================
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          memory:
+            memory: "512MB"
+            memorySwap: "2048MB"
+          #cpus: 1.5
         env:
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"
@@ -75,7 +71,7 @@ tasks:
           - python processes/wonderbrands/financial/billing_processes/odoo/facturacion_automatica_1a1.py
 
 triggers:
-  - id: ejecucion_diaria_noche       # 19:30 CDMX
+  - id: ejecucion_diaria_noche # 19:30 CDMX
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "30 19 * * *"
     timezone: America/Mexico_City
@@ -86,7 +82,7 @@ triggers:
     # =================================================================
     recoverMissedSchedules: LAST
 
-  - id: ejecucion_madrugada          # 04:30 CDMX
+  - id: ejecucion_madrugada # 04:30 CDMX
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "30 04 * * *"
     timezone: America/Mexico_City

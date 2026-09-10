@@ -1,23 +1,10 @@
 id: coppel_shipping_labels_pipeline
 namespace: wonderbrands.shipping_labels.coppel
-description: "Pipeline completo: extrae guías de Coppel Flex, cotiza, genera y publica en Odoo y Mirakl"
+description: "Pipeline completo coppel: extrae guías de Coppel Flex, cotiza, genera y publica en Odoo y Mirakl"
 
 concurrency:
   limit: 1
   behavior: CANCEL
-
-# Configuración por defecto idéntica a tu flujo de ML
-pluginDefaults:
-  - type: io.kestra.plugin.scripts.shell.Commands
-    values:
-      containerImage: wonderbrands-python:v1
-      taskRunner:
-        type: io.kestra.plugin.scripts.runner.docker.Docker
-        pullPolicy: NEVER
-      retry:
-        type: constant
-        interval: PT1M
-        maxAttempt: 3
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
@@ -42,6 +29,14 @@ tasks:
 
       - id: process_coppel_orders
         type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempts: 3
         env:
           #Credenciales de la API de Cotización y Generación
           AUTH_USER: "{{ secret('AUTH_USER') }}"
