@@ -64,10 +64,16 @@ tasks:
           TIKTOK_KH_APP_SECRET: "{{ secret('TIKTOK_KH_APP_SECRET') }}"
           TIKTOK_KH_SHOP_CIPHER: "{{ secret('TIKTOK_KH_SHOP_CIPHER') }}"
 
+          TIKTOK_NEOND_APP_KEY: "{{ secret('TIKTOK_NEOND_APP_KEY') }}"
+          TIKTOK_NEOND_APP_SECRET: "{{ secret('TIKTOK_NEOND_APP_SECRET') }}"
+          TIKTOK_NEOND_SHOP_CIPHER: "{{ secret('TIKTOK_NEOND_SHOP_CIPHER') }}"
+
           TIKTOK_NEON_APP_KEY: "{{ secret('TIKTOK_NEON_APP_KEY') }}"
           TIKTOK_NEON_APP_SECRET: "{{ secret('TIKTOK_NEON_APP_SECRET') }}"
           TIKTOK_NEON_SHOP_CIPHER: "{{ secret('TIKTOK_NEON_SHOP_CIPHER') }}"
 
+
+          # NO es BULKY
           TIKTOK_CDH_APP_KEY: "{{ secret('TIKTOK_CDH_APP_KEY') }}"
           TIKTOK_CDH_APP_SECRET: "{{ secret('TIKTOK_CDH_APP_SECRET') }}"
           TIKTOK_CDH_SHOP_CIPHER: "{{ secret('TIKTOK_CDH_SHOP_CIPHER') }}"
