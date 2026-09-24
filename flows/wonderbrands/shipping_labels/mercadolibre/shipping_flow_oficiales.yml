@@ -1,11 +1,11 @@
-id: ml_shipping_labels_pipeline
+id: ml_oficiales_shipping_labels_pipeline
 namespace: wonderbrands.shipping_labels.mercadolibre
-description: "Pipeline completo ML: extrae guías de ML, clasifica SLA y publica en Odoo"
+description: "Pipeline completo ML (SOMOS-REYES OFICIALES, seller 160190870): extrae guías de ML, clasifica SLA y publica en Odoo"
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
-  ml_seller_id: "25523702"
+  ml_seller_id: "160190870"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
@@ -13,7 +13,7 @@ variables:
   db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
 
 tasks:
-  - id: working_env_ml
+  - id: working_env_ml_oficiales
     type: io.kestra.plugin.core.flow.WorkingDirectory
     tasks:
 
@@ -89,5 +89,5 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *Fallo crítico en el pipeline de guías de MercadoLibre* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+        "text": "🚨 *Fallo crítico en el pipeline de guías de MercadoLibre OFICIALES (160190870)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
       }

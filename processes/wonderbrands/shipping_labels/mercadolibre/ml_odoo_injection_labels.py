@@ -10,6 +10,7 @@ import json
 from datetime import datetime, timedelta
 import sys
 import time
+from ml_sellers import get_seller_config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', handlers=[
         logging.StreamHandler(sys.stdout)
@@ -28,6 +29,10 @@ ODOO_DB = os.getenv('ODOO_DB')
 ODOO_USER = os.getenv('ODOO_USER')
 ODOO_PWD = os.getenv('ODOO_PASSWORD')
 
+SELLER = get_seller_config()
+SELLER_ID = SELLER['seller_id']
+SELLER_NAME = SELLER['seller_name']
+
 
 def get_db_connection():
     # Cambiamos passwd por password y db por database para pymysql
@@ -43,8 +48,11 @@ def get_db_connection():
 
 def get_ml_token(db):
     cursor = db.cursor()
-    cursor.execute("SELECT token FROM somos_reyes.tokens WHERE seller_id = '25523702'")
-    return str(cursor.fetchone()[0])
+    cursor.execute("SELECT token FROM somos_reyes.tokens WHERE seller_id = %s", (SELLER_ID,))
+    token = cursor.fetchone()[0]
+    if isinstance(token, bytes):
+        return token.decode('utf-8')
+    return str(token)
 
 
 class TimeoutTransport(xmlrpc.client.SafeTransport):
@@ -179,16 +187,16 @@ def process_fase_c():
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
     ml_token = get_ml_token(db)
 
-    log.info("Conectando a Odoo...")
+    log.info(f"Tienda: {SELLER_NAME} ({SELLER_ID}). Conectando a Odoo...")
     uid, models = authenticate_odoo()
 
     #ordenes listas para procesar (se incluye zpl_data para reintentar desde BD si Odoo falló antes)
     query_pendientes = """
         SELECT id, marketplace_reference, ml_shipping_id, odoo_carrier_ref, odoo_carrier_id, zpl_data
         FROM tools.ml_api_etl_orders 
-        WHERE print_status = 'READY_TO_PRINT' AND processed_successfully = 0
+        WHERE seller_id = %s AND print_status = 'READY_TO_PRINT' AND processed_successfully = 0
     """
-    cursor.execute(query_pendientes)
+    cursor.execute(query_pendientes, (SELLER_ID,))
     orders = cursor.fetchall()
 
     log.info(f"Se encontraron {len(orders)} órdenes pendientes en Base de Datos.")
@@ -292,7 +300,7 @@ def process_fase_c():
             #Insertar mensaje en el Chatter
             cdmx_time = (datetime.now() - timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
             models.execute_kw(ODOO_DB, uid, ODOO_PWD, 'sale.order', 'message_post', [[so_id]],
-                              {'body': f'{cdmx_time}. Se insertó la guía de Mercado Libre extraída vía API / KESTRA.'})
+                              {'body': f'{cdmx_time}. Se insertó la guía de Mercado Libre ({SELLER_NAME}) extraída vía API / KESTRA.'})
 
             #Actualizar Base de Datos como Éxito (Guardando el ZPL raw y marcando como procesado)
             cursor.execute("""
@@ -328,7 +336,7 @@ def process_fase_c():
             continue
 
     db.close()
-    log.info(f"Fase C completada. {procesadas} órdenes inyectadas en Odoo.")
+    log.info(f"[{SELLER_NAME}] Fase C completada. {procesadas} órdenes inyectadas en Odoo.")
 
     if errores_criticos > 0:
         raise Exception(f"El proceso completó las órdenes posibles, pero {errores_criticos} orden(es) fallaron de manera persistente tras N reintentos.")
@@ -338,5 +346,5 @@ if __name__ == "__main__":
     try:
         process_fase_c()
     except Exception as e:
-        log.error(f"Fallo crítico en proceso de extracción de guías ML: {str(e)}")
+        log.error(f"[{SELLER_NAME}] Fallo crítico en proceso de extracción de guías ML: {str(e)}")
         sys.exit(1)

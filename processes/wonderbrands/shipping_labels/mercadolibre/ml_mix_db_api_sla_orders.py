@@ -9,6 +9,7 @@ from urllib3.util.retry import Retry
 from zoneinfo import ZoneInfo
 from dateutil.parser import isoparse
 import sys
+from ml_sellers import get_seller_config
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', handlers=[
@@ -17,7 +18,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(__name__)
 
 CDMX = ZoneInfo("America/Mexico_City")
-SELLER_ID = '25523702'
+SELLER = get_seller_config()
+SELLER_ID = SELLER['seller_id']
+SELLER_NAME = SELLER['seller_name']
+PRINT_CONTROL_ID = SELLER['print_control_id']
 
 def now_cdmx():
     return datetime.now(CDMX)
@@ -64,7 +68,8 @@ def get_override_config(db):
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
     try:
         cursor.execute(
-            "SELECT force_print_days_ahead, active_until, ml_order_lookback_days, cutoff_time_cdmx FROM tools.ml_print_controls WHERE id = 1")
+            "SELECT force_print_days_ahead, active_until, ml_order_lookback_days, cutoff_time_cdmx FROM tools.ml_print_controls WHERE id = %s",
+            (PRINT_CONTROL_ID,))
         row = cursor.fetchone()
 
         #backup
@@ -188,32 +193,34 @@ def run_etl_hybrid(db, token):
     session = get_requests_session(token)
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
 
+    log.info(f"Tienda: {SELLER_NAME} ({SELLER_ID}) | ml_print_controls.id = {PRINT_CONTROL_ID}")
     log.info(f"Corte CDMX configurado a las {config['cutoff_time']}:00 horas. (Adelantamiento de guias de 'MAÑANA')")
 
     #cargar cache de BD (ahorra peticiones SLA)
     cursor.execute("""
         SELECT marketplace_reference, processed_successfully, print_status, ml_sla_expected_date 
         FROM tools.ml_api_etl_orders
-    """)
+        WHERE seller_id = %s
+    """, (SELLER_ID,))
     cache = {row['marketplace_reference']: row for row in cursor.fetchall()}
     log.info(f"Caché cargada: {len(cache)} órdenes en historial.")
 
     #candidatos locales
     date_from = (now_cdmx() - timedelta(days=config['lookback_days'])).strftime('%Y-%m-%d %H:%M:%S')
 
-    query_extract = f"""
+    query_extract = """
         SELECT 
             o.order_id, o.pack_id, o.status AS o_status, o.shipping_id, 
             s.status AS s_status, s.substatus AS s_substatus, 
             s.logistic_type AS l_type, s.tracking_method AS t_method
         FROM somos_reyes.ml_order_update o
         JOIN somos_reyes.ml_shipping s ON o.shipping_id = s.shipping_id
-        WHERE o.seller_id = '{SELLER_ID}'
+        WHERE o.seller_id = %s
           AND o.status = 'paid'
           AND s.status = 'ready_to_ship' AND s.substatus = 'ready_to_print'
           AND o.last_updated >= %s
     """
-    cursor.execute(query_extract, (date_from,))
+    cursor.execute(query_extract, (SELLER_ID, date_from))
     raw_orders = cursor.fetchall()
 
     #Filtra candidatos usando la caché
@@ -263,9 +270,9 @@ def run_etl_hybrid(db, token):
     for item in valid_orders:
         query_insert = """
             INSERT INTO tools.ml_api_etl_orders 
-            (order_id, marketplace_reference, pack_id, ml_order_status, ml_shipping_id, ml_shipping_status, ml_shipping_substatus, 
+            (seller_id, seller_name, order_id, marketplace_reference, pack_id, ml_order_status, ml_shipping_id, ml_shipping_status, ml_shipping_substatus, 
              ml_logistic_type, ml_tracking_method, ml_sla_expected_date, sla_classification, odoo_carrier_ref, odoo_carrier_id, print_status) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE 
             ml_order_status=VALUES(ml_order_status), ml_shipping_id=VALUES(ml_shipping_id), ml_shipping_status=VALUES(ml_shipping_status), 
             ml_shipping_substatus=VALUES(ml_shipping_substatus), ml_sla_expected_date=VALUES(ml_sla_expected_date), 
@@ -273,14 +280,14 @@ def run_etl_hybrid(db, token):
             print_status=IF(processed_successfully=1, print_status, VALUES(print_status))
         """
         insert_cursor.execute(query_insert, (
-            item['order_id'], item['mkp_ref'], item['pack_id'], item['o_status'], item['shipping_id'],
+            SELLER_ID, SELLER_NAME, item['order_id'], item['mkp_ref'], item['pack_id'], item['o_status'], item['shipping_id'],
             item['s_status'], item['s_substatus'], item['l_type'], item['t_method'], item['sla_date'],
             item['sla_class'], item['c_ref'], item['c_id'], item['p_status']
         ))
         procesadas += 1
 
     db.commit()
-    log.info(f"Proceso ETL completado. {procesadas} órdenes insertadas/actualizadas (Listas o Futuras).")
+    log.info(f"[{SELLER_NAME}] Proceso ETL completado. {procesadas} órdenes insertadas/actualizadas (Listas o Futuras).")
 
 
 if __name__ == "__main__":
@@ -290,7 +297,7 @@ if __name__ == "__main__":
         ml_token = get_ml_token(db)
         run_etl_hybrid(db, ml_token)
     except Exception as e:
-        log.error(f"Error en ejecución: {e}")
+        log.error(f"[{SELLER_NAME}] Error en ejecución: {e}")
         sys.exit(1)
     finally:
         if db:
