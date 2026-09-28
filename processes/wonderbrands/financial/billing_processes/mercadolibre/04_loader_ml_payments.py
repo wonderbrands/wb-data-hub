@@ -2,71 +2,123 @@ import xmlrpc.client
 import mysql.connector
 import os
 import logging
-from dotenv import load_dotenv
+import sys
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# ── Logging setup ──────────────────────────────────────────────
+# Solo StreamHandler: Kestra captura stdout/stderr como logs de la ejecución.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 log = logging.getLogger(__name__)
 
-#load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Repos\wonderbrands\.env')
+# ── Parámetros por variables de entorno ────────────────────────
+# Definidas en flows/wonderbrands/financial/mercadolibre/ml_payments_flow.yml
+ODOO_URL      = os.getenv("ODOO_URL")
+ODOO_DB       = os.getenv("ODOO_DB")
+ODOO_USER     = os.getenv("ODOO_USER")
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+
+DB_HOST     = os.getenv("DB_HOST")
+DB_USER     = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME     = os.getenv("DB_NAME")
+
+# Código del diario de Mercado Pago en Odoo
+MP_JOURNAL_CODE          = os.getenv("MP_JOURNAL_CODE", "MP")
+# l10n_mx_edi.payment.method: 3 = Transferencia
+EDI_PAYMENT_METHOD_ID    = int(os.getenv("EDI_PAYMENT_METHOD_ID", "3"))
+ODOO_TIMEOUT             = int(os.getenv("ODOO_TIMEOUT", "120"))  # Timeout XML-RPC en segundos
+
+
+class TimeoutTransport(xmlrpc.client.SafeTransport):
+    """Transporte personalizado para forzar un timeout en XML-RPC."""
+    def __init__(self, timeout=ODOO_TIMEOUT, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.timeout = timeout
+
+    def make_connection(self, host):
+        conn = super().make_connection(host)
+        conn.timeout = self.timeout
+        return conn
+
 
 def load_ml_payments_to_odoo():
+    # ── Validación de configuración ────────────────────────────
+    missing = [k for k, v in {
+        "ODOO_URL": ODOO_URL, "ODOO_DB": ODOO_DB, "ODOO_USER": ODOO_USER,
+        "ODOO_PASSWORD": ODOO_PASSWORD, "DB_HOST": DB_HOST, "DB_USER": DB_USER,
+        "DB_PASSWORD": DB_PASSWORD, "DB_NAME": DB_NAME
+    }.items() if not v]
+    if missing:
+        log.error(f"Faltan variables de entorno obligatorias: {', '.join(missing)}")
+        raise SystemExit(1)
+
     # ── 1. Conexión a Base de Datos ──────────────────────────────
     try:
         db = mysql.connector.connect(
-            host=os.getenv("DB_HOST"), user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"), database=os.getenv("DB_NAME")
+            host=DB_HOST, user=DB_USER,
+            password=DB_PASSWORD, database=DB_NAME
         )
         cursor = db.cursor(dictionary=True)
     except Exception as e:
         log.error(f"Error conectando a BD: {e}")
-        return
+        raise SystemExit(1)
 
     cursor.execute("""
-        SELECT p.*, b.odoo_so_name 
+        SELECT p.*, b.odoo_so_name
         FROM finance.mkp_payments_prod p
         JOIN finance.mkp_billing_prod b ON p.mkp_order_id = b.mkp_order_id
         WHERE p.status = 'PENDING'
     """)
     pending_payments = cursor.fetchall()
+    log.info(f"Pagos pendientes de aplicar en Odoo: {len(pending_payments)}")
 
     if not pending_payments:
-        log.info("No hay pagos pendientes de procesar.")
+        cursor.close()
+        db.close()
         return
 
     # ── 2. Conexión a Odoo 18 ────────────────────────────────────
-    odoo_url = os.getenv("odoo_urlV18")
-    odoo_db = os.getenv("odoo_dbV18")
-    odoo_user = os.getenv("odoo_user_dataV18")
-    odoo_pwd = os.getenv("odoo_password_dataV18")
-    
-    common = xmlrpc.client.ServerProxy(f'{odoo_url}/xmlrpc/2/common')
-    uid = common.authenticate(odoo_db, odoo_user, odoo_pwd, {})
-    models = xmlrpc.client.ServerProxy(f'{odoo_url}/xmlrpc/2/object')
+    try:
+        common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common', transport=TimeoutTransport())
+        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+        if not uid:
+            raise Exception("Autenticación rechazada por Odoo.")
+        models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object', transport=TimeoutTransport())
 
-    # Buscar el ID del Diario de Mercado Pago
-    # IMPORTANTE: Reemplaza 'MP' con el código real de tu diario en Odoo
-    journal_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.journal', 'search', [[('code', '=', 'MP')]], {'limit': 1})
+        # Buscar el ID del Diario de Mercado Pago
+        journal_search = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.journal', 'search',
+                                           [[('code', '=', MP_JOURNAL_CODE)]], {'limit': 1})
+    except Exception as e:
+        log.error(f"Error de conexión inicial con Odoo: {e}")
+        cursor.close()
+        db.close()
+        raise SystemExit(1)
+
     if not journal_search:
-        log.error("No se encontró el diario de Mercado Pago. Verifica el código en Odoo.")
-        return
+        log.error(f"No se encontró el diario de Mercado Pago (code='{MP_JOURNAL_CODE}') en Odoo.")
+        cursor.close()
+        db.close()
+        raise SystemExit(1)
     journal_id = journal_search[0]
+
+    # ── Contadores (los detalles por pago NO se loguean: solo el resumen final) ──
+    applied     = 0
+    not_applied = 0
 
     for record in pending_payments:
         so_name = record['odoo_so_name']
         try:
             # A) Buscar la Factura Publicada vinculada a la SO
-            inv_search = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.move', 'search_read', 
-                                           [[('invoice_origin', '=', so_name), ('move_type', '=', 'out_invoice'), ('state', '=', 'posted')]], 
+            inv_search = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'search_read',
+                                           [[('invoice_origin', '=', so_name), ('move_type', '=', 'out_invoice'), ('state', '=', 'posted')]],
                                            {'fields': ['id', 'name'], 'limit': 1})
-            
-            inv_search_2 = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.move', 'search_read', 
-                                           [[('invoice_origin', '=', so_name), ('state', '=', 'posted')]], 
-                                           {'fields': ['id', 'name'], 'limit': 1})
-            print(inv_search, inv_search_2)
-            
-            if not inv_search: 
+
+            if not inv_search:
                 raise Exception(f"Factura publicada para {so_name} no encontrada.")
-            
+
             inv = inv_search[0]
 
             # B) Configurar el Contexto del Wizard (Es vital para que Odoo sepa qué factura estamos pagando)
@@ -80,30 +132,37 @@ def load_ml_payments_to_odoo():
                 'journal_id': journal_id,
                 'amount': float(record['amount']),
                 'payment_date': record['date_released'].strftime("%Y-%m-%d"),
-                'l10n_mx_edi_payment_method_id': 3, # Transferencia
+                'l10n_mx_edi_payment_method_id': EDI_PAYMENT_METHOD_ID,
             }
-            
+
             # D) Crear el registro del Wizard en Odoo
-            wizard_id = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.payment.register', 'create', [wizard_vals], {'context': wizard_context})
-            
+            wizard_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment.register', 'create',
+                                          [wizard_vals], {'context': wizard_context})
+
             # E) Ejecutar la acción del Wizard
             # Esto crea el account.payment real y concilia las líneas (account.move.line) de forma nativa.
-            models.execute_kw(odoo_db, uid, odoo_pwd, 'account.payment.register', 'action_create_payments', [[wizard_id]], {'context': wizard_context})
-
-            log.info(f"✅ Cobro aplicado y conciliado nativamente para {so_name} (IVA trasladado con éxito)")
+            models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment.register', 'action_create_payments',
+                              [[wizard_id]], {'context': wizard_context})
 
             # F) Actualizar MySQL
             cursor.execute("UPDATE finance.mkp_payments_prod SET status = 'ODOO_PAID', processed_at = NOW() WHERE id = %s", (record['id'],))
             db.commit()
+            applied += 1
 
         except Exception as e:
             db.rollback()
             cursor.execute("UPDATE finance.mkp_payments_prod SET status = 'ERROR', error_log = %s WHERE id = %s", (str(e), record['id']))
             db.commit()
-            log.error(f"❌ Error en cobro de {so_name}: {e}")
+            not_applied += 1
 
+    # ── Resumen único de la corrida ────────────────────────────
+    log.info(
+        f"Resumen -> Pagos pendientes: {len(pending_payments)} | "
+        f"Aplicados en Odoo: {applied} | No aplicados (ERROR): {not_applied}"
+    )
     cursor.close()
     db.close()
+
 
 if __name__ == "__main__":
     load_ml_payments_to_odoo()
