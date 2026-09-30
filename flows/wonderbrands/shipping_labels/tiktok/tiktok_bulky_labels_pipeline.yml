@@ -92,7 +92,7 @@ tasks:
           # --- Ejecución ---
           # ERROR silencia el detalle técnico. El resumen operativo (una línea
           # por orden + totales) usa su propio logger y se ve de todas formas.
-          LOG_LEVEL: "ERROR"
+          LOG_LEVEL: "WARNING"
           TIKTOK_BULKY_DRY_RUN: "false"
           TEST_API_LABELS_SR: "false"
           TIKTOK_BULKY_MAX_ORDERS: "0"

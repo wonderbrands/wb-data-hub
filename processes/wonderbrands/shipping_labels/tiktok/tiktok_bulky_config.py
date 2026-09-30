@@ -40,6 +40,9 @@ def configure_logging():
     logging.basicConfig(
         level=LOG_LEVEL,
         format='%(asctime)s - %(levelname)s - %(message)s',
+        # stdout: Kestra marca como ERROR todo lo que sale por stderr (el
+        # default de StreamHandler), aunque el log sea INFO.
+        handlers=[logging.StreamHandler(sys.stdout)],
     )
     return logging.getLogger()
 
@@ -55,7 +58,7 @@ def get_summary_logger():
     """
     summary = logging.getLogger('tiktok_bulky.resumen')
     if not summary.handlers:
-        handler = logging.StreamHandler()
+        handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
         summary.addHandler(handler)
         summary.setLevel(logging.INFO)

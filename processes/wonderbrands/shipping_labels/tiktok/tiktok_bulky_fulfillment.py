@@ -1609,12 +1609,12 @@ def check_order_pricing(order: dict, conn, sheet_manual: dict) -> list:
                     pricing_check.FALLBACK_SHEET_KEY
                 ).get_worksheet_by_id(pricing_check.FALLBACK_WORKSHEET_ID)
                 _PRICING_SHEET_ROWS = worksheet.get("A:C")
-                logger.info(
+                logger.warning(
                     f"Pricing: conexión al Sheet de pricing EXITOSA "
                     f"({len(_PRICING_SHEET_ROWS)} filas leídas)."
                 )
             except Exception as e:
-                logger.error(
+                logger.warning(
                     f"Pricing: conexión al Sheet de pricing FALLIDA: "
                     f"{type(e).__name__}: {e!r}"
                 )
