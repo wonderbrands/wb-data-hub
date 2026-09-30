@@ -1043,6 +1043,7 @@ def generate_labels(best_rates_map: dict, recipient_data: dict, total_order_valu
 # --- CHECK DE PRICING ---
 
 _PRICING_SHEET_ROWS = None  # Sheet de fallback: se lee una vez por corrida.
+_PRICING_SHEET_TRIED = False
 
 
 def check_order_pricing(order: dict, conn, gc) -> list:
@@ -1050,7 +1051,8 @@ def check_order_pricing(order: dict, conn, gc) -> list:
     Valida el precio de cada línea contra el Priceado (`pricing_check`).
     Devuelve la lista de (sku, problema); vacía si todas las líneas aprueban.
     """
-    global _PRICING_SHEET_ROWS
+    global _PRICING_SHEET_ROWS, _PRICING_SHEET_TRIED
+    order_id = order.get('order_id')
     try:
         created = datetime.fromisoformat(str(order.get('created_date', '')).replace('Z', '+00:00'))
         if created.tzinfo is None:
@@ -1062,17 +1064,36 @@ def check_order_pricing(order: dict, conn, gc) -> list:
     problems = []
     for line in order.get('order_lines', []):
         sku = (line.get('offer_sku') or '').strip()
-        if _PRICING_SHEET_ROWS is None:
+        if not _PRICING_SHEET_TRIED:
+            _PRICING_SHEET_TRIED = True
             try:
                 worksheet = gc.open_by_key(pricing_check.FALLBACK_SHEET_KEY).get_worksheet_by_id(
                     pricing_check.FALLBACK_WORKSHEET_ID)
                 _PRICING_SHEET_ROWS = worksheet.get("A:C")
+                logger.info(
+                    f"Pricing: conexión al Sheet de pricing EXITOSA "
+                    f"({len(_PRICING_SHEET_ROWS)} filas leídas)."
+                )
             except Exception as e:
-                logger.error(f"Pricing: no se pudo leer el Sheet de fallback: {e}")
+                logger.error(
+                    f"Pricing: conexión al Sheet de pricing FALLIDA: "
+                    f"{type(e).__name__}: {e!r}"
+                )
         result = check_pricing(sku, line.get('price'), sale_time, conn, sheet_rows=_PRICING_SHEET_ROWS,
                                channel_id='coppel')
-        if not result['approved']:
-            problems.append((sku, result['problem']))
+        detail = (
+            f"orden {order_id} | SKU {sku} | precio {line.get('price')} | "
+            f"mínimo {result['minimum']} | fuente {result['source']}"
+        )
+        if result['approved']:
+            logger.info(f"Pricing OK | {detail}")
+        else:
+            problem = result['problem']
+            logger.warning(
+                f"Pricing RECHAZADO | {detail} | {problem}: "
+                f"{pricing_check.PROBLEM_DESCRIPTIONS.get(problem, problem)}"
+            )
+            problems.append((sku, problem))
     return problems
 
 
@@ -1210,8 +1231,8 @@ def procesar_ordenes_coppel():
         # --- Check de pricing (ANTES de cotizar/generar guía) ---
         pricing_problems = check_order_pricing(order, conn, gc)
         if pricing_problems:
-            reason = 'El precio de la orden es menor al priceado'
-            logger.warning(f"Orden {order_id}: pricing no aprobado: {pricing_problems}")
+            pricing_status, reason = pricing_check.resolve_pricing_outcome(pricing_problems)
+            logger.warning(f"Orden {order_id}: pricing no aprobado ({pricing_status}): {pricing_problems}")
             log_data = [fecha_orden, order_id, so_name, skus_str, reason]
             smart_log('Sin_cobertura', log_data)
             for line in order.get('order_lines', []):
@@ -1221,7 +1242,7 @@ def procesar_ordenes_coppel():
                     marketplace='Coppel',
                     sku=line.get('offer_sku'),
                     qty_ordered=int(line.get('quantity', 0)),
-                    status='LIMIT_PRICING_OVERCOME',
+                    status=pricing_status,
                     label_generated=False,
                     label_origin='SRS_GENERATED',
                     tracking_number=None,

@@ -1585,6 +1585,7 @@ def register_success(conn, sheet_success, sheet_manual, ctx: dict, labels: list,
 # CHECK DE PRICING
 # =============================================================================
 _PRICING_SHEET_ROWS = None  # Sheet de fallback: se lee una vez por corrida.
+_PRICING_SHEET_TRIED = False
 
 
 def check_order_pricing(order: dict, conn, sheet_manual: dict) -> list:
@@ -1592,28 +1593,48 @@ def check_order_pricing(order: dict, conn, sheet_manual: dict) -> list:
     Valida el precio de cada línea contra el Priceado (`pricing_check`).
     Devuelve la lista de (sku, problema); vacía si todas las líneas aprueban.
     """
-    global _PRICING_SHEET_ROWS
+    global _PRICING_SHEET_ROWS, _PRICING_SHEET_TRIED
+    order_id = order.get('id')
     sale_time = order.get('paid_time') or order.get('create_time')
     problems = []
     for line in order.get('line_items') or []:
         sku = (line.get('seller_sku') or line.get('sku_id') or '').strip()
         if not sku:
             continue
-        if _PRICING_SHEET_ROWS is None:
+        if not _PRICING_SHEET_TRIED:
+            _PRICING_SHEET_TRIED = True
             # Mismo GOOGLE_CREDS_JSON de la reportería (puede venir inline).
             try:
                 worksheet = authenticate_google_sheets().open_by_key(
                     pricing_check.FALLBACK_SHEET_KEY
                 ).get_worksheet_by_id(pricing_check.FALLBACK_WORKSHEET_ID)
                 _PRICING_SHEET_ROWS = worksheet.get("A:C")
+                logger.info(
+                    f"Pricing: conexión al Sheet de pricing EXITOSA "
+                    f"({len(_PRICING_SHEET_ROWS)} filas leídas)."
+                )
             except Exception as e:
-                logger.error(f"Pricing: no se pudo leer el Sheet de fallback: {e}")
+                logger.error(
+                    f"Pricing: conexión al Sheet de pricing FALLIDA: "
+                    f"{type(e).__name__}: {e!r}"
+                )
         result = check_pricing(
             sku, line.get('sale_price'), sale_time, conn,
             sheet_rows=_PRICING_SHEET_ROWS, channel_id='tiktok',
         )
-        if not result['approved']:
-            problems.append((sku, result['problem']))
+        detail = (
+            f"orden {order_id} | SKU {sku} | precio {line.get('sale_price')} | "
+            f"mínimo {result['minimum']} | fuente {result['source']}"
+        )
+        if result['approved']:
+            logger.info(f"Pricing OK | {detail}")
+        else:
+            problem = result['problem']
+            logger.warning(
+                f"Pricing RECHAZADO | {detail} | {problem}: "
+                f"{pricing_check.PROBLEM_DESCRIPTIONS.get(problem, problem)}"
+            )
+            problems.append((sku, problem))
     return problems
 
 
@@ -1668,8 +1689,8 @@ def process_order(order, shop, access_token, conn, models, uid,
     # Va después de buscar la SO para que el Sheet de manuales lleve el ID Odoo.
     pricing_problems = check_order_pricing(order, conn, sheet_manual)
     if pricing_problems:
-        register_manual(conn, sheet_manual, ctx, 'LIMIT_PRICING_OVERCOME',
-                        'El precio de la orden es menor al priceado')
+        pricing_status, pricing_message = pricing_check.resolve_pricing_outcome(pricing_problems)
+        register_manual(conn, sheet_manual, ctx, pricing_status, pricing_message)
         logger.warning(f"Orden {order_id}: pricing no aprobado: {pricing_problems}")
         return 'manual'
 

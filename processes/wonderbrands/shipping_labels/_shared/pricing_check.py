@@ -209,6 +209,34 @@ def check_pricing(
     return result
 
 
+PROBLEM_DESCRIPTIONS = {
+    "MISSING_SALE_TIME": "fecha de venta ausente o inválida",
+    "DUPLICATED_SKU_MONTH": "SKU duplicado en MATI para el mes/canal",
+    "INVALID_TARGET_PRICE": "target_price de MATI vacío o inválido",
+    "FALLBACK_UNAVAILABLE": "SKU no está en MATI y el Sheet de pricing no se pudo leer",
+    "FALLBACK_SKU_MISSING": "SKU sin precio: no está en MATI ni en el Sheet de pricing",
+    "FALLBACK_SKU_DUPLICATED": "SKU duplicado en el Sheet de pricing",
+    "FALLBACK_PRICE_INVALID": "precio del Sheet de pricing vacío o inválido",
+    "PRICE_BELOW_MINIMUM": "precio de venta menor al mínimo priceado",
+}
+
+STATUS_PRICE_MISMATCH = "LIMIT_PRICING_OVERCOME"
+MESSAGE_PRICE_MISMATCH = "El precio de la orden es menor al priceado"
+STATUS_SKU_NOT_PRICED = "NOT_SKU_PRICED"
+MESSAGE_SKU_NOT_PRICED = "El SKU no tiene precio asignado (DB/SHEETS)"
+
+
+def resolve_pricing_outcome(problems: list) -> tuple[str, str]:
+    """
+    Dado el listado de (sku, problema) de una orden, devuelve (status, mensaje).
+    NOT_SKU_PRICED solo si TODOS los fallos son SKU sin precio; cualquier otro
+    fallo se reporta como LIMIT_PRICING_OVERCOME.
+    """
+    if problems and all(p == "FALLBACK_SKU_MISSING" for _, p in problems):
+        return STATUS_SKU_NOT_PRICED, MESSAGE_SKU_NOT_PRICED
+    return STATUS_PRICE_MISMATCH, MESSAGE_PRICE_MISMATCH
+
+
 def _parse_price(value: Any) -> Decimal | None:
     """
     Convierte el texto de una celda del Sheet en Decimal.
