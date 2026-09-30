@@ -2,9 +2,11 @@ import logging
 import requests
 import json
 import os
+import sys
 
 # --- CONFIGURACIÓN DE LOGGING ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger()
 
 API_KEY_MIRAKL = 'a7cd0f6c-fc62-4fc9-9a98-886ad1fbe1c1'

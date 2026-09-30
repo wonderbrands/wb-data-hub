@@ -75,7 +75,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout) # <--- Esta es la pieza clave
-    ]
+    ],
+    # force: _00_load_carriers_map (importado arriba) ya configuró el root con
+    # un handler a stderr; sin force este basicConfig se ignora y Kestra marca
+    # todo como ERROR.
+    force=True
 )
 
 logger = logging.getLogger()
