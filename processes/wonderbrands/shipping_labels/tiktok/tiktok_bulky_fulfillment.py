@@ -1600,9 +1600,9 @@ def check_order_pricing(order: dict, conn, sheet_manual: dict) -> list:
         if not sku:
             continue
         if _PRICING_SHEET_ROWS is None:
-            # Reusa el cliente autenticado de la reportería (el JSON puede venir inline).
+            # Mismo GOOGLE_CREDS_JSON de la reportería (puede venir inline).
             try:
-                worksheet = sheet_manual['worksheet'].spreadsheet.client.open_by_key(
+                worksheet = authenticate_google_sheets().open_by_key(
                     pricing_check.FALLBACK_SHEET_KEY
                 ).get_worksheet_by_id(pricing_check.FALLBACK_WORKSHEET_ID)
                 _PRICING_SHEET_ROWS = worksheet.get("A:C")
@@ -1650,14 +1650,6 @@ def process_order(order, shop, access_token, conn, models, uid,
                         "El valor de la orden es 0; no se puede validar el ratio de costo.")
         return 'manual'
 
-    # --- Check de pricing (ANTES de cotizar/generar guía) ----------------
-    pricing_problems = check_order_pricing(order, conn, sheet_manual)
-    if pricing_problems:
-        register_manual(conn, sheet_manual, ctx, 'LIMIT_PRICING_OVERCOME',
-                        'El precio de la orden es menor al priceado')
-        logger.warning(f"Orden {order_id}: pricing no aprobado: {pricing_problems}")
-        return 'manual'
-
     recipient_data = build_recipient_data(order)
     if not recipient_data['zip']:
         register_manual(conn, sheet_manual, ctx, 'ADDRESS_INCOMPLETE',
@@ -1670,6 +1662,15 @@ def process_order(order, shop, access_token, conn, models, uid,
     if not so_id:
         register_manual(conn, sheet_manual, ctx, 'ODOO_ORDER_MISSING',
                         f"No existe una sale.order asociada a la orden TikTok {order_id}.")
+        return 'manual'
+
+    # --- Check de pricing (ANTES de crear paquete, cotizar o generar guía) --
+    # Va después de buscar la SO para que el Sheet de manuales lleve el ID Odoo.
+    pricing_problems = check_order_pricing(order, conn, sheet_manual)
+    if pricing_problems:
+        register_manual(conn, sheet_manual, ctx, 'LIMIT_PRICING_OVERCOME',
+                        'El precio de la orden es menor al priceado')
+        logger.warning(f"Orden {order_id}: pricing no aprobado: {pricing_problems}")
         return 'manual'
 
     # --- Paquete en TikTok ----------------------------------------------
