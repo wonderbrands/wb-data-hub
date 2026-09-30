@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flujo de Devoluciones — Mercado Libre</title>
+<style>
+  :root {
+    --black: #1A1A1A;
+    --yellow: #FFE600;
+    --white: #FFFFFF;
+    --gray-bg: #F7F7F5;
+    --gray-border: #E0E0DC;
+    --gray-text: #6B6B65;
+    --green-light: #EAF5EA;
+    --green-border: #90D090;
+    --green-text: #2E7D32;
+    --blue-light: #EBF3FB;
+    --blue-border: #90BBE0;
+    --blue-text: #1565C0;
+    --amber-light: #FFF8E6;
+    --amber-border: #F0D080;
+    --amber-text: #956300;
+    --lila-light: #F0EFFC;
+    --lila-border: #C4C0EC;
+    --lila-text: #4A46A0;
+    --coral-light: #FEF0EC;
+    --coral-border: #F5B8A0;
+    --coral-text: #A03010;
+    --pink-light: #FDF0F5;
+    --pink-border: #F0A8C0;
+    --pink-text: #8B1A4A;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px; background: var(--white); color: var(--black);
+    line-height: 1.5; max-width: 1040px; margin: 0 auto; padding: 32px 24px 60px;
+  }
+
+  .doc-header { margin-bottom: 32px; padding-bottom: 16px; border-bottom: 3px solid var(--yellow); }
+  .doc-header-tags { display: flex; gap: 8px; margin-bottom: 6px; }
+  .doc-header-tag { background: var(--black); color: var(--yellow); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px; }
+  .doc-header h1 { font-size: 20px; font-weight: 600; }
+  .doc-header-meta { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+
+  .section { margin-bottom: 28px; }
+  .section-label { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .step-badge { width: 26px; height: 26px; border-radius: 50%; background: var(--black); color: var(--yellow); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .section-label h2 { font-size: 14px; font-weight: 600; }
+  .section-label p { font-size: 12px; color: var(--gray-text); margin-top: 1px; }
+
+  .connector { display: flex; flex-direction: column; align-items: center; padding: 4px 0; width: 100%; }
+  .connector .arrow-line { width: 2px; background: var(--gray-border); min-height: 20px; }
+  .arrow-head { font-size: 14px; line-height: 1; color: var(--gray-text); }
+
+  .card { border-radius: 8px; padding: 12px 14px; border: 1.5px solid var(--gray-border); background: var(--white); }
+  .card-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .card-sub { font-size: 11px; color: var(--gray-text); }
+
+  .card.trigger { background: var(--black); border-color: var(--black); color: var(--white); text-align: center; }
+  .card.trigger .card-title { color: var(--yellow); font-size: 14px; }
+  .card.condition { background: var(--amber-light); border-color: var(--amber-border); text-align: center; }
+  .card.condition .card-title { color: var(--amber-text); }
+  .card.condition .card-sub { color: #7A5200; }
+  .card.process { background: var(--lila-light); border-color: var(--lila-border); text-align: center; width: 100%; }
+  .card.process .card-title { color: var(--lila-text); }
+  .card.process .card-sub { color: #3D39A0; }
+  .card.ok { background: var(--green-light); border-color: var(--green-border); }
+  .card.ok .card-title { color: var(--green-text); }
+  .card.ok .card-sub { color: #1B5E20; }
+  .card.warn { background: var(--coral-light); border-color: var(--coral-border); }
+  .card.warn .card-title { color: var(--coral-text); }
+  .card.warn .card-sub { color: #7A2000; }
+  .card.amber { background: var(--amber-light); border-color: var(--amber-border); }
+  .card.amber .card-title { color: var(--amber-text); }
+  .card.neutral { background: var(--gray-bg); border-color: var(--gray-border); text-align: center; }
+
+  .split-grid { display: grid; gap: 14px; }
+  .split-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .split-col { display: flex; flex-direction: column; align-items: center; }
+  .split-col .card { width: 100%; }
+  .split-connector { width: 2px; background: var(--gray-border); height: 14px; }
+  .branch-label { text-align: center; font-size: 11px; font-weight: 600; padding-bottom: 4px; }
+  .branch-label.a { color: var(--amber-text); }
+  .branch-label.b { color: var(--coral-text); }
+  .branch-label.c { color: var(--lila-text); }
+
+  /* Asiento tables */
+  .asiento-box { border: 1.5px solid var(--lila-border); border-radius: 8px; overflow: hidden; width: 100%; }
+  .asiento-box.a { border-color: var(--amber-border); }
+  .asiento-box.b { border-color: var(--coral-border); }
+  .asiento-box.c { border-color: var(--lila-border); }
+  .asiento-header { padding: 8px 14px; font-size: 12px; font-weight: 600; border-bottom-width: 1px; border-bottom-style: solid; }
+  .asiento-box.a .asiento-header { background: var(--amber-light); color: var(--amber-text); border-bottom-color: var(--amber-border); }
+  .asiento-box.b .asiento-header { background: var(--coral-light); color: var(--coral-text); border-bottom-color: var(--coral-border); }
+  .asiento-box.c .asiento-header { background: var(--lila-light); color: var(--lila-text); border-bottom-color: var(--lila-border); }
+  .asiento-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .asiento-table th { background: var(--gray-bg); padding: 5px 10px; text-align: left; font-size: 10px; font-weight: 600; color: var(--gray-text); border-bottom: 1px solid var(--gray-border); letter-spacing: 0.05em; text-transform: uppercase; }
+  .asiento-table th.right, .asiento-table td.right { text-align: right; }
+  .asiento-table td { padding: 6px 10px; border-bottom: 1px solid var(--gray-border); color: var(--black); }
+  .asiento-table tr:last-child td { border-bottom: none; }
+  .asiento-table tr:hover td { background: var(--gray-bg); }
+  .debit { font-weight: 500; color: var(--blue-text); }
+  .credit { font-weight: 500; color: var(--green-text); }
+  .dash { color: var(--gray-border); text-align: right; }
+  .account-name { font-weight: 500; }
+  .account-code { font-size: 10px; color: var(--gray-text); font-family: 'SF Mono', 'Fira Code', monospace; margin-top: 1px; }
+  .account-sub { font-size: 10px; color: var(--gray-text); margin-top: 1px; font-style: italic; }
+  .row-separator td { background: var(--gray-bg); padding: 3px 10px; }
+  .row-separator .section-name { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--gray-text); }
+  .no-cogs td { font-size: 11px; color: var(--gray-text); font-style: italic; padding: 7px 10px; }
+
+  /* Notes */
+  .note { font-size: 11px; color: var(--gray-text); padding: 8px 12px; background: var(--amber-light); border-left: 3px solid var(--amber-border); border-radius: 0 6px 6px 0; margin-top: 6px; }
+  .note strong { color: var(--amber-text); }
+  .note.info { background: var(--blue-light); border-left-color: var(--blue-border); }
+  .note.info strong { color: var(--blue-text); }
+  .note.a { background: var(--amber-light); border-left-color: var(--amber-border); }
+  .note.a strong { color: var(--amber-text); }
+  .note.b { background: var(--coral-light); border-left-color: var(--coral-border); }
+  .note.b strong { color: var(--coral-text); }
+
+  /* Criteria */
+  .criteria-box { background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 6px; padding: 10px 14px; margin-top: 8px; }
+  .criteria-title { font-weight: 600; font-size: 11px; color: var(--black); margin-bottom: 6px; }
+  .criteria-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .criteria-row:last-child { margin-bottom: 0; }
+  .criteria-key { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 10px; background: var(--white); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--blue-text); white-space: nowrap; flex-shrink: 0; }
+  .criteria-val { font-size: 11px; color: var(--gray-text); }
+  code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 10px; background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--black); }
+
+  /* Log box */
+  .log-box { background: var(--gray-bg); border: 1.5px solid var(--gray-border); border-radius: 8px; padding: 12px 14px; }
+
+  /* Group badge */
+  .group-badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; border-radius: 50%;
+    font-size: 10px; font-weight: 700; flex-shrink: 0;
+  }
+  .group-badge.a { background: var(--amber-light); color: var(--amber-text); border: 1px solid var(--amber-border); }
+  .group-badge.b { background: var(--coral-light); color: var(--coral-text); border: 1px solid var(--coral-border); }
+  .group-badge.c { background: var(--lila-light); color: var(--lila-text); border: 1px solid var(--lila-border); }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="doc-header">
+  <div class="doc-header-tags">
+    <span class="doc-header-tag">Proyecto IVA</span>
+    <span class="doc-header-tag" style="background:var(--lila-light);color:var(--lila-text);border:1px solid var(--lila-border);">Mercado Libre</span>
+  </div>
+  <h1>Flujo de Devoluciones (REFUND) — Reconocimiento Contable</h1>
+  <p class="doc-header-meta">Requerimientos de Finanzas → equipo de Data · Proceso propuesto · Mayo 2026</p>
+</div>
+
+
+<!-- SECCIÓN 1 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">1</div>
+    <div><h2>REFUND registrado en ML</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card trigger" style="width:300px;">
+      <div class="card-title">REFUND registrado en ML</div>
+    </div>
+  </div>
+
+  <div class="criteria-box">
+    <div class="criteria-title">Cómo identificar un REFUND en el reporte ML API</div>
+    <div class="criteria-row">
+      <span class="criteria-key">transaction_type</span>
+      <span class="criteria-val">= <code>refund</code></span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">saldo</span>
+      <span class="criteria-val">negativo</span>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:10px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 2 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">2</div>
+    <div><h2>ML emite Nota de Crédito (CFDI)</h2><p>Relacionada al UUID de la factura original</p></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card blue" style="width:360px;text-align:center;">
+      <div class="card-title" style="color:var(--blue-text);">ML emite Nota de Crédito (CFDI)</div>
+      <div class="card-sub">Relacionada al UUID de la factura original</div>
+    </div>
+  </div>
+
+  <div class="note info" style="margin-top:8px;">
+    <strong>Aplicación del cobro al registrar la NC en Odoo:</strong> Al vincular la NC a la factura original, si ésta ya tenía cobro aplicado, esa aplicación se rompe y se disminuye el saldo en <code>102-002-007 Mercado Pago</code>. Si la factura aún no tenía cobro aplicado, se disminuye directamente la cuenta por cobrar <code>105-001-004 Mercado Libre</code>.
+  </div>
+
+  <div class="connector" style="margin-top:10px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 3 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">3</div>
+    <div><h2>Identificación del tipo de operación</h2><p>El script clasifica el REFUND en uno de tres grupos según el estado de la orden</p></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card condition" style="width:380px;">
+      <div class="card-title">¿Qué tipo de operación originó el REFUND?</div>
+      <div class="card-sub">El script evalúa si hubo despacho (OUT) y el tipo de resolución</div>
+    </div>
+  </div>
+
+  <!-- 3 ramas -->
+  <div style="margin-top:8px;">
+    <div class="split-grid split-3">
+      <div class="branch-label a">A — Cancelación antes de despacho</div>
+      <div class="branch-label b">B — Devolución posterior al despacho</div>
+      <div class="branch-label c" style="color:var(--lila-text);">C — Bonificación sin retorno</div>
+    </div>
+
+    <div class="split-grid split-3" style="margin-top:4px;align-items:start;">
+
+      <!-- RAMA A -->
+      <div class="split-col">
+        <div class="card amber" style="width:100%;">
+          <div class="card-title">Orden confirmada y cancelada antes del OUT</div>
+          <div class="card-sub">El producto nunca salió del almacén</div>
+        </div>
+        <div class="split-connector"></div>
+        <div class="card amber" style="width:100%;">
+          <div class="card-title">NC registrada en Odoo</div>
+          <div class="card-sub">Sin movimiento de inventario físico</div>
+        </div>
+        <div class="split-connector"></div>
+        <div class="asiento-box a" style="width:100%;">
+          <div class="asiento-header">Asiento — Cancelación antes de despacho</div>
+          <table class="asiento-table">
+            <thead>
+              <tr><th style="width:55%">Cuenta</th><th class="right">Db</th><th class="right">Cr</th></tr>
+            </thead>
+            <tbody>
+              <tr class="row-separator"><td colspan="3"><span class="section-name">Ingresos</span></td></tr>
+              <tr>
+                <td>
+                  <div class="account-name">Dev., Descuentos o Bonificaciones sobre Ventas</div>
+                  <div class="account-code">402-001-001</div>
+                </td>
+                <td class="right debit">$</td><td class="right dash">—</td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-name">IVA Trasladado Cobrado</div>
+                  <div class="account-code">208-001-001</div>
+                </td>
+                <td class="right debit">$</td><td class="right dash">—</td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-name">Mercado Libre</div>
+                  <div class="account-code">105-001-004</div>
+                </td>
+                <td class="right dash">—</td><td class="right credit">$</td>
+              </tr>
+              <tr class="row-separator"><td colspan="3"><span class="section-name">COGS — recupero 100%</span></td></tr>
+              <tr>
+                <td>
+                  <div class="account-name">Mercancías Facturadas No Enviadas</div>
+                  <div class="account-sub">Revierte la cuenta transitoria de facturación</div>
+                </td>
+                <td class="right debit">$</td><td class="right dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="account-name">Costo de Venta</div></td>
+                <td class="right dash">—</td><td class="right credit">$</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note a" style="width:100%;margin-top:6px;font-size:10px;">
+          <strong>Mercancías Facturadas No Enviadas</strong> se revierte porque el costo nunca se materializó en una salida física. El OUT nunca ocurrió.
+        </div>
+      </div>
+
+      <!-- RAMA B -->
+      <div class="split-col">
+        <div class="card warn" style="width:100%;">
+          <div class="card-title">Orden confirmada y devuelta posterior al OUT</div>
+          <div class="card-sub">El producto fue despachado y regresa al almacén</div>
+        </div>
+        <div class="split-connector"></div>
+        <div class="card warn" style="width:100%;">
+          <div class="card-title">NC registrada en Odoo</div>
+          <div class="card-sub">Activa devolución de inventario</div>
+        </div>
+        <div class="split-connector"></div>
+        <div class="asiento-box b" style="width:100%;">
+          <div class="asiento-header">Asiento — Devolución posterior al despacho</div>
+          <table class="asiento-table">
+            <thead>
+              <tr><th style="width:55%">Cuenta</th><th class="right">Db</th><th class="right">Cr</th></tr>
+            </thead>
+            <tbody>
+              <tr class="row-separator"><td colspan="3"><span class="section-name">Ingresos</span></td></tr>
+              <tr>
+                <td>
+                  <div class="account-name">Dev., Descuentos o Bonificaciones sobre Ventas</div>
+                  <div class="account-code">402-001-001</div>
+                </td>
+                <td class="right debit">$</td><td class="right dash">—</td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-name">IVA Trasladado Cobrado</div>
+                  <div class="account-code">208-001-001</div>
+                </td>
+                <td class="right debit">$</td><td class="right dash">—</td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-name">Mercado Libre</div>
+                  <div class="account-code">105-001-004</div>
+                </td>
+                <td class="right dash">—</td><td class="right credit">$</td>
+              </tr>
+              <tr class="row-separator"><td colspan="3"><span class="section-name">COGS — recupero 100%</span></td></tr>
+              <tr>
+                <td>
+                  <div class="account-name">Devoluciones en tránsito</div>
+                  <div class="account-sub">Pendiente de creación · activo transitorio</div>
+                </td>
+                <td class="right debit">$</td><td class="right dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="account-name">Costo de Venta</div></td>
+                <td class="right dash">—</td><td class="right credit">$</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note b" style="width:100%;margin-top:6px;font-size:10px;">
+          <strong>Devoluciones en tránsito</strong> se libera contra Inventario al confirmarse la recepción física del producto devuelto en almacén.
+        </div>
+      </div>
+
+      <!-- RAMA C -->
+      <div class="split-col">
+        <div class="card process" style="width:100%;">
+          <div class="card-title">Orden entregada con bonificación parcial</div>
+          <div class="card-sub">El producto no retorna al almacén</div>
+        </div>
+        <div class="split-connector"></div>
+        <div class="card process" style="width:100%;">
+          <div class="card-title">NC registrada en Odoo</div>
+          <div class="card-sub">Sin movimiento de inventario</div>
+        </div>
+        <div class="split-connector"></div>
+        <div class="asiento-box c" style="width:100%;">
+          <div class="asiento-header">Asiento — Bonificación</div>
+          <table class="asiento-table">
+            <thead>
+              <tr><th style="width:55%">Cuenta</th><th class="right">Db</th><th class="right">Cr</th></tr>
+            </thead>
+            <tbody>
+              <tr class="row-separator"><td colspan="3"><span class="section-name">Ingresos</span></td></tr>
+              <tr>
+                <td>
+                  <div class="account-name">Dev., Descuentos o Bonificaciones sobre Ventas</div>
+                  <div class="account-code">402-001-001</div>
+                </td>
+                <td class="right debit">$</td><td class="right dash">—</td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-name">IVA Trasladado Cobrado</div>
+                  <div class="account-code">208-001-001</div>
+                </td>
+                <td class="right debit">$</td><td class="right dash">—</td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="account-name">Mercado Libre</div>
+                  <div class="account-code">105-001-004</div>
+                </td>
+                <td class="right dash">—</td><td class="right credit">$</td>
+              </tr>
+              <tr class="row-separator"><td colspan="3"><span class="section-name">COGS</span></td></tr>
+              <tr class="no-cogs"><td colspan="3">Sin movimiento. El producto no retorna; el costo no se recupera.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note" style="width:100%;margin-top:6px;font-size:10px;background:var(--lila-light);border-left-color:var(--lila-border);">
+          <strong style="color:var(--lila-text);">NC parcial</strong> — ML emite la NC por el % del valor que corresponda al reembolso acordado.
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:14px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 4 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">4</div>
+    <div><h2>Log de conciliación</h2><p>Información registrada en la SO e Invoice de Odoo</p></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="log-box" style="max-width:520px;width:100%;">
+      <div class="card-title" style="margin-bottom:8px;">Datos a registrar en SO e Invoice de Odoo</div>
+      <div style="display:flex;flex-direction:column;gap:5px;">
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">ML refund ID</span>
+          <span class="criteria-val">Identificador único del REFUND en ML</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">NC Odoo</span>
+          <span class="criteria-val">Referencia de la NC emitida en Odoo</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">CFDI UUID</span>
+          <span class="criteria-val">UUID de la NC emitida por ML</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">Tipo</span>
+          <span class="criteria-val">A — Cancelación antes de despacho / B — Devolución post-OUT / C — Bonificación</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

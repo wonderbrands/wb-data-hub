@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flujo de Facturación — Mercado Libre</title>
+<style>
+  :root {
+    --black: #1A1A1A;
+    --yellow: #FFE600;
+    --purple: #A8A4E0;
+    --mint: #A8D8A8;
+    --white: #FFFFFF;
+    --gray-bg: #F7F7F5;
+    --gray-border: #E0E0DC;
+    --gray-text: #6B6B65;
+    --red-light: #FFF0ED;
+    --red-border: #F5A898;
+    --red-text: #C0392B;
+    --green-light: #EAF5EA;
+    --green-border: #90D090;
+    --green-text: #2E7D32;
+    --blue-light: #EBF3FB;
+    --blue-border: #90BBE0;
+    --blue-text: #1565C0;
+    --amber-light: #FFF8E6;
+    --amber-border: #F0D080;
+    --amber-text: #956300;
+    --lila-light: #F0EFFC;
+    --lila-border: #C4C0EC;
+    --lila-text: #4A46A0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    background: var(--white);
+    color: var(--black);
+    line-height: 1.5;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 32px 24px 60px;
+  }
+
+  .doc-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 32px;
+    padding-bottom: 16px;
+    border-bottom: 3px solid var(--yellow);
+  }
+  .doc-header-tag {
+    background: var(--black);
+    color: var(--yellow);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 3px;
+  }
+  .doc-header h1 { font-size: 20px; font-weight: 600; }
+  .doc-header-meta { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+
+  .section { margin-bottom: 36px; }
+  .section-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .step-badge {
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    background: var(--black);
+    color: var(--yellow);
+    font-size: 11px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .section-label h2 { font-size: 14px; font-weight: 600; }
+  .section-label p { font-size: 12px; color: var(--gray-text); margin-top: 1px; }
+
+  .flow-row { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .flow-row.centered { justify-content: center; }
+
+  .connector {
+    display: flex; flex-direction: column; align-items: center;
+    color: var(--gray-text); font-size: 11px; gap: 2px;
+    padding: 4px 0; width: 100%;
+  }
+  .connector .arrow-line { width: 2px; background: var(--gray-border); flex: 1; min-height: 20px; }
+  .arrow-head { font-size: 14px; line-height: 1; color: var(--gray-text); }
+  .connector-label { font-size: 11px; color: var(--gray-text); background: var(--white); padding: 0 4px; white-space: nowrap; }
+
+  .card {
+    border-radius: 8px; padding: 12px 14px;
+    border: 1.5px solid var(--gray-border);
+    background: var(--white); position: relative;
+  }
+  .card-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .card-sub { font-size: 11px; color: var(--gray-text); }
+
+  .card.trigger {
+    background: var(--black); border-color: var(--black);
+    color: var(--white); text-align: center; min-width: 220px;
+  }
+  .card.trigger .card-title { color: var(--yellow); font-size: 14px; }
+  .card.trigger .card-sub { color: rgba(255,255,255,0.6); }
+
+  .split-container { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }
+  .split-side { display: flex; flex-direction: column; align-items: center; gap: 0; }
+  .split-arrow { width: 2px; background: var(--gray-border); height: 20px; margin: 0 auto; }
+
+  .card.condition { background: var(--amber-light); border-color: var(--amber-border); text-align: center; }
+  .card.condition .card-title { color: var(--amber-text); }
+  .card.condition .card-sub { color: #7A5200; }
+
+  .card.ok { background: var(--green-light); border-color: var(--green-border); }
+  .card.ok .card-title { color: var(--green-text); }
+  .card.ok .card-sub { color: #1B5E20; }
+
+  .card.alert { background: var(--red-light); border-color: var(--red-border); }
+  .card.alert .card-title { color: var(--red-text); }
+  .card.alert .card-sub { color: #922B21; }
+
+  .card.process {
+    background: var(--lila-light); border-color: var(--lila-border);
+    text-align: center; width: 100%;
+  }
+  .card.process .card-title { color: var(--lila-text); font-size: 14px; }
+  .card.process .card-sub { color: #3D39A0; }
+
+  .card.log { background: var(--gray-bg); border-color: var(--gray-border); text-align: center; width: 100%; }
+  .card.log .card-title { color: var(--black); }
+
+  .card.blue { background: var(--blue-light); border-color: var(--blue-border); }
+  .card.blue .card-title { color: var(--blue-text); }
+  .card.blue .card-sub { color: #0D47A1; }
+
+  /* Accounting table */
+  .asiento-box { border: 1.5px solid var(--lila-border); border-radius: 8px; overflow: hidden; width: 100%; margin-bottom: 4px; }
+  .asiento-header { background: var(--lila-light); padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--lila-text); border-bottom: 1px solid var(--lila-border); }
+  .asiento-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .asiento-table th {
+    background: var(--gray-bg); padding: 6px 12px; text-align: left;
+    font-size: 11px; font-weight: 600; color: var(--gray-text);
+    border-bottom: 1px solid var(--gray-border);
+    letter-spacing: 0.05em; text-transform: uppercase;
+  }
+  .asiento-table th.right, .asiento-table td.right { text-align: right; }
+  .asiento-table td { padding: 7px 12px; border-bottom: 1px solid var(--gray-border); color: var(--black); }
+  .asiento-table tr:last-child td { border-bottom: none; }
+  .asiento-table tr:hover td { background: var(--gray-bg); }
+  .debit { font-weight: 500; color: var(--blue-text); }
+  .credit { font-weight: 500; color: var(--green-text); }
+  .dash { color: var(--gray-border); text-align: right; }
+  .account-name { font-weight: 500; }
+  .account-code { font-size: 10px; color: var(--gray-text); font-family: 'SF Mono', 'Fira Code', monospace; margin-top: 1px; }
+  .account-sub { font-size: 11px; color: var(--gray-text); margin-top: 1px; }
+  .row-separator td { background: var(--gray-bg); padding: 4px 12px; }
+  .row-separator .section-name { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--gray-text); }
+
+  /* Settlement section */
+  .settlement-box { border: 1.5px solid var(--blue-border); border-radius: 8px; overflow: hidden; width: 100%; }
+  .settlement-header { background: var(--blue-light); padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--blue-text); border-bottom: 1px solid var(--blue-border); }
+  .settlement-body { padding: 12px 14px; }
+  .step-row { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 10px; }
+  .step-row:last-child { margin-bottom: 0; }
+  .step-num {
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--blue-border); color: var(--blue-text);
+    font-size: 10px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; margin-top: 1px;
+  }
+  .step-content { flex: 1; }
+  .step-content strong { font-size: 12px; color: var(--blue-text); display: block; margin-bottom: 2px; }
+  .step-content p { font-size: 11px; color: var(--gray-text); }
+  .step-content code {
+    font-size: 10px; background: var(--gray-bg); border: 1px solid var(--gray-border);
+    border-radius: 3px; padding: 1px 5px; color: var(--black);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+  }
+  .step-arrow { width: 2px; background: var(--blue-border); height: 12px; margin: 0 0 0 10px; }
+
+  /* Notes */
+  .note {
+    font-size: 11px; color: var(--gray-text);
+    padding: 8px 12px;
+    background: var(--amber-light);
+    border-left: 3px solid var(--amber-border);
+    border-radius: 0 6px 6px 0;
+    margin-top: 6px;
+  }
+  .note strong { color: var(--amber-text); }
+  .note.gray {
+    background: var(--gray-bg);
+    border-left-color: var(--gray-border);
+  }
+  .note.gray strong { color: var(--black); }
+
+  /* Filter criteria box */
+  .criteria-box {
+    background: var(--gray-bg); border: 1px solid var(--gray-border);
+    border-radius: 6px; padding: 10px 14px; margin-top: 8px; font-size: 11px;
+  }
+  .criteria-box .criteria-title { font-weight: 600; font-size: 11px; color: var(--black); margin-bottom: 6px; }
+  .criteria-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .criteria-row:last-child { margin-bottom: 0; }
+  .criteria-key {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 10px; background: var(--white);
+    border: 1px solid var(--gray-border); border-radius: 3px;
+    padding: 1px 5px; color: var(--blue-text); white-space: nowrap; flex-shrink: 0;
+  }
+  .criteria-val { font-size: 11px; color: var(--gray-text); }
+  .criteria-val code {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 10px; background: var(--white);
+    border: 1px solid var(--gray-border); border-radius: 3px;
+    padding: 1px 5px; color: var(--black);
+  }
+  .criteria-exclude {
+    margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--gray-border);
+  }
+  .criteria-exclude .criteria-title { color: var(--red-text); }
+  .criteria-exclude .criteria-key { color: var(--red-text); }
+
+  .pill {
+    display: inline-block; font-size: 10px; font-weight: 600;
+    padding: 2px 7px; border-radius: 20px; margin-left: 6px; vertical-align: middle;
+    letter-spacing: 0.04em;
+  }
+  .pill.new { background: var(--lila-light); color: var(--lila-text); border: 1px solid var(--lila-border); }
+
+  /* Account list in settlement */
+  .account-list { margin-top: 6px; }
+  .account-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 0; border-bottom: 1px solid var(--gray-border); font-size: 11px;
+  }
+  .account-item:last-child { border-bottom: none; }
+  .account-item .acc-code {
+    font-family: 'SF Mono', 'Fira Code', monospace; font-size: 10px;
+    background: var(--gray-bg); border: 1px solid var(--gray-border);
+    border-radius: 3px; padding: 1px 5px; color: var(--blue-text); white-space: nowrap;
+  }
+  .account-item .acc-name { color: var(--black); font-weight: 500; }
+  .acc-dr { font-size: 10px; color: var(--blue-text); font-weight: 600; margin-left: auto; }
+  .acc-cr { font-size: 10px; color: var(--green-text); font-weight: 600; margin-left: auto; }
+</style>
+</head>
+<body>
+
+<div class="doc-header">
+  <div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <span class="doc-header-tag">Proyecto IVA</span>
+      <span class="doc-header-tag" style="background:var(--lila-light);color:var(--lila-text);border:1px solid var(--lila-border);">Mercado Libre</span>
+    </div>
+    <h1>Flujo de Facturación y Reconocimiento Contable</h1>
+    <p class="doc-header-meta">Requerimientos de Finanzas → equipo de Data · Proceso propuesto · Mayo 2026</p>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 1 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">1</div>
+    <div><h2>Venta confirmada en ML</h2></div>
+  </div>
+
+  <div class="flow-row centered">
+    <div class="card trigger" style="width:280px">
+      <div class="card-title">Venta confirmada en ML</div>
+    </div>
+  </div>
+
+  <div class="criteria-box" style="margin-top:10px;">
+    <div class="criteria-title">Cómo identificar una venta confirmada en el reporte ML API</div>
+    <div class="criteria-row">
+      <span class="criteria-key">transaction_type</span>
+      <span class="criteria-val">= <code>SETTLEMENT</code></span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">settlement_date</span>
+      <span class="criteria-val">= mes bajo análisis</span>
+    </div>
+    <div class="criteria-exclude">
+      <div class="criteria-title">Excluir del filtro anterior — external_reference que contenga:</div>
+      <div class="criteria-row"><span class="criteria-key">external_reference</span><span class="criteria-val"><code>money_transfer_</code></span></div>
+      <div class="criteria-row"><span class="criteria-key">external_reference</span><span class="criteria-val"><code>MELIPAYMENTS-COLLECCTIONATTEMPT</code></span></div>
+      <div class="criteria-row"><span class="criteria-key">external_reference</span><span class="criteria-val"><code>loyal_paid_level_6</code></span></div>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 2 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">2</div>
+    <div><h2>Acciones en paralelo</h2></div>
+  </div>
+
+  <div class="split-container">
+    <div class="split-side">
+      <div class="card blue" style="width:100%">
+        <div class="card-title">YUJU crea SO en Odoo</div>
+      </div>
+    </div>
+    <div class="split-side">
+      <div class="card blue" style="width:100%">
+        <div class="card-title">ML emite factura CFDI</div>
+        <div class="card-sub">Con sello fiscal de WB</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 3 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">3</div>
+    <div><h2>Script de validación cruzada</h2></div>
+  </div>
+
+  <div class="flow-row centered">
+    <div class="card condition" style="width:340px">
+      <div class="card-title">Script de validación cruzada</div>
+      <div class="card-sub">¿Orden ML = SO Odoo = CFDI emitido?</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;margin-top:0;">
+    <div style="display:flex;flex-direction:column;align-items:center;">
+      <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+      <div style="font-size:11px;color:var(--green-text);font-weight:600;margin-bottom:4px;">✓ SO existe</div>
+      <div class="card ok" style="width:90%">
+        <div class="card-title">Jalar CFDI de ML a Odoo</div>
+        <div class="card-sub">Vincular a la SO existente</div>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;align-items:center;">
+      <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+      <div style="font-size:11px;color:var(--red-text);font-weight:600;margin-bottom:4px;">✗ SO faltante</div>
+      <div class="card alert" style="width:90%">
+        <div class="card-title">Alerta + Crear SO + Jalar CFDI</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:8px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 4 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">4</div>
+    <div><h2>Generación de asiento contable</h2><p>Automático al confirmar CFDI en Odoo</p></div>
+  </div>
+
+  <div class="flow-row centered" style="margin-bottom:10px;">
+    <div class="card process" style="max-width:340px">
+      <div class="card-title">Generación de asiento contable</div>
+      <div class="card-sub">Automático al confirmar CFDI en Odoo</div>
+    </div>
+  </div>
+
+  <div class="asiento-box">
+    <div class="asiento-header">Asiento — Venta</div>
+    <table class="asiento-table">
+      <thead>
+        <tr>
+          <th style="width:55%">Cuenta</th>
+          <th class="right">Débito</th>
+          <th class="right">Crédito</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="row-separator"><td colspan="3"><span class="section-name">Ingresos</span></td></tr>
+        <tr>
+          <td>
+            <div class="account-name">Mercado Libre</div>
+            <div class="account-code">105-001-004</div>
+            <div class="account-sub">Cuenta por cobrar al marketplace</div>
+          </td>
+          <td class="right debit">$ Venta + IVA</td>
+          <td class="right dash">—</td>
+        </tr>
+        <tr>
+          <td>
+            <div class="account-name">Ventas y/o servicios gravados a la tasa general</div>
+            <div class="account-code">401-001-001</div>
+          </td>
+          <td class="right dash">—</td>
+          <td class="right credit">$ Venta</td>
+        </tr>
+        <tr>
+          <td>
+            <div class="account-name">Ventas por envío</div>
+            <div class="account-code">401-001-002</div>
+            <div class="account-sub">Si aplica</div>
+          </td>
+          <td class="right dash">—</td>
+          <td class="right credit">$ Envío</td>
+        </tr>
+        <tr>
+          <td>
+            <div class="account-name">IVA Trasladado Cobrado</div>
+            <div class="account-code">208-001-001</div>
+          </td>
+          <td class="right dash">—</td>
+          <td class="right credit">$ IVA</td>
+        </tr>
+        <tr class="row-separator"><td colspan="3"><span class="section-name">Costo</span></td></tr>
+        <tr>
+          <td>
+            <div class="account-name">Costo de Venta</div>
+          </td>
+          <td class="right debit">$ Costo</td>
+          <td class="right dash">—</td>
+        </tr>
+        <tr>
+          <td>
+            <div class="account-name">Mercancía Facturada No Enviada</div>
+            <div class="account-sub">Cuenta transitoria · pendiente de creación en contabilidad</div>
+          </td>
+          <td class="right dash">—</td>
+          <td class="right credit">$ Costo</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <strong>Nota — cuenta transitoria:</strong> "Mercancía Facturada No Enviada" acumula el costo mientras el producto no ha salido físicamente del almacén (OUT pendiente). Al generarse el OUT en Odoo, esta cuenta se cancela contra la cuenta original de inventario, dejando el costo de venta definitivamente registrado.
+  </div>
+  <div class="note" style="margin-top:6px;">
+    <strong>Problema pendiente de resolución:</strong> Debido a que la factura se emite y afecta al Costo de Venta previo a la salida del producto, en algunos casos van a existir distorsiones en el costo promedio del producto vendido. Esto se debe a que un ingreso posterior a la facturación, pero anterior al OUT de dicha orden, modificaría el costo promedio del producto y lo volvería inconsistente con el costo facturado. <em>Pendiente revisión de configuración en Odoo.</em>
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 5 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">5</div>
+    <div><h2>Log de conciliación</h2><p>Información registrada en la SO e Invoice de Odoo</p></div>
+  </div>
+
+  <div class="flow-row centered">
+    <div class="card log" style="max-width:440px;text-align:left;">
+      <div class="card-title" style="margin-bottom:8px;">Datos a registrar en SO e Invoice de Odoo</div>
+      <div style="display:flex;flex-direction:column;gap:5px;">
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">ID Mercado Libre</span>
+          <span class="criteria-val">Order ID de ML asociado a la operación</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">SO Odoo</span>
+          <span class="criteria-val">Número de orden de venta en Odoo</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">CFDI UUID</span>
+          <span class="criteria-val">UUID del CFDI emitido por ML</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:8px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 6 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">6</div>
+    <div><h2>Aplicación de cobros</h2><p>Barrido del reporte ML API para registrar pagos en Odoo</p></div>
+  </div>
+
+  <div class="settlement-box">
+    <div class="settlement-header">Proceso de aplicación de cobros — Reporte ML API</div>
+    <div class="settlement-body">
+
+      <div class="step-row">
+        <div class="step-num">1</div>
+        <div class="step-content">
+          <strong>Identificar SOs cobradas en el período</strong>
+          <p>En el reporte de ML vía API, el campo <code>money_release_date</code> define la fecha en que ML libera el cobro de cada orden.</p>
+        </div>
+      </div>
+      <div class="step-arrow"></div>
+
+      <div class="step-row">
+        <div class="step-num">2</div>
+        <div class="step-content">
+          <strong>Aplicar cobro por cada factura de venta en Odoo</strong>
+          <p>Toda SO cobrada dispara la aplicación del pago sobre la factura de venta correspondiente en Odoo.</p>
+        </div>
+      </div>
+      <div class="step-arrow"></div>
+
+      <div class="step-row">
+        <div class="step-num">3</div>
+        <div class="step-content">
+          <strong>Asiento contable de cobro</strong>
+          <p>La aplicación del cobro en Odoo genera automáticamente el asiento pertinente, afectando las siguientes cuentas:</p>
+          <div class="account-list" style="margin-top:8px;">
+            <div class="account-item">
+              <span class="acc-code">105-001-004</span>
+              <span class="acc-name">Mercado Libre</span>
+              <span class="acc-cr">Crédito</span>
+            </div>
+            <div class="account-item">
+              <span class="acc-code">102-002-007</span>
+              <span class="acc-name">Mercado Pago</span>
+              <span class="acc-dr">Débito</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

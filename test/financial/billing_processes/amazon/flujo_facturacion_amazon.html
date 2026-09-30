@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flujo de Facturación — Amazon</title>
+<style>
+  :root {
+    --black: #1A1A1A;
+    --yellow: #FFE600;
+    --white: #FFFFFF;
+    --gray-bg: #F7F7F5;
+    --gray-border: #E0E0DC;
+    --gray-text: #6B6B65;
+    --red-light: #FFF0ED;
+    --red-border: #F5A898;
+    --red-text: #C0392B;
+    --green-light: #EAF5EA;
+    --green-border: #90D090;
+    --green-text: #2E7D32;
+    --blue-light: #EBF3FB;
+    --blue-border: #90BBE0;
+    --blue-text: #1565C0;
+    --amber-light: #FFF8E6;
+    --amber-border: #F0D080;
+    --amber-text: #956300;
+    --lila-light: #F0EFFC;
+    --lila-border: #C4C0EC;
+    --lila-text: #4A46A0;
+    --orange-light: #FFF3E8;
+    --orange-border: #F5C080;
+    --orange-text: #8B4500;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px; background: var(--white); color: var(--black);
+    line-height: 1.5; max-width: 860px; margin: 0 auto; padding: 32px 24px 60px;
+  }
+
+  /* Header */
+  .doc-header { margin-bottom: 32px; padding-bottom: 16px; border-bottom: 3px solid var(--yellow); }
+  .doc-header-tags { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .doc-header-tag { background: var(--black); color: var(--yellow); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px; }
+  .doc-header h1 { font-size: 20px; font-weight: 600; }
+  .doc-header-meta { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+
+  /* Section */
+  .section { margin-bottom: 32px; }
+  .section-label { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .step-badge { width: 26px; height: 26px; border-radius: 50%; background: var(--black); color: var(--yellow); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .section-label h2 { font-size: 14px; font-weight: 600; }
+  .section-label p { font-size: 12px; color: var(--gray-text); margin-top: 1px; }
+
+  /* Connector */
+  .connector { display: flex; flex-direction: column; align-items: center; padding: 4px 0; width: 100%; }
+  .connector .arrow-line { width: 2px; background: var(--gray-border); min-height: 20px; }
+  .arrow-head { font-size: 14px; line-height: 1; color: var(--gray-text); }
+  .connector-label { font-size: 11px; color: var(--gray-text); background: var(--white); padding: 0 4px; }
+
+  /* Cards */
+  .card { border-radius: 8px; padding: 12px 14px; border: 1.5px solid var(--gray-border); background: var(--white); }
+  .card-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .card-sub { font-size: 11px; color: var(--gray-text); }
+  .card.trigger { background: var(--black); border-color: var(--black); color: var(--white); text-align: center; }
+  .card.trigger .card-title { color: var(--yellow); font-size: 14px; }
+  .card.condition { background: var(--amber-light); border-color: var(--amber-border); text-align: center; }
+  .card.condition .card-title { color: var(--amber-text); }
+  .card.condition .card-sub { color: #7A5200; }
+  .card.ok { background: var(--green-light); border-color: var(--green-border); }
+  .card.ok .card-title { color: var(--green-text); }
+  .card.ok .card-sub { color: #1B5E20; }
+  .card.alert { background: var(--red-light); border-color: var(--red-border); }
+  .card.alert .card-title { color: var(--red-text); }
+  .card.process { background: var(--lila-light); border-color: var(--lila-border); text-align: center; width: 100%; }
+  .card.process .card-title { color: var(--lila-text); font-size: 14px; }
+  .card.process .card-sub { color: #3D39A0; }
+  .card.blue { background: var(--blue-light); border-color: var(--blue-border); }
+  .card.blue .card-title { color: var(--blue-text); }
+  .card.blue .card-sub { color: #0D47A1; }
+  .card.orange { background: var(--orange-light); border-color: var(--orange-border); }
+  .card.orange .card-title { color: var(--orange-text); }
+  .card.orange .card-sub { color: #6B3500; }
+
+  /* Split */
+  .split-container { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }
+  .split-col { display: flex; flex-direction: column; align-items: center; }
+  .split-col .card { width: 100%; }
+  .split-connector { width: 2px; background: var(--gray-border); height: 14px; }
+  .branch-label { text-align: center; font-size: 11px; font-weight: 600; padding-bottom: 4px; }
+  .branch-label.ok { color: var(--green-text); }
+  .branch-label.warn { color: var(--red-text); }
+
+  /* Criteria box */
+  .criteria-box { background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 6px; padding: 10px 14px; margin-top: 8px; }
+  .criteria-title { font-weight: 600; font-size: 11px; color: var(--black); margin-bottom: 6px; }
+  .criteria-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .criteria-row:last-child { margin-bottom: 0; }
+  .criteria-key { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--white); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--blue-text); white-space: nowrap; flex-shrink: 0; }
+  .criteria-val { font-size: 11px; color: var(--gray-text); }
+  code { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--black); }
+
+  /* Notes */
+  .note { font-size: 11px; color: var(--gray-text); padding: 8px 12px; background: var(--amber-light); border-left: 3px solid var(--amber-border); border-radius: 0 6px 6px 0; margin-top: 6px; }
+  .note strong { color: var(--amber-text); }
+  .note.info { background: var(--blue-light); border-left-color: var(--blue-border); }
+  .note.info strong { color: var(--blue-text); }
+  .note.ok { background: var(--green-light); border-left-color: var(--green-border); }
+  .note.ok strong { color: var(--green-text); }
+
+  /* Asiento table */
+  .asiento-box { border: 1.5px solid var(--lila-border); border-radius: 8px; overflow: hidden; width: 100%; margin-top: 10px; }
+  .asiento-header { background: var(--lila-light); padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--lila-text); border-bottom: 1px solid var(--lila-border); }
+  .asiento-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .asiento-table th { background: var(--gray-bg); padding: 5px 10px; font-size: 10px; font-weight: 600; color: var(--gray-text); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table th.r { text-align: right; }
+  .asiento-table td { padding: 6px 10px; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table tr:last-child td { border-bottom: none; }
+  .asiento-table tr:hover td { background: var(--gray-bg); }
+  .acc-name { font-weight: 500; color: var(--black); }
+  .acc-code { font-size: 10px; color: var(--gray-text); font-family: 'SF Mono','Fira Code',monospace; margin-top: 1px; }
+  .acc-sub { font-size: 10px; color: var(--gray-text); font-style: italic; margin-top: 1px; }
+  .db { font-weight: 500; color: var(--blue-text); text-align: right; }
+  .cr { font-weight: 500; color: var(--green-text); text-align: right; }
+  .dash { color: var(--gray-border); text-align: right; }
+  .sep-row td { background: var(--gray-bg); padding: 3px 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray-text); }
+
+  /* Log box */
+  .log-box { background: var(--gray-bg); border: 1.5px solid var(--gray-border); border-radius: 8px; padding: 12px 14px; width: 100%; }
+  .log-box .card-title { margin-bottom: 8px; }
+
+  /* Settlement timeline */
+  .settlement-box { border: 1.5px solid var(--blue-border); border-radius: 8px; overflow: hidden; width: 100%; }
+  .settlement-header { background: var(--blue-light); padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--blue-text); border-bottom: 1px solid var(--blue-border); }
+  .settlement-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .settlement-row { display: flex; gap: 10px; align-items: flex-start; }
+  .settlement-num { width: 20px; height: 20px; border-radius: 50%; background: var(--blue-border); color: var(--blue-text); font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
+  .settlement-content { flex: 1; }
+  .settlement-content strong { font-size: 12px; color: var(--blue-text); display: block; margin-bottom: 2px; }
+  .settlement-content p { font-size: 11px; color: var(--gray-text); }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="doc-header">
+  <div class="doc-header-tags">
+    <span class="doc-header-tag">Proyecto IVA</span>
+    <span class="doc-header-tag" style="background:var(--orange-light);color:var(--orange-text);border:1px solid var(--orange-border);">Amazon</span>
+  </div>
+  <h1>Flujo de Facturación y Reconocimiento Contable</h1>
+  <p class="doc-header-meta">Requerimientos de Finanzas → equipo de Data · Proceso propuesto · Mayo 2026</p>
+</div>
+
+
+<!-- SECCIÓN 1 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">1</div>
+    <div><h2>Identificar ventas del mes en el reporte Amazon</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card trigger" style="width:320px;">
+      <div class="card-title">Venta confirmada en Amazon</div>
+    </div>
+  </div>
+
+  <div class="criteria-box">
+    <div class="criteria-title">Cómo identificar una venta en el reporte BI 3.0 (Repositorio de Pagos)</div>
+    <div class="criteria-row">
+      <span class="criteria-key">Col I — description</span>
+      <span class="criteria-val">= <code>Order Payment</code></span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">Col F — posted_date</span>
+      <span class="criteria-val">= mes bajo análisis</span>
+    </div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--gray-border);">
+      <div class="criteria-title">Campos clave por fila de venta</div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col A — settlement_id</span>
+        <span class="criteria-val">Identifica el grupo de liquidación al que pertenece la orden. Cada settlement agrupa las órdenes de un período (~15 días) y tiene una única fecha de Disbursement.</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col C — order_id</span>
+        <span class="criteria-val">ID de la orden en Amazon (formato 7xx-xxxxxxx-xxxxxxx)</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col D — so</span>
+        <span class="criteria-val">SO de Odoo ya cruzada en el reporte</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col Z — product_charges</span>
+        <span class="criteria-val">Precio de venta al público sin IVA (base imponible de la factura CFDI)</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col X — our_price_tax</span>
+        <span class="criteria-val">IVA sobre el precio del producto. La suma <code>product_charges + our_price_tax</code> es el valor total que va en la factura CFDI.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 2 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">2</div>
+    <div><h2>Validación cruzada con Odoo</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card condition" style="width:340px;">
+      <div class="card-title">Script de validación cruzada</div>
+      <div class="card-sub">¿Order ID Amazon = SO en Odoo?</div>
+    </div>
+  </div>
+
+  <div style="margin-top:4px;">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;">
+      <div style="display:flex;flex-direction:column;align-items:center;">
+        <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+        <div class="branch-label ok">✓ SO existe</div>
+        <div class="card ok" style="width:90%">
+          <div class="card-title">SO vinculada al order_id</div>
+          <div class="card-sub">Continúa al Paso 3 para determinar tipo de facturación</div>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:center;">
+        <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+        <div class="branch-label warn">✗ SO faltante</div>
+        <div class="card alert" style="width:90%">
+          <div class="card-title">Alerta + Crear SO + Vincular order_id</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:8px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 3 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">3</div>
+    <div><h2>Determinar tipo de facturación por orden</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card condition" style="width:360px;">
+      <div class="card-title">¿La orden es de Amazon Business (B2B)?</div>
+      <div class="card-sub">Determina si Amazon ya emitió la factura o si WB debe emitirla</div>
+    </div>
+  </div>
+
+  <div style="margin-top:4px;">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:4px;align-items:start;">
+
+      <!-- Rama B2B -->
+      <div style="display:flex;flex-direction:column;align-items:center;gap:0;">
+        <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+        <div class="branch-label ok">✓ B2B — Amazon ya facturó</div>
+        <div class="card ok" style="width:100%">
+          <div class="card-title">Jalar CFDI de Amazon a Odoo</div>
+          <div class="card-sub">Vincular a la SO correspondiente. Mismo mecanismo que ML.</div>
+        </div>
+        <div class="note" style="width:100%;margin-top:6px;">
+          <strong>Pendientes de definir:</strong><br>
+          · Incorporar al reporte que se obtiene vía API las facturas de las órdenes de Amazon Business.<br>
+          · Confirmar mirando una muestra pasada cómo opera el autofacturador de Amazon Business. En nuestra consulta al soporte de AMZ, en principio se factura tanto a clientes específicos como a público en general con facturas individuales.
+        </div>
+      </div>
+
+      <!-- Rama B2C -->
+      <div style="display:flex;flex-direction:column;align-items:center;gap:0;">
+        <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+        <div class="branch-label warn">✗ B2C — Script de facturación WB</div>
+        <div class="card orange" style="width:100%">
+          <div class="card-title">Script de facturación WB</div>
+          <div class="card-sub">Cambios respecto al proceso actual</div>
+        </div>
+        <div style="width:2px;height:10px;background:var(--gray-border);"></div>
+        <div style="width:100%;display:flex;flex-direction:column;gap:6px;">
+          <div style="background:var(--gray-bg);border:1px solid var(--gray-border);border-radius:6px;padding:8px 10px;font-size:11px;">
+            <span style="font-weight:600;color:var(--black);display:block;margin-bottom:2px;">1. Excluir órdenes B2B</span>
+            <span style="color:var(--gray-text);">Las órdenes ya facturadas por el autofacturador de Amazon Business se excluyen del script.</span>
+          </div>
+          <div style="background:var(--gray-bg);border:1px solid var(--gray-border);border-radius:6px;padding:8px 10px;font-size:11px;">
+            <span style="font-weight:600;color:var(--black);display:block;margin-bottom:2px;">2. Eliminar restricción de OUT</span>
+            <span style="color:var(--gray-text);">Toda orden reconocida por Amazon debe facturarse, independientemente de si tuvo OUT o no.</span>
+          </div>
+          <div style="background:var(--gray-bg);border:1px solid var(--gray-border);border-radius:6px;padding:8px 10px;font-size:11px;">
+            <span style="font-weight:600;color:var(--black);display:block;margin-bottom:2px;">3. Factura individual por operación</span>
+            <span style="color:var(--gray-text);">Se abandona el esquema de facturas globales. Cada orden genera su propio CFDI, ya sea con RFC del cliente o a público en general (XAXX010101000).</span>
+          </div>
+          <div style="background:var(--gray-bg);border:1px solid var(--gray-border);border-radius:6px;padding:8px 10px;font-size:11px;">
+            <span style="font-weight:600;color:var(--black);display:block;margin-bottom:2px;">4. Verificar que la SO no esté ya facturada</span>
+            <span style="color:var(--gray-text);">Antes de emitir, chequear que la SO no tenga ya un CFDI asociado — podría haber sido facturada por el cliente mediante el autofacturador.</span>
+          </div>
+          <div style="background:var(--amber-light);border:1px solid var(--amber-border);border-radius:6px;padding:8px 10px;font-size:11px;">
+            <span style="font-weight:600;color:var(--amber-text);display:block;margin-bottom:2px;">⚠️ A definir</span>
+            <span style="color:var(--gray-text);">¿Con qué frecuencia se corre el script? ¿Cuántos días se da al cliente para facturar con su RFC antes de emitir la factura a público en general?</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 4 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">4</div>
+    <div><h2>Generación de asiento contable</h2><p>Automático al confirmar CFDI en Odoo</p></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;margin-bottom:10px;">
+    <div class="card process" style="max-width:340px;">
+      <div class="card-title">Generación de asiento contable</div>
+      <div class="card-sub">Automático al confirmar CFDI en Odoo</div>
+    </div>
+  </div>
+
+  <div class="asiento-box">
+    <div class="asiento-header">Asiento — Venta</div>
+    <table class="asiento-table">
+      <thead>
+        <tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr>
+      </thead>
+      <tbody>
+        <tr class="sep-row"><td colspan="3">Ingresos</td></tr>
+        <tr>
+          <td><div class="acc-name">Amazon</div><div class="acc-code">105-001-006</div><div class="acc-sub">Cuenta por cobrar</div></td>
+          <td class="db">$ Venta + IVA</td><td class="dash">—</td>
+        </tr>
+        <tr>
+          <td><div class="acc-name">Ventas y/o Servicios Gravados</div><div class="acc-code">401-001-001</div></td>
+          <td class="dash">—</td><td class="cr">$ Venta</td>
+        </tr>
+        <tr>
+          <td><div class="acc-name">Ventas por Envío</div><div class="acc-code">401-001-002</div><div class="acc-sub">Si aplica</div></td>
+          <td class="dash">—</td><td class="cr">$ Envío</td>
+        </tr>
+        <tr>
+          <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+          <td class="dash">—</td><td class="cr">$ IVA</td>
+        </tr>
+        <tr class="sep-row"><td colspan="3">Costo</td></tr>
+        <tr>
+          <td><div class="acc-name">Costo de Venta</div></td>
+          <td class="db">$ Costo</td><td class="dash">—</td>
+        </tr>
+        <tr>
+          <td><div class="acc-name">Mercancía Facturada No Enviada</div><div class="acc-sub">Transitoria · pendiente de creación · se libera con el OUT</div></td>
+          <td class="dash">—</td><td class="cr">$ Costo</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note" style="margin-top:8px;">
+    <strong>Distorsión de costo promedio (pendiente de resolución):</strong> Al emitirse la factura y afectarse el Costo de Venta previo al OUT, un ingreso de inventario posterior a la facturación pero anterior al despacho modificaría el costo promedio, volviéndolo inconsistente con el costo facturado. Pendiente revisión de configuración en Odoo.
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 5 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">5</div>
+    <div><h2>Log de conciliación</h2><p>Información registrada en la SO e Invoice de Odoo</p></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="log-box" style="max-width:500px;">
+      <div class="card-title" style="margin-bottom:8px;">Datos a registrar en SO e Invoice de Odoo</div>
+      <div style="display:flex;flex-direction:column;gap:5px;">
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">Amazon order_id</span>
+          <span class="criteria-val">ID de la orden (Col C del reporte)</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">settlement_id</span>
+          <span class="criteria-val">Grupo de liquidación al que pertenece la orden (Col A)</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">SO Odoo</span>
+          <span class="criteria-val">Número de orden de venta en Odoo</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">CFDI UUID</span>
+          <span class="criteria-val">UUID del CFDI emitido (por Amazon en B2B, por WB en B2C)</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">Tipo</span>
+          <span class="criteria-val">B2B (Amazon facturó) / B2C con RFC / B2C público en general</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- SECCIÓN 6 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">6</div>
+    <div><h2>Aplicación de cobros</h2><p>Barrido por settlement_id — fecha de Disbursement como trigger</p></div>
+  </div>
+
+  <div class="settlement-box">
+    <div class="settlement-header">Proceso de aplicación de pagos — por settlement_id</div>
+    <div class="settlement-body">
+
+      <div class="settlement-row">
+        <div class="settlement-num">1</div>
+        <div class="settlement-content">
+          <strong>Identificar settlements con fecha de liberación en el período</strong>
+          <p>Cada <code>settlement_id</code> tiene una fecha de liberación de fondos asociada. Este dato no está en el reporte BI 3.0 actual — es un insumo pendiente de incorporar. Una vez disponible, permite determinar qué grupos de órdenes fueron cobrados en el período y disparar la aplicación de cobro correspondiente.</p>
+        </div>
+      </div>
+
+      <div class="settlement-row">
+        <div class="settlement-num">2</div>
+        <div class="settlement-content">
+          <strong>Agrupar todas las órdenes del settlement liberado</strong>
+          <p>Para cada <code>settlement_id</code> liberado en el período, identificar todas las órdenes <code>Order Payment</code> que pertenecen a ese grupo (Col A). Estas son las facturas a las que se aplicará cobro.</p>
+        </div>
+      </div>
+
+      <div class="settlement-row">
+        <div class="settlement-num">3</div>
+        <div class="settlement-content">
+          <strong>Aplicar cobro factura a factura en Odoo (masivo)</strong>
+          <p>Para cada factura del settlement, registrar en Odoo un pago individual vinculado a esa factura específica. El cobro se aplica por el total de la factura con IVA (<code>product_charges + our_price_tax</code>), saldando la CxC por completo.</p>
+        </div>
+      </div>
+
+      <div class="settlement-row">
+        <div class="settlement-num">4</div>
+        <div class="settlement-content">
+          <strong>Asiento contable de cobro</strong>
+          <p>La aplicación del cobro en Odoo genera automáticamente el asiento por el total de cada factura:</p>
+          <div style="margin-top:8px;">
+            <div class="asiento-box" style="border-color:var(--blue-border);">
+              <div class="asiento-header" style="background:var(--blue-light);color:var(--blue-text);border-bottom-color:var(--blue-border);">Asiento — Cobro (por factura)</div>
+              <table class="asiento-table">
+                <thead><tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>
+                      <div class="acc-name">Liberaciones Amazon Pendientes de Procesar</div>
+                      <div class="acc-sub">Cuenta transitoria · permite control previo a afectar bancos</div>
+                    </td>
+                    <td class="db">$ Venta + IVA</td><td class="dash">—</td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <div class="acc-name">Amazon</div>
+                      <div class="acc-code">105-001-006</div>
+                      <div class="acc-sub">CxC — se salda en su totalidad</div>
+                    </td>
+                    <td class="dash">—</td><td class="cr">$ Venta + IVA</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="note info" style="margin-top:8px;">
+    <strong>Cuenta transitoria "Liberaciones Amazon Pendientes de Procesar":</strong> A diferencia de ML (donde el cobro impacta directamente Mercado Pago), en Amazon el cobro se registra primero en esta cuenta transitoria para mantener control y trazabilidad antes de afectar las cuentas de bancos. Permite conciliar cada liberación contra el extracto bancario antes de dar por finalizado el proceso.
+  </div>
+  <div class="note" style="margin-top:6px;">
+    <strong>Insumo pendiente:</strong> La fecha de liberación de cada <code>settlement_id</code> no existe hoy en el reporte BI 3.0. Pendiente definir cómo se incorpora este dato al proceso (campo adicional en el reporte, consulta a Seller Central, u otro mecanismo).
+  </div>
+
+</div>
+
+</body>
+</html>
