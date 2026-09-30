@@ -1610,7 +1610,7 @@ def check_order_pricing(order: dict, conn, sheet_manual: dict) -> list:
                 logger.error(f"Pricing: no se pudo leer el Sheet de fallback: {e}")
         result = check_pricing(
             sku, line.get('sale_price'), sale_time, conn,
-            sheet_rows=_PRICING_SHEET_ROWS,
+            sheet_rows=_PRICING_SHEET_ROWS, channel_id='tiktok',
         )
         if not result['approved']:
             problems.append((sku, result['problem']))

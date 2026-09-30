@@ -5,7 +5,7 @@ import logging
 import gspread
 import mysql.connector
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import xmlrpc.client
 import base64
 import os
@@ -29,6 +29,8 @@ from _00_shipping_labels_db import (
     sku_shipping_cost_from_labels,
     sku_shipping_cost_from_rates,
 )
+import pricing_check
+from pricing_check import check_pricing
 
 # ------------------------------------------------------------
 
@@ -1038,6 +1040,42 @@ def generate_labels(best_rates_map: dict, recipient_data: dict, total_order_valu
     return generated_labels
 
 
+# --- CHECK DE PRICING ---
+
+_PRICING_SHEET_ROWS = None  # Sheet de fallback: se lee una vez por corrida.
+
+
+def check_order_pricing(order: dict, conn, gc) -> list:
+    """
+    Valida el precio de cada línea contra el Priceado (`pricing_check`).
+    Devuelve la lista de (sku, problema); vacía si todas las líneas aprueban.
+    """
+    global _PRICING_SHEET_ROWS
+    try:
+        created = datetime.fromisoformat(str(order.get('created_date', '')).replace('Z', '+00:00'))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        sale_time = int(created.timestamp())
+    except ValueError:
+        sale_time = None  # check_pricing lo reporta como MISSING_SALE_TIME
+
+    problems = []
+    for line in order.get('order_lines', []):
+        sku = (line.get('offer_sku') or '').strip()
+        if _PRICING_SHEET_ROWS is None:
+            try:
+                worksheet = gc.open_by_key(pricing_check.FALLBACK_SHEET_KEY).get_worksheet_by_id(
+                    pricing_check.FALLBACK_WORKSHEET_ID)
+                _PRICING_SHEET_ROWS = worksheet.get("A:C")
+            except Exception as e:
+                logger.error(f"Pricing: no se pudo leer el Sheet de fallback: {e}")
+        result = check_pricing(sku, line.get('price'), sale_time, conn, sheet_rows=_PRICING_SHEET_ROWS,
+                               channel_id='coppel')
+        if not result['approved']:
+            problems.append((sku, result['problem']))
+    return problems
+
+
 # --- BUCLE PRINCIPAL REFACTORIZADO ---
 
 def procesar_ordenes_coppel():
@@ -1167,6 +1205,31 @@ def procesar_ordenes_coppel():
 
         if order.get('order_state') != 'SHIPPING':
             logger.warning(f"Omitiendo orden {order_id}: Estado es '{order.get('order_state')}'")
+            continue
+
+        # --- Check de pricing (ANTES de cotizar/generar guía) ---
+        pricing_problems = check_order_pricing(order, conn, gc)
+        if pricing_problems:
+            reason = 'El precio de la orden es menor al priceado'
+            logger.warning(f"Orden {order_id}: pricing no aprobado: {pricing_problems}")
+            log_data = [fecha_orden, order_id, so_name, skus_str, reason]
+            smart_log('Sin_cobertura', log_data)
+            for line in order.get('order_lines', []):
+                insert_shipping_label(
+                    conn,
+                    marketplace_id=order_id,
+                    marketplace='Coppel',
+                    sku=line.get('offer_sku'),
+                    qty_ordered=int(line.get('quantity', 0)),
+                    status='LIMIT_PRICING_OVERCOME',
+                    label_generated=False,
+                    label_origin='SRS_GENERATED',
+                    tracking_number=None,
+                    shipping_cost=None,
+                    carrier=None,
+                    carrier_service_level=None,
+                    error_log=reason
+                )
             continue
 
         # --- PASO A: Extraer datos de Mirakl ---

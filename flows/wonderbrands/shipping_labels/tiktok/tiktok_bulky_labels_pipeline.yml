@@ -96,7 +96,7 @@ tasks:
           TIKTOK_BULKY_DRY_RUN: "false"
           TEST_API_LABELS_SR: "false"
           TIKTOK_BULKY_MAX_ORDERS: "0"
-          TIKTOK_BULKY_LOOKBACK_HOURS: "72"
+          TIKTOK_BULKY_LOOKBACK_HOURS: 120"
           TIKTOK_BULKY_PAGE_SIZE: "50"
           SLEEP_BETWEEN_ORDERS: "1"
 
