@@ -80,25 +80,29 @@ def dias_desde(fecha_str, hoy):
 
 def obtener_pickings_out(models, db, uid, pwd, order_ids):
     """
-    Devuelve {sale_id: {'fecha_done': str|None, 'abiertos': set(estados)}} con los
-    OUT (picking_type_code = outgoing) de cada orden:
-      - fecha_done: último OUT en estado 'done'.
+    Devuelve {sale_id: {'fecha_done': str|None, 'abiertos': set(estados), 'previos_abiertos': bool}}:
+      - fecha_done: último OUT (picking_type_code = outgoing) en estado 'done'.
       - abiertos: estados de los OUT que siguen pendientes (ni done ni cancel),
         p. ej. un backorder o un OUT esperando disponibilidad.
+      - previos_abiertos: la SO tiene un PICK/PACK (internal) pendiente; en almacenes
+        multi-paso el OUT puede no existir todavía mientras el PICK no se valide.
     """
-    info = defaultdict(lambda: {'fecha_done': None, 'abiertos': set()})
+    info = defaultdict(lambda: {'fecha_done': None, 'abiertos': set(), 'previos_abiertos': False})
     for chunk in chunks(list(order_ids)):
         domain = [
             ('sale_id', 'in', chunk),
-            ('picking_type_code', '=', 'outgoing'),
+            ('picking_type_code', 'in', ['outgoing', 'internal']),
             ('state', '!=', 'cancel'),
         ]
-        pickings = call_odoo(models, db, uid, pwd, 'stock.picking', 'search_read', [domain], {'fields': ['sale_id', 'state', 'date_done']})
+        pickings = call_odoo(models, db, uid, pwd, 'stock.picking', 'search_read', [domain],
+                             {'fields': ['sale_id', 'state', 'date_done', 'picking_type_code']})
         for p in pickings:
             if not p.get('sale_id'):
                 continue
             d = info[p['sale_id'][0]]
-            if p['state'] == 'done':
+            if p['picking_type_code'] == 'internal':
+                d['previos_abiertos'] = d['previos_abiertos'] or p['state'] != 'done'
+            elif p['state'] == 'done':
                 if not d['fecha_done'] or (p.get('date_done') or '') > d['fecha_done']:
                     d['fecha_done'] = p.get('date_done')
             else:
@@ -107,7 +111,10 @@ def obtener_pickings_out(models, db, uid, pwd, order_ids):
 
 def obtener_ordenes_con_devolucion(models, db, uid, pwd, order_ids):
     """
-    Busca si la orden tiene un movimiento de retorno (RET) en estado 'done'.
+    Busca si la orden tiene una devolución en estado 'done'.
+    Una devolución es cualquier picking de entrada (incoming) ligado a la SO, o
+    cuyo folio contenga RET o DEV (según el almacén, las devoluciones de un OUT
+    se nombran .../RET/... o .../DEV/...).
     Devuelve un diccionario {sale_id: fecha_done}.
     """
     resultado = {}
@@ -115,7 +122,10 @@ def obtener_ordenes_con_devolucion(models, db, uid, pwd, order_ids):
         domain = [
             ('sale_id', 'in', chunk),
             ('state', '=', 'done'),
-            ('name', 'ilike', '%RET%')  # Validamos que el folio del movimiento contenga RET
+            '|', '|',
+            ('picking_type_code', '=', 'incoming'),
+            ('name', 'ilike', 'RET'),
+            ('name', 'ilike', 'DEV'),
         ]
         pickings = call_odoo(models, db, uid, pwd, 'stock.picking', 'search_read', [domain], {'fields': ['sale_id', 'date_done']})
         resultado.update({p['sale_id'][0]: p.get('date_done') for p in pickings if p.get('sale_id')})
@@ -150,8 +160,28 @@ def leer_ordenes(models, db, uid, pwd, order_ids):
 def describir_out_abierto(estados):
     return ', '.join(sorted(ESTADOS_PICKING.get(e, e) for e in estados)) or 'N/A'
 
+def motivo_out(out):
+    """Motivo por el que una SO sigue sin OUT, según el estado de sus OUT abiertos."""
+    if out['fecha_done'] and out['abiertos']:
+        return 'Backorder pendiente (OUT parcial)'
+    if 'confirmed' in out['abiertos']:
+        return 'OUT esperando disponibilidad (sin stock en Odoo)'
+    if 'waiting' in out['abiertos']:
+        return 'OUT esperando otra operación (PICK/PACK)'
+    if 'assigned' in out['abiertos']:
+        return 'OUT listo, sin validar'
+    if 'draft' in out['abiertos']:
+        return 'OUT en borrador'
+    if out.get('previos_abiertos'):
+        return 'Detenida en PICK/PACK (OUT aún no generado)'
+    return 'Sin OUT activo (cancelado o nunca generado)'
+
 
 # ── Resumen HTML para el cuerpo del correo ─────────────────────────────
+
+_TH = 'style="border:1px solid #ccc;padding:4px 8px;background:#f2f2f2;text-align:center"'
+_TABLA = '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px">'
+_ESTILO_FILA = {'normal': '', 'subtotal': 'background:#f7f7f7;font-weight:bold', 'total': 'background:#e8eef7;font-weight:bold'}
 
 def _fmt_n(x):
     return f"{x:,.0f}" if x else "–"
@@ -159,86 +189,185 @@ def _fmt_n(x):
 def _fmt_mxn(x):
     return f"${x:,.0f}" if x else "–"
 
+def _monto(r):
+    v = r['Valor de la orden de venta [$]']
+    return v if isinstance(v, (int, float)) else 0
+
+def _td(contenido, alinear='right', extra=''):
+    return f'<td style="border:1px solid #ccc;padding:4px 8px;text-align:{alinear};{extra}">{contenido}</td>'
+
 def _columnas_mes(reporte, max_meses=6):
-    """Meses (YYYY-MM) presentes; si hay más de max_meses, los viejos se agrupan."""
+    """Meses (YYYY-MM) presentes; si hay más de max_meses, los viejos se agrupan en 'Anteriores'."""
     meses = sorted({r['Mes de orden'] for r in reporte if r['Mes de orden'] != 'N/A'})
     if len(meses) <= max_meses:
         return meses, set()
     viejos = set(meses[:len(meses) - max_meses + 1])
     return ['Anteriores'] + meses[-(max_meses - 1):], viejos
 
-def _tabla_pivot(reporte, filas, valor, fmt, meses, viejos, titulo):
-    """filas: lista de (tipo_venta, etiqueta_fila, funcion_filtro)."""
-    th = 'style="border:1px solid #ccc;padding:4px 8px;background:#f2f2f2;text-align:center"'
-    td = 'style="border:1px solid #ccc;padding:4px 8px;text-align:right"'
-    tdl = 'style="border:1px solid #ccc;padding:4px 8px;text-align:left"'
-    out = [f'<p><b>{titulo}</b></p>',
-           '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px">',
-           f'<tr><th {th}>Tipo venta</th><th {th}>Concepto</th>'
-           + ''.join(f'<th {th}>{m}</th>' for m in meses) + f'<th {th}>Total</th></tr>']
-    for tipo, etiqueta, filtro in filas:
+def _ventanas(hoy):
+    """Fecha desde la que revisa cada concepto; None = sin límite hacia atrás."""
+    return {
+        'RETRASO_OUT': None,
+        'DESFASE_FACTURACION': hoy - timedelta(days=DIAS_VENTANA_DESFASE),
+        'REQUIERE_NOTA_CREDITO': hoy - timedelta(days=DIAS_VENTANA_DESFASE),
+        'FANTASMA_OUT_ML': hoy - timedelta(days=DIAS_VENTANA_ML),
+    }
+
+def _tabla(titulo, subtitulo, encabezados, filas, meses, viejos, valor, fmt, extras=(), fuera_de_ventana=None):
+    """
+    Tabla pivote por mes de la orden.
+      filas: lista de dicts {'izq': [celdas], 'rows': [registros], 'tipo': normal|subtotal|total, 'conceptos': [...]}
+      valor/fmt: cómo se agrega y formatea cada celda de mes.
+      extras: columnas adicionales al final [(encabezado, fn(rows) -> str)].
+      fuera_de_ventana(mes, conceptos) -> True si algún concepto de la fila no revisa ese mes (celda 'n/r').
+    """
+    out = [f'<p style="margin:18px 0 2px"><b>{titulo}</b></p>']
+    if subtitulo:
+        out.append(f'<p style="margin:0 0 6px;font-size:12px;color:#555">{subtitulo}</p>')
+    out.append(_TABLA)
+    out.append('<tr>' + ''.join(f'<th {_TH}>{h}</th>' for h in encabezados)
+               + ''.join(f'<th {_TH}>{m}</th>' for m in meses)
+               + f'<th {_TH}>Total</th>' + ''.join(f'<th {_TH}>{h}</th>' for h, _ in extras) + '</tr>')
+    for f in filas:
+        estilo = _ESTILO_FILA[f.get('tipo', 'normal')]
         acum = defaultdict(float)
-        for r in reporte:
-            if r['Tipo_Venta'] == tipo and filtro(r):
-                mes = 'Anteriores' if r['Mes de orden'] in viejos else r['Mes de orden']
-                acum[mes] += valor(r)
-        total = sum(acum.values())
-        negrita = etiqueta.startswith('Órdenes únicas')
-        estilo = ';font-weight:bold' if negrita else ''
-        out.append(f'<tr style="{"background:#fafafa" if negrita else ""}">'
-                   f'<td {tdl}>{tipo}</td><td {tdl[:-1]}{estilo}">{etiqueta}</td>'
-                   + ''.join(f'<td {td[:-1]}{estilo}">{fmt(acum.get(m, 0))}</td>' for m in meses)
-                   + f'<td {td[:-1]};font-weight:bold">{fmt(total)}</td></tr>')
+        for r in f['rows']:
+            acum['Anteriores' if r['Mes de orden'] in viejos else r['Mes de orden']] += valor(r)
+        celdas = [_td(html.escape(str(c)), 'left', estilo) for c in f['izq']]
+        for m in meses:
+            if fuera_de_ventana and not acum.get(m) and fuera_de_ventana(m, f.get('conceptos', [])):
+                celdas.append(_td('n/r', 'center', 'background:#eeeeee;color:#999'))
+            else:
+                celdas.append(_td(fmt(acum.get(m, 0)), 'right', estilo))
+        celdas.append(_td(fmt(sum(acum.values())), 'right', estilo + ';font-weight:bold'))
+        celdas += [_td(fn(f['rows']), 'right', estilo) for _, fn in extras]
+        out.append('<tr>' + ''.join(celdas) + '</tr>')
     out.append('</table>')
     return '\n'.join(out)
+
+def _filas_por_grupo(reporte, tipos, clave, etiqueta_subtotal, conceptos_de=None, orden=None):
+    """Filas excluyentes: cada registro cae en un solo grupo; subtotal por tipo y total general."""
+    filas = []
+    for t in tipos:
+        del_tipo = [r for r in reporte if r['Tipo_Venta'] == t]
+        grupos = defaultdict(list)
+        for r in del_tipo:
+            grupos[clave(r)].append(r)
+        for k in sorted(grupos, key=orden or (lambda k: -len(grupos[k]))):
+            filas.append({'izq': [t, k], 'rows': grupos[k], 'conceptos': conceptos_de(k) if conceptos_de else []})
+        filas.append({'izq': [t, etiqueta_subtotal], 'rows': del_tipo, 'tipo': 'subtotal'})
+    filas.append({'izq': ['TOTAL', 'Total general'], 'rows': reporte, 'tipo': 'total'})
+    return filas
+
+def generar_como_leer_html(hoy):
+    v = _ventanas(hoy)
+    f_des = v['DESFASE_FACTURACION'].strftime('%Y-%m-%d')
+    f_ml = v['FANTASMA_OUT_ML'].strftime('%Y-%m-%d')
+    caja = 'style="border:1px solid #c9d6ea;background:#f4f8fd;padding:10px 14px;font-size:12px;max-width:900px"'
+    return f"""
+<div {caja}>
+<p style="margin:0 0 6px"><b>Cómo leer este reporte</b></p>
+<ul style="margin:0 0 8px;padding-left:18px">
+<li>Cada SO aparece <b>una sola vez</b> en el CSV. Su columna <i>Tipo_Alerta</i> es la <b>combinación</b> de todos los problemas
+que se le detectaron (p. ej. <i>RETRASO_OUT + DESFASE_FACTURACION</i>). Las combinaciones <b>sí son excluyentes</b>:
+una SO "RETRASO_OUT + DESFASE_FACTURACION" no aparece en "RETRASO_OUT" solo ni en "DESFASE_FACTURACION" solo.</li>
+<li><b>Tablas 1, 2 y 5</b> (por combinación y por canal): cada SO y su monto cuentan <b>una vez</b>. Las filas se suman y el subtotal es el total real.</li>
+<li><b>Tablas 3 y 4</b> (por concepto y motivo): responden "¿cuántas SOs tienen este problema?". Una SO con dos problemas
+aparece en las dos filas, cada vez con su monto completo. <b>No sumar esas filas</b>; el total es la fila "Órdenes sin duplicar".</li>
+</ul>
+<p style="margin:0 0 4px"><b>Periodo que revisa cada concepto</b> (corte {hoy.strftime('%Y-%m-%d %H:%M')} UTC):</p>
+<ul style="margin:0;padding-left:18px">
+<li><b>RETRASO_OUT</b>: sin límite hacia atrás (toda SO confirmada con más de {DIAS_TOLERANCIA_OUT} días). Es el único concepto que llega a meses antiguos.</li>
+<li><b>DESFASE_FACTURACION</b> y <b>REQUIERE_NOTA_CREDITO</b>: solo SOs de los últimos {DIAS_VENTANA_DESFASE} días (desde el {f_des}).</li>
+<li><b>FANTASMA_OUT_ML</b>: solo envíos de Mercado Libre de los últimos {DIAS_VENTANA_ML} días (desde el {f_ml}).</li>
+<li>Celdas <span style="background:#eeeeee;color:#999;padding:0 4px">n/r</span> = <b>no revisado</b> en ese mes por la ventana del concepto;
+no significa cero casos. Por eso una SO de un mes antiguo solo puede aparecer como RETRASO_OUT.</li>
+</ul>
+</div>"""
 
 def generar_resumen_html(reporte, hoy):
     if not reporte:
         return '<p>✅ No se detectaron inconsistencias el día de hoy.</p>'
 
-    def monto(r):
-        return r['Valor de la orden de venta [$]'] if isinstance(r['Valor de la orden de venta [$]'], (int, float)) else 0
-
     tipos = [t for t in ['FULL', 'DROP', 'N/A'] if any(r['Tipo_Venta'] == t for r in reporte)]
-    filas = []
-    for t in tipos:
-        for c in CONCEPTOS:
-            if any(r['Tipo_Venta'] == t and r[c] for r in reporte):
-                filas.append((t, c, lambda r, c=c: r[c]))
-        filas.append((t, 'Órdenes únicas', lambda r: True))
-
     meses, viejos = _columnas_mes(reporte)
+    ventanas = _ventanas(hoy)
+
+    def fuera_de_ventana(mes, conceptos):
+        if mes == 'Anteriores':
+            return any(ventanas.get(c) for c in conceptos)
+        return any(ventanas.get(c) and mes < ventanas[c].strftime('%Y-%m') for c in conceptos)
+
+    def conceptos_de_combo(combo):
+        return [c.strip() for c in combo.split('+')]
+
+    def orden_combo(combo):
+        cs = conceptos_de_combo(combo)
+        return (len(cs), [CONCEPTOS.index(c) for c in cs if c in CONCEPTOS])
+
+    mxn = lambda rows: _fmt_mxn(sum(_monto(r) for r in rows))
+
+    # Tablas 1 y 2: combinaciones (excluyentes), por mes
+    filas_combo = _filas_por_grupo(reporte, tipos, lambda r: r['Tipo_Alerta'], 'Subtotal',
+                                   conceptos_de=conceptos_de_combo, orden=orden_combo)
     partes = [
-        _tabla_pivot(reporte, filas, lambda r: 1, _fmt_n, meses, viejos,
-                     'Tabla 1 · Cantidad de SOs por concepto y mes de la orden'),
-        _tabla_pivot(reporte, filas, monto, _fmt_mxn, meses, viejos,
-                     'Tabla 2 · Monto de las SOs (MXN, IVA incluido) por concepto y mes de la orden'),
+        _tabla('Tabla 1 · SOs por combinación de alertas y mes de la orden',
+               'Excluyente: cada SO cuenta una vez. Las filas se suman; el subtotal es el total real.',
+               ['Tipo venta', 'Combinación (Tipo_Alerta)'], filas_combo, meses, viejos,
+               lambda r: 1, _fmt_n, fuera_de_ventana=fuera_de_ventana),
+        _tabla('Tabla 2 · Monto (MXN, IVA incluido) por combinación de alertas y mes de la orden',
+               'Mismas SOs de la Tabla 1, medidas en monto. Las filas se suman.',
+               ['Tipo venta', 'Combinación (Tipo_Alerta)'], filas_combo, meses, viejos,
+               _monto, _fmt_mxn, fuera_de_ventana=fuera_de_ventana),
     ]
 
-    # Tabla 3: combinaciones (mutuamente excluyentes) para cuadrar contra el total de filas del CSV
-    combos = defaultdict(lambda: [0, 0.0])
-    for r in reporte:
-        k = (r['Tipo_Venta'], r['Tipo_Alerta'])
-        combos[k][0] += 1
-        combos[k][1] += monto(r)
-    th = 'style="border:1px solid #ccc;padding:4px 8px;background:#f2f2f2"'
-    td = 'style="border:1px solid #ccc;padding:4px 8px;text-align:right"'
-    tdl = 'style="border:1px solid #ccc;padding:4px 8px"'
-    t3 = ['<p><b>Tabla 3 · Combinaciones de alertas (cada SO aparece una sola vez; suma = total del CSV)</b></p>',
-          '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px">',
-          f'<tr><th {th}>Tipo venta</th><th {th}>Tipo_Alerta (columna del CSV)</th><th {th}>SOs</th><th {th}>MXN</th></tr>']
-    for (t, combo), (n, m) in sorted(combos.items(), key=lambda x: (tipos.index(x[0][0]), -x[1][0])):
-        t3.append(f'<tr><td {tdl}>{t}</td><td {tdl}>{html.escape(combo)}</td><td {td}>{_fmt_n(n)}</td><td {td}>{_fmt_mxn(m)}</td></tr>')
-    t3.append(f'<tr><td {tdl} colspan="2"><b>Total</b></td><td {td}><b>{_fmt_n(len(reporte))}</b></td>'
-              f'<td {td}><b>{_fmt_mxn(sum(monto(r) for r in reporte))}</b></td></tr></table>')
-    partes.append('\n'.join(t3))
+    # Tabla 3: por concepto (no excluyente), separando "solo este concepto" vs "con otro concepto"
+    es_solo = lambda r: sum(r[c] for c in CONCEPTOS) == 1
+    filas_concepto = []
+    for t in tipos:
+        del_tipo = [r for r in reporte if r['Tipo_Venta'] == t]
+        for c in CONCEPTOS:
+            rows = [r for r in del_tipo if r[c]]
+            if rows:
+                filas_concepto.append({'izq': [t, c], 'rows': rows, 'conceptos': [c]})
+        filas_concepto.append({'izq': [t, 'Órdenes sin duplicar'], 'rows': del_tipo, 'tipo': 'subtotal'})
+    filas_concepto.append({'izq': ['TOTAL', 'Total general (sin duplicar)'], 'rows': reporte, 'tipo': 'total'})
+    partes.append(_tabla(
+        'Tabla 3 · SOs por concepto y mes de la orden (cuántas SOs tienen cada problema)',
+        'No excluyente: una SO con dos problemas aparece en las dos filas. <b>No sumar las filas de concepto</b>; '
+        'el total es "Órdenes sin duplicar". "Solo este concepto" + "Con otro concepto" = Total de la fila.',
+        ['Tipo venta', 'Concepto'], filas_concepto, meses, viejos, lambda r: 1, _fmt_n,
+        extras=[('MXN', mxn),
+                ('Solo este concepto', lambda rows: _fmt_n(sum(1 for r in rows if es_solo(r)))),
+                ('Con otro concepto', lambda rows: _fmt_n(sum(1 for r in rows if not es_solo(r))))],
+        fuera_de_ventana=fuera_de_ventana))
 
-    nota = ('<p style="font-size:12px;color:#555">Los conceptos <b>no son mutuamente excluyentes</b>: una misma SO puede estar, '
-            'por ejemplo, en RETRASO_OUT y en DESFASE_FACTURACION a la vez (facturada y sin OUT después de '
-            f'{DIAS_TOLERANCIA_OUT} días). Por eso en las Tablas 1 y 2 la suma de los conceptos puede ser mayor que '
-            'la fila <i>Órdenes únicas</i>, que es la que debe usarse como total. '
-            f'Corte: {hoy.strftime("%Y-%m-%d %H:%M")} UTC.</p>')
-    return '\n'.join(partes) + nota
+    # Tabla 4: motivo dentro de cada concepto (excluyente dentro del concepto)
+    filas_motivo = []
+    for t in tipos:
+        del_tipo = [r for r in reporte if r['Tipo_Venta'] == t]
+        for c in CONCEPTOS:
+            grupos = defaultdict(list)
+            for r in del_tipo:
+                if r[c]:
+                    grupos[r['_motivos'].get(c, 'N/A')].append(r)
+            for motivo in sorted(grupos, key=lambda k: -len(grupos[k])):
+                filas_motivo.append({'izq': [t, c, motivo], 'rows': grupos[motivo], 'conceptos': [c]})
+    partes.append(_tabla(
+        'Tabla 4 · Motivo detectado dentro de cada concepto, por mes de la orden',
+        'Dentro de un concepto los motivos son excluyentes y suman la fila de ese concepto en la Tabla 3. '
+        'Entre conceptos distintos la misma SO puede repetirse.',
+        ['Tipo venta', 'Concepto', 'Motivo'], filas_motivo, meses, viejos, lambda r: 1, _fmt_n,
+        extras=[('MXN', mxn)], fuera_de_ventana=fuera_de_ventana))
+
+    # Tabla 5: por canal (excluyente)
+    partes.append(_tabla(
+        'Tabla 5 · SOs por canal y mes de la orden',
+        'Excluyente: cada SO pertenece a un solo canal. Las filas se suman.',
+        ['Tipo venta', 'Canal'], _filas_por_grupo(reporte, tipos, lambda r: r['Canal'], 'Subtotal'),
+        meses, viejos, lambda r: 1, _fmt_n, extras=[('MXN', mxn)]))
+
+    return generar_como_leer_html(hoy) + '\n'.join(partes)
 
 def generar_glosario_html():
     reglas = [
@@ -258,8 +387,9 @@ def generar_glosario_html():
          f'Envío de Mercado Libre de los últimos {DIAS_VENTANA_ML} días con estado <i>delivered</i> en ML, cuya SO en Odoo '
          'sigue sin entregar o parcial y sin ningún OUT hecho.'),
         ('REQUIERE_NOTA_CREDITO',
-         'SO del universo de DESFASE_FACTURACION que tiene una devolución (RET) en estado <i>Hecho</i>: la mercancía regresó '
-         'pero la factura sigue vigente, por lo que debe emitirse nota de crédito.'),
+         'SO del universo de DESFASE_FACTURACION (facturado &gt; entregado, últimos 60 días) que tiene una devolución en estado '
+         '<i>Hecho</i>: un picking de entrada ligado a la SO o con folio RET o DEV. La mercancía regresó pero la factura sigue '
+         'vigente, por lo que debe emitirse nota de crédito. Tiene prioridad sobre DESFASE_FACTURACION (la SO va en uno u otro).'),
     ]
     th = 'style="border:1px solid #ccc;padding:4px 8px;background:#f2f2f2;text-align:left"'
     td = 'style="border:1px solid #ccc;padding:4px 8px;vertical-align:top"'
@@ -270,6 +400,9 @@ def generar_glosario_html():
              '<li><b>Mes de orden</b>: mes de <i>date_order</i> (UTC).</li>'
              '<li><b>Estado OUT pendiente</b> (CSV): estado del OUT abierto. <i>Esperando disponibilidad</i> = Odoo no tiene stock '
              'en ese almacén para validarlo; <i>Listo</i> = tiene stock, falta validarlo.</li>'
+             '<li><b>Motivo</b> (CSV y Tabla 4): causa detectada dentro de cada concepto. <i>Detenida en PICK/PACK</i> = '
+             'el OUT no existe aún porque el paso previo sigue abierto; <i>Sin OUT activo</i> = no hay OUT ni PICK/PACK abiertos '
+             '(p. ej. OUT cancelado).</li>'
              '<li>El CSV incluye una columna 1/0 por concepto para filtrar o hacer pivots sin depender de las combinaciones.</li>'
              '</ul>')
     return ('<p><b>Glosario · Reglas de cada concepto</b></p>'
@@ -305,7 +438,7 @@ def generar_reporte_alertas():
     reporte_dict = {}
 
     def agregar_al_reporte(orden_data, tipo_alerta, detalle, fecha_factura=None, fecha_out=None, fecha_ret=None,
-                           out_abiertos=None, cantidades=None):
+                           out_abiertos=None, cantidades=None, motivo='N/A'):
         """Función auxiliar para agregar o actualizar una orden en el reporte"""
         nombre = orden_data['name']
         fecha_factura = fecha_factura or 'N/A'
@@ -319,9 +452,11 @@ def generar_reporte_alertas():
                 fila[tipo_alerta] = 1
                 fila['Tipo_Alerta'] += f" + {tipo_alerta}"
                 fila['Detalle'] += f" | {detalle}"
+                fila['_motivos'][tipo_alerta] = motivo
+                fila['Motivo'] += f" | {tipo_alerta}: {motivo}"
             # Completamos los datos si antes no aplicaban y ahora sí tenemos dato
             for col, val in [('Fecha de factura', fecha_factura), ('Fecha OUT', fecha_out),
-                             ('Fecha RET', fecha_ret), ('Estado OUT pendiente', estado_out)]:
+                             ('Fecha devolución', fecha_ret), ('Estado OUT pendiente', estado_out)]:
                 if fila[col] == 'N/A' and val != 'N/A':
                     fila[col] = val
             if cantidades and fila['Cant. facturada'] == 'N/A':
@@ -338,6 +473,8 @@ def generar_reporte_alertas():
                 'Almacen': almacen_nombre,
                 'Tipo_Alerta': tipo_alerta,
                 'Detalle': detalle,
+                'Motivo': f"{tipo_alerta}: {motivo}",
+                '_motivos': {tipo_alerta: motivo},
                 'Valor de la orden de venta [$]': orden_data.get('amount_total', 'N/A'),
                 'Fecha de orden': fecha_orden,
                 'Mes de orden': fecha_orden[:7] if fecha_orden != 'N/A' else 'N/A',
@@ -346,7 +483,7 @@ def generar_reporte_alertas():
                 'Estado OUT pendiente': estado_out,
                 'Fecha de factura': fecha_factura,
                 'Fecha OUT': fecha_out,
-                'Fecha RET': fecha_ret,
+                'Fecha devolución': fecha_ret,
                 'Cant. pedida': 'N/A',
                 'Cant. facturada': 'N/A',
                 'Cant. entregada': 'N/A',
@@ -376,7 +513,8 @@ def generar_reporte_alertas():
             r, 'RETRASO_OUT', detalle,
             fecha_factura=fechas_factura_retrasos.get(r['name']),
             fecha_out=out['fecha_done'],
-            out_abiertos=out['abiertos']
+            out_abiertos=out['abiertos'],
+            motivo=motivo_out(out)
         )
 
     # ── ALERTA 2: Desfase Facturación–Despacho ──────────────
@@ -415,19 +553,23 @@ def generar_reporte_alertas():
 
             if o['id'] in ordenes_con_devolucion:
                 tipo_alerta = 'REQUIERE_NOTA_CREDITO'
-                detalle_texto = "RET confirmado pero factura vigente."
+                detalle_texto = "Devolución (RET/DEV) hecha pero factura vigente."
+                motivo = 'Devolución hecha, factura vigente'
             elif sobrefacturada:
                 tipo_alerta = 'DESFASE_FACTURACION'
                 detalle_texto = "Facturado > pedido (posible doble factura)."
+                motivo = 'Facturado > pedido (posible doble factura)'
             elif not out['fecha_done']:
                 if dias is not None and dias <= DIAS_TOLERANCIA_OUT:
                     descartadas_tolerancia += 1
                     continue  # Facturada al cobro, aún dentro de la ventana normal de despacho
                 tipo_alerta = 'DESFASE_FACTURACION'
                 detalle_texto = f"Facturada sin OUT ({dias} días)."
+                motivo = f'Facturada sin OUT (> {DIAS_TOLERANCIA_OUT} días)'
             else:
                 tipo_alerta = 'DESFASE_FACTURACION'
                 detalle_texto = "OUT hecho pero facturado > entregado."
+                motivo = 'OUT hecho, facturado > entregado'
 
             agregar_al_reporte(
                 o, tipo_alerta, detalle_texto,
@@ -435,7 +577,8 @@ def generar_reporte_alertas():
                 fecha_out=out['fecha_done'],
                 fecha_ret=ordenes_con_devolucion.get(o['id']),
                 out_abiertos=out['abiertos'],
-                cantidades=(pedida, facturada, entregada)
+                cantidades=(pedida, facturada, entregada),
+                motivo=motivo
             )
     log.info(f"Alerta 2: {descartadas_tolerancia} órdenes facturadas sin OUT descartadas por estar dentro de {DIAS_TOLERANCIA_OUT} días.")
 
@@ -465,21 +608,22 @@ def generar_reporte_alertas():
                     op, 'FANTASMA_OUT_ML', "ML entregado, Odoo sin OUT.",
                     fecha_factura=fechas_factura_ml.get(op['name']),
                     fecha_ret=ordenes_con_devolucion_ml.get(op['id']),
-                    out_abiertos=out['abiertos']
+                    out_abiertos=out['abiertos'],
+                    motivo=motivo_out(out)
                 )
         cursor.close()
         db.close()
 
     # ── Generar CSV ────────────
-    columnas = ['Orden', 'Referencia marketplace', 'Canal', 'Tipo_Venta', 'Almacen', 'Tipo_Alerta', 'Detalle',
+    columnas = ['Orden', 'Referencia marketplace', 'Canal', 'Tipo_Venta', 'Almacen', 'Tipo_Alerta', 'Motivo', 'Detalle',
                 'Valor de la orden de venta [$]', 'Fecha de orden', 'Mes de orden', 'Dias desde la orden',
-                'Estado entrega Odoo', 'Estado OUT pendiente', 'Fecha de factura', 'Fecha OUT', 'Fecha RET',
+                'Estado entrega Odoo', 'Estado OUT pendiente', 'Fecha de factura', 'Fecha OUT', 'Fecha devolución',
                 'Cant. pedida', 'Cant. facturada', 'Cant. entregada'] + CONCEPTOS
 
     reporte_final = sorted(reporte_dict.values(), key=lambda r: r['Fecha de orden'], reverse=True)
 
     with open(CSV_FILENAME, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=columnas)
+        writer = csv.DictWriter(f, fieldnames=columnas, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(reporte_final)
 
