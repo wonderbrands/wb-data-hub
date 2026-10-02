@@ -597,7 +597,8 @@ def process_batch_concurrently():
         cursor_main.execute("""
             UPDATE finance.mkp_billing_prod
             SET status = 'ORDER_NEVER_IN_ODOO', processed_at = NOW()
-            WHERE status = 'ORDER_NOT_ODOO_YET'
+            WHERE  marketplace = 'MERCADO_LIBRE'
+              AND status = 'ORDER_NOT_ODOO_YET'
               AND created_at < (UTC_TIMESTAMP() - INTERVAL 10 DAY)
         """)
         expired_orders = cursor_main.rowcount

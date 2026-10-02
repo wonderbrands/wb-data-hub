@@ -69,8 +69,12 @@ def extract_ml_payments():
     cursor.execute("""
         SELECT b.mkp_order_id
         FROM finance.mkp_billing_prod b
-        LEFT JOIN finance.mkp_payments_prod p ON b.mkp_order_id = p.mkp_order_id
-        WHERE b.status in ('ODOO_INVOICED', 'ALREADY_ODOO_INVOICED') AND p.mkp_order_id IS NULL;
+        LEFT JOIN finance.mkp_payments_prod p
+          ON p.marketplace = b.marketplace
+         AND p.mkp_order_id = b.mkp_order_id
+        WHERE b.marketplace = 'MERCADO_LIBRE'
+          AND b.status IN ('ODOO_INVOICED', 'ALREADY_ODOO_INVOICED')
+          AND p.mkp_order_id IS NULL;
     """)
     orders = cursor.fetchall()
     log.info(f"Órdenes pendientes de revisar cobro: {len(orders)}")

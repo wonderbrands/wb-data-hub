@@ -69,8 +69,11 @@ def load_ml_payments_to_odoo():
     cursor.execute("""
         SELECT p.*, b.odoo_so_name
         FROM finance.mkp_payments_prod p
-        JOIN finance.mkp_billing_prod b ON p.mkp_order_id = b.mkp_order_id
-        WHERE p.status = 'PENDING'
+        JOIN finance.mkp_billing_prod b
+          ON b.marketplace = p.marketplace
+         AND b.mkp_order_id = p.mkp_order_id
+        WHERE p.marketplace = 'MERCADO_LIBRE'
+          AND p.status = 'PENDING'
     """)
     pending_payments = cursor.fetchall()
     log.info(f"Pagos pendientes de aplicar en Odoo: {len(pending_payments)}")
