@@ -640,6 +640,17 @@ def filter_and_group_by_team(context, records, delta_days, failed_ids_set):
     teams_dict.pop('Team_Walmart', None)
     teams_dict.pop('Salderos / Facebook', None)
 
+    # Amazon migra a su propio proceso (01_amz_billing.py): excluye las ordenes
+    # B2B (Amazon Business ya emitio el CFDI) y factura sin restriccion de OUT.
+    # Se excluye TODO Amazon, de cualquier fecha, y no con un corte por fecha
+    # como cutoff_ml: este script filtra por date_order y el de Amazon por
+    # posted_date, asi que una fecha dejaria una franja visible para los dos.
+    # El "desde cuando" lo define AMZ_START_DATE del lado de Amazon.
+    # Por coincidencia de nombre, igual que account_for_team(): cubre
+    # 'Team_Amazon' y cualquier variante.
+    for _team in [t for t in teams_dict if 'Amazon' in t]:
+        teams_dict.pop(_team, None)
+
     return teams_dict
 
 
