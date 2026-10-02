@@ -86,7 +86,8 @@ def extract_ml_invoices():
     cursor.execute("""
         SELECT o.order_id, o.date_closed, s.status as invoice_status, o.status as order_status_ml, IFNULL(s.retry_count, 0)
         FROM somos_reyes.ml_order_update o
-        LEFT JOIN finance.mkp_billing_prod s ON o.order_id = s.mkp_order_id
+        LEFT JOIN finance.mkp_billing_prod s
+            ON s.marketplace = 'MERCADO_LIBRE' AND o.order_id = s.mkp_order_id
         WHERE o.date_created >= %s
           AND o.status IN ('paid', 'closed') -- Solo aseguramos órdenes que ya procesaron pago
           AND (s.status IS NULL OR s.status = 'NO_INVOICE_IN_ML')
