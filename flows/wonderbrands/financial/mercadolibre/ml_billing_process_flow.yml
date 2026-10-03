@@ -1,6 +1,6 @@
 id: ml_billing_process_flow
 namespace: wonderbrands.financial.mercadolibre
-description: "Pipeline Facturación ML: Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
+description: "Pipeline Facturación ML (SOMOS-REYES, seller 25523702): Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
 
 concurrency:
   limit: 1
@@ -9,6 +9,8 @@ concurrency:
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
+  # marketplace, CxC y fecha de corte se derivan del seller en ml_stores.py
+  ml_seller_id: "25523702"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
@@ -39,6 +41,7 @@ tasks:
           DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
+          ML_SELLER_ID: "{{ vars.ml_seller_id }}"
         commands:
           - python processes/wonderbrands/financial/billing_processes/mercadolibre/01_miner_ml_billing.py
 
@@ -58,6 +61,7 @@ tasks:
           DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
+          ML_SELLER_ID: "{{ vars.ml_seller_id }}"
         commands:
           - python processes/wonderbrands/financial/billing_processes/mercadolibre/02_loader_ml_billing.py
 

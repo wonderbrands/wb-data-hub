@@ -5,6 +5,7 @@ import logging
 import sys
 from datetime import datetime, timedelta
 import time
+from ml_stores import get_store_config
 
 # ── Logging setup ──────────────────────────────────────────────
 # Solo StreamHandler: Kestra captura stdout/stderr como logs de la ejecución.
@@ -17,13 +18,17 @@ log = logging.getLogger(__name__)
 
 # ── Parámetros por variables de entorno ────────────────────────
 # Definidas en flows/wonderbrands/financial/mercadolibre/ml_payments_flow.yml
+# y ml_oficiales_payments_flow.yml (cada flujo mapea su propio secreto a MERCADO_PAGO_TOKEN)
 DB_HOST     = os.getenv("DB_HOST")
 DB_USER     = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME     = os.getenv("DB_NAME")
 MP_TOKEN    = os.getenv("MERCADO_PAGO_TOKEN")
 
-ML_SELLER_ID        = os.getenv("ML_SELLER_ID", "25523702")
+# Tienda de Mercado Libre (Kestra inyecta ML_SELLER_ID; el resto sale de ml_stores.py)
+STORE               = get_store_config()
+ML_SELLER_ID        = STORE['seller_id']
+MKP_MARKETPLACE     = STORE['marketplace']
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT", "10"))
 # Pausa entre órdenes para respetar el rate limit de ML y MP
 SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "0.3"))
@@ -72,12 +77,12 @@ def extract_ml_payments():
         LEFT JOIN finance.mkp_payments_prod p
           ON p.marketplace = b.marketplace
          AND p.mkp_order_id = b.mkp_order_id
-        WHERE b.marketplace = 'MERCADO_LIBRE'
+        WHERE b.marketplace = %s
           AND b.status IN ('ODOO_INVOICED', 'ALREADY_ODOO_INVOICED')
           AND p.mkp_order_id IS NULL;
-    """)
+    """, (MKP_MARKETPLACE,))
     orders = cursor.fetchall()
-    log.info(f"Órdenes pendientes de revisar cobro: {len(orders)}")
+    log.info(f"[{MKP_MARKETPLACE}] Órdenes pendientes de revisar cobro: {len(orders)}")
 
     if not orders:
         cursor.close()
@@ -146,8 +151,8 @@ def extract_ml_payments():
                     cursor.execute("""
                         INSERT IGNORE INTO finance.mkp_payments_prod
                         (marketplace, mkp_order_id, payment_id, amount, date_released, status)
-                        VALUES ('MERCADO_LIBRE', %s, %s, %s, %s, 'PENDING')
-                    """, (order_id, payment_id, data_mp['transaction_amount'], date_rel))
+                        VALUES (%s, %s, %s, %s, %s, 'PENDING')
+                    """, (MKP_MARKETPLACE, order_id, payment_id, data_mp['transaction_amount'], date_rel))
                     db.commit()
                     released += cursor.rowcount
                 else:
@@ -164,7 +169,7 @@ def extract_ml_payments():
     # ── Resumen único de la corrida ────────────────────────────
     total_errors = ml_errors + mp_errors + other_errors
     log.info(
-        f"Resumen -> Órdenes revisadas: {len(orders)} | Pagos liberados: {released} | "
+        f"[{MKP_MARKETPLACE}] Resumen -> Órdenes revisadas: {len(orders)} | Pagos liberados: {released} | "
         f"Pagos no liberados: {not_released} | "
         f"Errores: {total_errors} (ml={ml_errors}, mp={mp_errors}, otros={other_errors})"
     )
