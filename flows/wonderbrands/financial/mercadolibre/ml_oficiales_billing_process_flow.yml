@@ -1,6 +1,6 @@
-id: ml_payments_flow
+id: ml_oficiales_billing_process_flow
 namespace: wonderbrands.financial.mercadolibre
-description: "Pipeline Pagos ML (SOMOS-REYES, seller 25523702): Extrae cobros liberados de MP (03) y los concilia en Odoo (04). Arranca al terminar la facturación."
+description: "Pipeline Facturación ML OFICIALES (SOMOS-REYES OFICIALES, seller 160190870): Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
 
 concurrency:
   limit: 1
@@ -9,8 +9,9 @@ concurrency:
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
-  # marketplace y diario de cobros ('MP') se derivan del seller en ml_stores.py
-  ml_seller_id: "25523702"
+  # marketplace (MERCADO_LIBRE_OFICIALES), CxC (105.01.005) y fecha de corte
+  # (2026-09-17 15:56:00 CDMX) se derivan del seller en ml_stores.py
+  ml_seller_id: "160190870"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
@@ -18,7 +19,7 @@ variables:
   db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
 
 tasks:
-  - id: working_env_payments
+  - id: working_env_billing_oficiales
     type: io.kestra.plugin.core.flow.WorkingDirectory
     tasks:
 
@@ -29,8 +30,8 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
-      # ── PASO 03: Extracción y validación de cobros liberados (MP) ──
-      - id: run_miner_ml_payments
+      # ── PASO 01: Extracción de XMLs de Mercado Libre Oficiales a BD ──
+      - id: run_miner_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-python:v1
         taskRunner:
@@ -41,13 +42,12 @@ tasks:
           DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
-          MERCADO_PAGO_TOKEN: "{{ secret('MERCADO_PAGO_TOKEN') }}"
           ML_SELLER_ID: "{{ vars.ml_seller_id }}"
         commands:
-          - python processes/wonderbrands/financial/billing_processes/mercadolibre/03_miner_ml_payments.py
+          - python processes/wonderbrands/financial/billing_processes/mercadolibre/01_miner_ml_billing.py
 
-      # ── PASO 04: Aplicación y conciliación nativa de cobros en Odoo ──
-      - id: run_loader_ml_payments
+      # ── PASO 02: Inyección de Facturas a Odoo (Lotes controlados) ──
+      - id: run_loader_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-python:v1
         taskRunner:
@@ -64,24 +64,14 @@ tasks:
           DB_NAME: "{{ vars.db_name }}"
           ML_SELLER_ID: "{{ vars.ml_seller_id }}"
         commands:
-          - python processes/wonderbrands/financial/billing_processes/mercadolibre/04_loader_ml_payments.py
+          - python processes/wonderbrands/financial/billing_processes/mercadolibre/02_loader_ml_billing.py
 
 triggers:
-  # Se ejecuta automáticamente en cuanto termina la Facturación ML
-  - id: listen_to_billing_flow
-    type: io.kestra.plugin.core.trigger.Flow
-    states: 
-      - SUCCESS
-      - WARNING
-    dependsOn:
-      - namespace: wonderbrands.financial.mercadolibre
-        flowId: ml_billing_process_flow
-
-  # DISPARADOR DE RESPALDO: Una corrida de barrido a las 5:00 AM UTC (11:00 PM CDMX)
-  # por si algún cobro se liberó tarde en Mercado Pago sin requerir nueva factura.
-  - id: barrido_nocturno_pagos
+  # Cada 6 horas UTC, desfasado 3 h respecto a ml_billing_process_flow (0,6,12,18)
+  # para que los dos loaders no hagan action_post contra Odoo al mismo tiempo.
+  - id: micro_lotes_cada_6_horas
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 5 * * *"
+    cron: "0 3,9,15,21 * * *"
 
 errors:
   - id: slack_alert
@@ -89,5 +79,5 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *¡Fallo en Pipeline de Pagos ML (Scripts 03-04)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
+        "text": "🚨 *¡Fallo en Pipeline de Facturación ML OFICIALES (160190870) (Scripts 01-02)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
       }
