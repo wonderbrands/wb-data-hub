@@ -8,6 +8,7 @@ from datetime import datetime
 import os
 import logging
 import sys
+from ml_stores import get_store_config
 
 # ── Logging setup ──────────────────────────────────────────────
 # Solo StreamHandler: Kestra captura stdout/stderr como logs de la ejecución,
@@ -25,9 +26,12 @@ DB_USER     = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME     = os.getenv("DB_NAME")
 
-# Vendedor de Mercado Libre y ventana de búsqueda (Paciente Cero: fecha UTC-4 exacta)
-ML_SELLER_ID       = os.getenv("ML_SELLER_ID", "25523702")
-ML_BILLING_START   = os.getenv("ML_BILLING_START", "2026-06-01 15:50:55")
+# Tienda de Mercado Libre (Kestra inyecta ML_SELLER_ID; el resto sale de ml_stores.py)
+STORE            = get_store_config()
+ML_SELLER_ID     = STORE['seller_id']
+MKP_MARKETPLACE  = STORE['marketplace']
+# Ventana de búsqueda sobre ml_order_update.date_created (fecha UTC-4 exacta)
+ML_BILLING_START = STORE['billing_start']
 # Horas tras el pago a partir de las cuales se asume que ML jamás va a facturar (30 días)
 NEVER_BILLED_HOURS = int(os.getenv("NEVER_BILLED_HOURS", "720"))
 REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "15"))
@@ -83,18 +87,21 @@ def extract_ml_invoices():
     headers = {'Authorization': f'Bearer {ml_token}'}
 
     # ── Órdenes candidatas ─────────────────────────────────────
+    # El filtro por seller_id es obligatorio: ml_order_update trae las órdenes de
+    # TODAS las tiendas, y sin él cada tienda consultaría órdenes ajenas con su token.
     cursor.execute("""
         SELECT o.order_id, o.date_closed, s.status as invoice_status, o.status as order_status_ml, IFNULL(s.retry_count, 0)
         FROM somos_reyes.ml_order_update o
         LEFT JOIN finance.mkp_billing_prod s
-            ON s.marketplace = 'MERCADO_LIBRE' AND o.order_id = s.mkp_order_id
-        WHERE o.date_created >= %s
+            ON s.marketplace = %s AND o.order_id = s.mkp_order_id
+        WHERE o.seller_id = %s
+          AND o.date_created >= %s
           AND o.status IN ('paid', 'closed') -- Solo aseguramos órdenes que ya procesaron pago
           AND (s.status IS NULL OR s.status = 'NO_INVOICE_IN_ML')
         ORDER BY o.date_closed ASC;
-    """, (ML_BILLING_START,))
+    """, (MKP_MARKETPLACE, ML_SELLER_ID, ML_BILLING_START))
     orders = cursor.fetchall()
-    log.info(f"Órdenes candidatas encontradas: {len(orders)}")
+    log.info(f"[{MKP_MARKETPLACE}] Órdenes candidatas encontradas: {len(orders)}")
 
     if not orders:
         cursor.close()
@@ -107,6 +114,7 @@ def extract_ml_invoices():
     never_billed  = 0
     net_errors    = 0
     http_errors   = 0
+    http_by_code  = {}   # código HTTP -> cantidad, para diagnosticar permisos/rate limit
     xml_errors    = 0
     token_expired = False
 
@@ -151,14 +159,19 @@ def extract_ml_invoices():
             cursor.execute("""
                 INSERT INTO finance.mkp_billing_prod
                 (marketplace, mkp_order_id, status, retry_count)
-                VALUES ('MERCADO_LIBRE', %s, %s, %s)
+                VALUES (%s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE status = VALUES(status), retry_count = VALUES(retry_count)
-            """, (order_id, new_status, new_retry_count))
+            """, (MKP_MARKETPLACE, order_id, new_status, new_retry_count))
             db.commit()
             continue
 
         if r.status_code != 200:
             http_errors += 1
+            # Solo la primera respuesta de cada código se loguea (con su cuerpo recortado)
+            if r.status_code not in http_by_code:
+                log.warning(f"[{MKP_MARKETPLACE}] HTTP {r.status_code} en orden {order_id}: {r.text[:300]}")
+            http_by_code[r.status_code] = http_by_code.get(r.status_code, 0) + 1
+            time.sleep(SLEEP_BETWEEN_CALLS)  # También en error: evita rachas que disparen un 429
             continue
 
         # ── Parsear XML (Si llegó 200 OK) ──
@@ -190,14 +203,14 @@ def extract_ml_invoices():
             cursor.execute("""
                 INSERT INTO finance.mkp_billing_prod
                 (marketplace, mkp_order_id, cfdi_uuid, total_amount, xml_data, raw_json, status, retry_count)
-                VALUES ('MERCADO_LIBRE', %s, %s, %s, %s, %s, 'PENDING', %s)
+                VALUES (%s, %s, %s, %s, %s, %s, 'PENDING', %s)
                 ON DUPLICATE KEY UPDATE
                     cfdi_uuid = VALUES(cfdi_uuid),
                     total_amount = VALUES(total_amount),
                     xml_data = VALUES(xml_data),
                     raw_json = VALUES(raw_json),
                     status = 'PENDING'
-            """, (order_id, uuid, total, xml_base64, raw_json_str, retry_count))
+            """, (MKP_MARKETPLACE, order_id, uuid, total, xml_base64, raw_json_str, retry_count))
             db.commit()
             inserts_ok += 1
 
@@ -209,9 +222,9 @@ def extract_ml_invoices():
     # ── Resumen único de la corrida ────────────────────────────
     total_errors = net_errors + http_errors + xml_errors
     log.info(
-        f"Resumen -> Candidatas: {len(orders)} | XMLs extraídos: {inserts_ok} | "
+        f"[{MKP_MARKETPLACE}] Resumen -> Candidatas: {len(orders)} | XMLs extraídos: {inserts_ok} | "
         f"En espera (404): {waiting_404} | Nunca facturadas por ML: {never_billed} | "
-        f"Errores: {total_errors} (red={net_errors}, http={http_errors}, xml={xml_errors})"
+        f"Errores: {total_errors} (red={net_errors}, http={http_errors} {http_by_code}, xml={xml_errors})"
     )
     cursor.close()
     db.close()

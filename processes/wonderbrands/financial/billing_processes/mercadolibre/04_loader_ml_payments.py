@@ -3,6 +3,7 @@ import mysql.connector
 import os
 import logging
 import sys
+from ml_stores import get_store_config
 
 # ── Logging setup ──────────────────────────────────────────────
 # Solo StreamHandler: Kestra captura stdout/stderr como logs de la ejecución.
@@ -15,7 +16,8 @@ log = logging.getLogger(__name__)
 
 # ── Parámetros por variables de entorno ────────────────────────
 # Definidas en flows/wonderbrands/financial/mercadolibre/ml_payments_flow.yml
-ODOO_URL      = os.getenv("ODOO_URL")
+# y ml_oficiales_payments_flow.yml
+ODOO_URL     = os.getenv("ODOO_URL")
 ODOO_DB       = os.getenv("ODOO_DB")
 ODOO_USER     = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
@@ -25,8 +27,12 @@ DB_USER     = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME     = os.getenv("DB_NAME")
 
-# Código del diario de Mercado Pago en Odoo
-MP_JOURNAL_CODE          = os.getenv("MP_JOURNAL_CODE", "MP")
+# Tienda de Mercado Libre (Kestra inyecta ML_SELLER_ID; el resto sale de ml_stores.py)
+STORE                    = get_store_config()
+MKP_MARKETPLACE          = STORE['marketplace']
+# Código del diario de Mercado Pago en Odoo y su cuenta por defecto esperada (None = sin candado)
+MP_JOURNAL_CODE          = STORE['mp_journal_code']
+MP_ACCOUNT_CODE          = STORE['mp_account_code']
 # l10n_mx_edi.payment.method: 3 = Transferencia
 EDI_PAYMENT_METHOD_ID    = int(os.getenv("EDI_PAYMENT_METHOD_ID", "3"))
 ODOO_TIMEOUT             = int(os.getenv("ODOO_TIMEOUT", "120"))  # Timeout XML-RPC en segundos
@@ -72,11 +78,11 @@ def load_ml_payments_to_odoo():
         JOIN finance.mkp_billing_prod b
           ON b.marketplace = p.marketplace
          AND b.mkp_order_id = p.mkp_order_id
-        WHERE p.marketplace = 'MERCADO_LIBRE'
+        WHERE p.marketplace = %s
           AND p.status = 'PENDING'
-    """)
+    """, (MKP_MARKETPLACE,))
     pending_payments = cursor.fetchall()
-    log.info(f"Pagos pendientes de aplicar en Odoo: {len(pending_payments)}")
+    log.info(f"[{MKP_MARKETPLACE}] Pagos pendientes de aplicar en Odoo: {len(pending_payments)}")
 
     if not pending_payments:
         cursor.close()
@@ -91,9 +97,15 @@ def load_ml_payments_to_odoo():
             raise Exception("Autenticación rechazada por Odoo.")
         models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object', transport=TimeoutTransport())
 
-        # Buscar el ID del Diario de Mercado Pago
-        journal_search = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.journal', 'search',
-                                           [[('code', '=', MP_JOURNAL_CODE)]], {'limit': 1})
+        # Buscar el Diario de Mercado Pago (con su cuenta por defecto para el candado)
+        journal_search = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.journal', 'search_read',
+                                           [[('code', '=', MP_JOURNAL_CODE)]],
+                                           {'fields': ['id', 'default_account_id'], 'limit': 1})
+
+        expected_account = []
+        if journal_search and MP_ACCOUNT_CODE:
+            expected_account = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.account', 'search',
+                                                 [[('code', '=', MP_ACCOUNT_CODE)]], {'limit': 1})
     except Exception as e:
         log.error(f"Error de conexión inicial con Odoo: {e}")
         cursor.close()
@@ -105,7 +117,20 @@ def load_ml_payments_to_odoo():
         cursor.close()
         db.close()
         raise SystemExit(1)
-    journal_id = journal_search[0]
+    journal_id = journal_search[0]['id']
+
+    # Candado: el diario debe tener como cuenta por defecto la cuenta de la tienda.
+    # Evita aplicar cobros de una tienda en la cuenta de banco de otra.
+    if MP_ACCOUNT_CODE:
+        default_account = journal_search[0]['default_account_id']
+        if not expected_account or not default_account or default_account[0] != expected_account[0]:
+            log.error(
+                f"El diario '{MP_JOURNAL_CODE}' no tiene como cuenta por defecto la {MP_ACCOUNT_CODE} "
+                f"(tiene: {default_account[1] if default_account else 'ninguna'}). Abortando sin aplicar cobros."
+            )
+            cursor.close()
+            db.close()
+            raise SystemExit(1)
 
     # ── Contadores (los detalles por pago NO se loguean: solo el resumen final) ──
     applied     = 0
@@ -160,7 +185,7 @@ def load_ml_payments_to_odoo():
 
     # ── Resumen único de la corrida ────────────────────────────
     log.info(
-        f"Resumen -> Pagos pendientes: {len(pending_payments)} | "
+        f"[{MKP_MARKETPLACE}] Resumen -> Pagos pendientes: {len(pending_payments)} | "
         f"Aplicados en Odoo: {applied} | No aplicados (ERROR): {not_applied}"
     )
     cursor.close()

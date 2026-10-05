@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 import concurrent.futures
 import threading
 import sys
+from ml_stores import get_store_config
 
 # Almacenamiento local por hilo para manejar sesiones TLS independientes si MAX_WORKERS > 1
 thread_local_proxy = threading.local()
@@ -40,7 +41,8 @@ class ErrorsAndSummaryFilter(logging.Filter):
 
 
 # ── Parámetros por variables de entorno ────────────────────────
-# Credenciales Odoo (definidas en flows/wonderbrands/financial/mercadolibre/ml_billing_flow.yml)
+# Credenciales Odoo (definidas en flows/wonderbrands/financial/mercadolibre/ml_billing_process_flow.yml
+# y ml_oficiales_billing_process_flow.yml)
 ODOO_URL      = os.getenv("ODOO_URL")
 ODOO_DB       = os.getenv("ODOO_DB")
 ODOO_USER     = os.getenv("ODOO_USER")
@@ -59,9 +61,13 @@ if LOG_ERRORS_AND_SUMMARY:
     log.addFilter(ErrorsAndSummaryFilter())
 
 # ----------------------------------------------------------------------------
+# Tienda de Mercado Libre (Kestra inyecta ML_SELLER_ID; el resto sale de ml_stores.py)
+STORE                   = get_store_config()
+MKP_MARKETPLACE         = STORE['marketplace']
+ACCOUNT_CODE_CXC_ML     = STORE['account_code_cxc']
+
 PARTNER_ID_PUBLICO_GENERAL = int(os.getenv("PARTNER_ID_PUBLICO_GENERAL", "13436"))
 TAX_ID_MARKETPLACES     = int(os.getenv("TAX_ID_MARKETPLACES", "38"))
-ACCOUNT_CODE_CXC_ML     = os.getenv("ACCOUNT_CODE_CXC_ML", "105.01.004")
 BATCH_LIMIT             = int(os.getenv("BATCH_LIMIT", "40"))            # Facturas por lote
 MAX_WORKERS             = int(os.getenv("MAX_WORKERS", "1"))             # Hilos concurrentes
 SLEEP_BETWEEN_BATCHES   = int(os.getenv("SLEEP_BETWEEN_BATCHES", "10"))  # Segundos de respiro tras cada lote
@@ -206,7 +212,7 @@ def get_account_id(models, db, uid, pwd, code):
 
 
 # -------------------------------------------------------------------------------
-def reset_stuck_processing_records(marketplace='MERCADO_LIBRE'):
+def reset_stuck_processing_records(marketplace=MKP_MARKETPLACE):
     """
     Si una corrida anterior murió a la mitad de un lote (Bad Gateway, kill -9,
     caída del servidor, la excepción que se dispara en process_batch_concurrently
@@ -597,10 +603,10 @@ def process_batch_concurrently():
         cursor_main.execute("""
             UPDATE finance.mkp_billing_prod
             SET status = 'ORDER_NEVER_IN_ODOO', processed_at = NOW()
-            WHERE  marketplace = 'MERCADO_LIBRE'
+            WHERE  marketplace = %s
               AND status = 'ORDER_NOT_ODOO_YET'
               AND created_at < (UTC_TIMESTAMP() - INTERVAL 10 DAY)
-        """)
+        """, (MKP_MARKETPLACE,))
         expired_orders = cursor_main.rowcount
         db_main.commit()
     except Exception as e:
@@ -621,7 +627,7 @@ def process_batch_concurrently():
     # archivo).
 
     # 1.3 CAMBIOS EN LOS REINTENTOS: Excluir IDs de estados especiales ya procesados en esta ejecución completa
-    query_params = [MAX_ERROR_RETRIES, ERROR_RETRY_WINDOW_DAYS]
+    query_params = [MKP_MARKETPLACE, MAX_ERROR_RETRIES, ERROR_RETRY_WINDOW_DAYS]
     exclude_sql = ""
     with retried_lock:
         if retried_special_ids:
@@ -633,7 +639,7 @@ def process_batch_concurrently():
     cursor_main.execute(f"""
         SELECT id, mkp_order_id, cfdi_uuid, xml_data, retry_count_loader, status
         FROM finance.mkp_billing_prod
-        WHERE marketplace = 'MERCADO_LIBRE'
+        WHERE marketplace = %s
           AND (
                 status = 'PENDING'
                 OR (
@@ -905,7 +911,7 @@ def process_batch_concurrently():
         error = status_counts.get('ERROR', 0)
         processing = status_counts.get('PROCESSING', 0)
         log.info(
-            f"Resumen lote: Total={total}, Éxitos publicados={success}, Ya facturadas={already}, "
+            f"[{MKP_MARKETPLACE}] Resumen lote: Total={total}, Éxitos publicados={success}, Ya facturadas={already}, "
             f"ERROR_BG={error_bg}, ORDER_NOT_ODOO_YET={order_not}, TOTAL_DIFF={total_diff}, "
             f"ERROR={error}, PROCESSING={processing} | Borradores reanudados={resumed_drafts}, "
             f"Clientes nuevos={partners_created}, Clientes fallidos={partners_failed}, "
@@ -921,7 +927,8 @@ def process_batch_concurrently():
 
 
 if __name__ == "__main__":
-    log.info("=== Iniciando Inyección CONCURRENTE de Facturas ML a Odoo ===")
+    log.info(f"=== Iniciando Inyección CONCURRENTE de Facturas ML a Odoo "
+             f"| {STORE['seller_name']} ({STORE['seller_id']}) -> {MKP_MARKETPLACE}, CxC {ACCOUNT_CODE_CXC_ML} ===")
     validate_env()
 
     # Al arrancar la ejecución, se limpia el set de IDs especiales reintentados
