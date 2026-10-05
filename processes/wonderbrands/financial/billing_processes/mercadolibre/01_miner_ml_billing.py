@@ -114,6 +114,7 @@ def extract_ml_invoices():
     never_billed  = 0
     net_errors    = 0
     http_errors   = 0
+    http_by_code  = {}   # código HTTP -> cantidad, para diagnosticar permisos/rate limit
     xml_errors    = 0
     token_expired = False
 
@@ -166,6 +167,11 @@ def extract_ml_invoices():
 
         if r.status_code != 200:
             http_errors += 1
+            # Solo la primera respuesta de cada código se loguea (con su cuerpo recortado)
+            if r.status_code not in http_by_code:
+                log.warning(f"[{MKP_MARKETPLACE}] HTTP {r.status_code} en orden {order_id}: {r.text[:300]}")
+            http_by_code[r.status_code] = http_by_code.get(r.status_code, 0) + 1
+            time.sleep(SLEEP_BETWEEN_CALLS)  # También en error: evita rachas que disparen un 429
             continue
 
         # ── Parsear XML (Si llegó 200 OK) ──
@@ -218,7 +224,7 @@ def extract_ml_invoices():
     log.info(
         f"[{MKP_MARKETPLACE}] Resumen -> Candidatas: {len(orders)} | XMLs extraídos: {inserts_ok} | "
         f"En espera (404): {waiting_404} | Nunca facturadas por ML: {never_billed} | "
-        f"Errores: {total_errors} (red={net_errors}, http={http_errors}, xml={xml_errors})"
+        f"Errores: {total_errors} (red={net_errors}, http={http_errors} {http_by_code}, xml={xml_errors})"
     )
     cursor.close()
     db.close()
