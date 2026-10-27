@@ -1,0 +1,93 @@
+id: ml_credit_notes_flow
+namespace: wonderbrands.financial.mercadolibre
+description: "Pipeline Notas de Crédito ML (SOMOS-REYES, seller 25523702): Extrae de ML las NC (CFDI E) de órdenes facturadas (05). Arranca al terminar los pagos."
+
+# La primera ejecución manual (scan_mode=sweep) es el barrido histórico desde el corte
+# de facturación; las automáticas solo consultan las órdenes que ya tocan según la cola
+# finance.mkp_credit_notes_scan. El 06 (registro en Odoo) se agrega como siguiente paso.
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: scan_mode
+    type: SELECT
+    values:
+      - both
+      - signals
+      - sweep
+    defaults: both
+  - id: only_order_ids
+    type: STRING
+    required: false
+    description: "Prueba dirigida: order_ids separados por coma (ignora la cola)"
+  - id: max_calls_per_run
+    type: INT
+    defaults: 20000
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  # marketplace y fecha de corte se derivan del seller en ml_stores.py
+  ml_seller_id: "25523702"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+
+tasks:
+  - id: working_env_credit_notes
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      # ── PASO 05: Extracción de XMLs de NC de Mercado Libre a BD ──
+      - id: run_miner_ml_credit_notes
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        timeout: PT6H
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        env:
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          ML_SELLER_ID: "{{ vars.ml_seller_id }}"
+          # Explícitos: en Kestra nunca aplican los LOCAL_* del script
+          PREFLIGHT_ONLY: "false"
+          SCAN_MODE: "{{ inputs.scan_mode }}"
+          ONLY_ORDER_IDS: "{{ inputs.only_order_ids ?? '' }}"
+          MAX_CALLS_PER_RUN: "{{ inputs.max_calls_per_run }}"
+        commands:
+          # Fase de pruebas: el script vive en test/. Al pasar a producción se mueve a
+          # processes/wonderbrands/financial/billing_processes/mercadolibre/ junto a 01-04.
+          - python test/financial/credit_note_refund_processes/05_miner_ml_credit_notes.py
+
+triggers:
+  # Se ejecuta automáticamente en cuanto terminan los Pagos ML (así el 06 verá el
+  # payment_state actualizado de cada factura)
+  - id: listen_to_payments_flow
+    type: io.kestra.plugin.core.trigger.Flow
+    states:
+      - SUCCESS
+      - WARNING
+    dependsOn:
+      - namespace: wonderbrands.financial.mercadolibre
+        flowId: ml_payments_flow
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *¡Fallo en Pipeline de Notas de Crédito ML (Script 05)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
+      }
