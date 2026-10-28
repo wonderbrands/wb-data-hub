@@ -52,6 +52,12 @@ from _00_shipping_labels_db import (
 )
 import pricing_check
 from pricing_check import check_pricing
+from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
+
+# Órdenes con VoBo humano (sheet de reproceso). Se carga en el main.
+VOBO = VoboSheet('TikTok')
+# Motivos de register_manual que son una validación dura de Odoo: no se reintenta.
+VOBO_BLOCKED_REASONS = ('ODOO_ORDER_MISSING',)
 
 
 # PyPDF2 sólo se usa para consolidar guías multicaja en un único PDF. Si no
@@ -1440,6 +1446,9 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
     forma de repartirlo y se registra el total.
     """
     order_id = ctx['order_id']
+    # POST_LABEL_UPDATE_FAILED llega tras register_success (ya marcada GUIA_GENERADA).
+    if motivo != 'DRY_RUN':
+        VOBO.mark(order_id, EST_BLOCKED if motivo in VOBO_BLOCKED_REASONS else EST_FAIL)
     logger.warning(f"MANUAL | Orden {order_id} | {motivo}: {detalle}")
     resumen.warning(
         f"MANUAL    | {ctx.get('seller_name', '')} | TikTok {order_id} | "
@@ -1511,7 +1520,8 @@ def close_manual_row(sheet_manual: dict, ctx: dict, labels: list,
         ctx.get('so_name') or cfg.NOT_APPLICABLE,
         'RESUELTA_AUTOMATICAMENTE',
         f"Guía generada en una corrida posterior: "
-        f"{', '.join(l['tracking_number'] for l in labels)}. Ya no requiere revisión.",
+        f"{', '.join(l['tracking_number'] for l in labels)}. Ya no requiere revisión."
+        f"{VOBO.note(order_id)}",
         get_attempt_number(sheet_manual, order_id),
         ", ".join(i['sku'] for i in ctx.get('items', [])) or cfg.NOT_APPLICABLE,
         normalize_provider(labels[0]['provider']),
@@ -1530,6 +1540,7 @@ def register_success(conn, sheet_success, sheet_manual, ctx: dict, labels: list,
     main_carrier = normalize_provider(labels[0]['provider'])
     main_service = labels[0]['service_level']
     status = 'LABELS_GENERATED' if (tiktok_ok and odoo_ok) else 'LABELS_GENERATED_PARTIAL_UPDATE'
+    VOBO.mark(order_id, EST_OK)  # la guía existe aunque falle el reporte posterior
 
     upsert_sheet_row(sheet_success, order_id, [
         now_cdmx_str(),                                              # Time-stamp
@@ -1687,7 +1698,11 @@ def process_order(order, shop, access_token, conn, models, uid,
 
     # --- Check de pricing (ANTES de crear paquete, cotizar o generar guía) --
     # Va después de buscar la SO para que el Sheet de manuales lleve el ID Odoo.
-    pricing_problems = check_order_pricing(order, conn, sheet_manual)
+    if order_id in VOBO:
+        logger.info(f"VoBo: la orden {order_id} tiene VoBo. Se omite el check de pricing.")
+        pricing_problems = []
+    else:
+        pricing_problems = check_order_pricing(order, conn, sheet_manual)
     if pricing_problems:
         pricing_status, pricing_message = pricing_check.resolve_pricing_outcome(pricing_problems)
         register_manual(conn, sheet_manual, ctx, pricing_status, pricing_message)
@@ -1735,7 +1750,9 @@ def process_order(order, shop, access_token, conn, models, uid,
         'rates_map': best_rates_map,
     }
 
-    if cost_ratio > cfg.LIMIT_RATIO_PERCENTAGE:
+    if cost_ratio > cfg.LIMIT_RATIO_PERCENTAGE and order_id in VOBO:
+        logger.info(f"VoBo: la orden {order_id} supera el límite ({cost_ratio:.1%}) pero tiene VoBo. Se continúa.")
+    elif cost_ratio > cfg.LIMIT_RATIO_PERCENTAGE:
         register_manual(
             conn, sheet_manual, ctx, 'LIMIT_RATIO_OVERCOME',
             f"El costo de envío (${shipping_cost:.2f}) representa el {cost_ratio:.1%} "
@@ -1945,7 +1962,10 @@ def process_tiktok_bulky_labels():
         conn.close()
         return counters
 
-    sheet_success, sheet_manual = setup_report_sheets(authenticate_google_sheets())
+    gc = authenticate_google_sheets()
+    sheet_success, sheet_manual = setup_report_sheets(gc)
+    VOBO.load(gc)
+    resumen.info(f"VOBO      | {len(VOBO.ids())} orden(es) con VoBo para reproceso: {', '.join(VOBO.ids()) or 'ninguna'}")
     if sheet_success['worksheet'] is None or sheet_manual['worksheet'] is None:
         logger.warning(
             "Reportería de Google Sheets no disponible. El proceso continúa, "
