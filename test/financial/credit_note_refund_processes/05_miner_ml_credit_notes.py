@@ -86,7 +86,7 @@ LOCAL_RUN               = "both"
 # Órdenes para "orders" (y la primera se usa como orden de prueba en "preflight")
 LOCAL_ORDER_IDS         = "2000018238217954,2000016723575980,2000016949680478,2000017527328146"
 # Tope de órdenes que se CONSULTAN en ML en esta corrida (llenar la cola no cuenta)
-LOCAL_MAX_CALLS_PER_RUN = 200
+LOCAL_MAX_CALLS_PER_RUN = 100000
 # En Kestra no aplica nada de este bloque: el flujo manda PREFLIGHT_ONLY, SCAN_MODE,
 # ONLY_ORDER_IDS y MAX_CALLS_PER_RUN como variables de entorno, y esas ganan.
 # ══════════════════════════════════════════════════════════════
