@@ -34,10 +34,6 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
-        retry:
-          type: constant
-          interval: PT1M
-          maxAttempts: 3
         env:
           #Credenciales de la API de Cotización y Generación
           AUTH_USER: "{{ secret('AUTH_USER') }}"

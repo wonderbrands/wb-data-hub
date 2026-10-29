@@ -40,10 +40,6 @@ tasks:
           pullPolicy: NEVER
         # El reintento es seguro: una orden que ya tiene guía queda con
         # label_generated=1 en tools.shipping_labels y se omite en el reintento.
-        retry:
-          type: constant
-          interval: PT1M
-          maxAttempts: 3
         env:
           # ============================================================
           # --- API interna de cotización y generación de guías ---
@@ -102,7 +98,7 @@ tasks:
           TIKTOK_BULKY_DRY_RUN: "true"
           TEST_API_LABELS_SR: "false"
           TIKTOK_BULKY_MAX_ORDERS: "0"
-          TIKTOK_BULKY_LOOKBACK_HOURS: 120"
+          TIKTOK_BULKY_LOOKBACK_HOURS: "120"
           TIKTOK_BULKY_PAGE_SIZE: "50"
           SLEEP_BETWEEN_ORDERS: "1"
 
