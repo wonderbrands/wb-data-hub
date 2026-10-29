@@ -166,7 +166,8 @@ class VoboSheet:
                     'aprobador': cell(row, 'aprobador'), 'tienda': cell(row, 'tienda'),
                 }
 
-            logger.info(
+            # En dry-run va como warning: es el único resultado visible con LOG_LEVEL=WARNING.
+            (logger.warning if self.dry_run else logger.info)(
                 f"VoBo [{self.marketplace}]: {len(eligible)} orden(es) elegible(s) para "
                 f"reproceso: {', '.join(eligible) or 'ninguna'}."
             )
