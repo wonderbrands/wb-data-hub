@@ -926,6 +926,7 @@ def register_vobo_result(conn, sh_sr, order: dict, sheet_name: str, data: list):
     else:
         estado = EST_FAIL
 
+    VOBO.annotate(order_id, odoo_id=data[2] if len(data) > 2 else None)
     estado = VOBO.mark(order_id, estado)
     if not estado:  # ya registrada en esta corrida
         return

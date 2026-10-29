@@ -1447,6 +1447,7 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
     """
     order_id = ctx['order_id']
     # POST_LABEL_UPDATE_FAILED llega tras register_success (ya marcada GUIA_GENERADA).
+    VOBO.annotate(order_id, odoo_id=ctx.get('so_name'), tienda=ctx.get('seller_name'))
     if motivo != 'DRY_RUN':
         VOBO.mark(order_id, EST_BLOCKED if motivo in VOBO_BLOCKED_REASONS else EST_FAIL)
     logger.warning(f"MANUAL | Orden {order_id} | {motivo}: {detalle}")
@@ -1540,6 +1541,7 @@ def register_success(conn, sheet_success, sheet_manual, ctx: dict, labels: list,
     main_carrier = normalize_provider(labels[0]['provider'])
     main_service = labels[0]['service_level']
     status = 'LABELS_GENERATED' if (tiktok_ok and odoo_ok) else 'LABELS_GENERATED_PARTIAL_UPDATE'
+    VOBO.annotate(order_id, odoo_id=ctx.get('so_name'), tienda=ctx.get('seller_name'))
     VOBO.mark(order_id, EST_OK)  # la guía existe aunque falle el reporte posterior
 
     upsert_sheet_row(sheet_success, order_id, [

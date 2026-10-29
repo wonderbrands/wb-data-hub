@@ -569,6 +569,7 @@ def process_amazon_self_ship_labels():
 
         # ids Odoo
         so_id, so_name = get_order_ids_from_odoo(models, uid, order_id)
+        VOBO.annotate(order_id, odoo_id=so_name)
         if not so_id:
             logger.warning(f"Orden {order_id} no encontrada en Odoo. Aún así se intentará generar guía.")
 

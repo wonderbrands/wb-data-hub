@@ -20,7 +20,12 @@ Uso típico (en cada script de guías):
     VOBO = VoboSheet('Coppel')
     VOBO.load(client)                 # nunca lanza excepción
     if order_id in VOBO: ...          # la orden tiene VoBo vigente
+    VOBO.annotate(order_id, odoo_id=so_name)   # opcional: ID Odoo / tienda
     VOBO.mark(order_id, EST_OK)       # se ignora si la orden no tiene VoBo
+
+Columnas del sheet (por nombre de encabezado, en cualquier orden):
+    Manuales:    Marketplace ID, VoBo, Motivo Original, Aprobador, (Tienda opcional)
+    Automáticas: Odoo ID, Tienda (si está vacía), Estado, Intentos, Fecha Guia
 
 Estados (columna `estado`):
     (vacío) / PENDIENTE   -> elegible
@@ -42,6 +47,8 @@ import json
 import logging
 import os
 import time
+import unicodedata
+from datetime import datetime, timedelta, timezone
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -63,6 +70,17 @@ _APPROVED_VALUES = {'SI', 'SÍ', 'S', 'OK', 'X', 'TRUE', '1', 'YES', 'Y', 'VOBO'
                     'VO.BO.', 'VO.BO', 'APROBADO', 'APROBADA'}
 
 _REQUIRED_COLUMNS = ('marketplace_id', 'vobo', 'estado', 'intentos')
+
+
+def _header(raw) -> str:
+    """'Marketplace ID' -> marketplace_id, '# Intentos' -> intentos, 'Fecha Guía' -> fecha_guia."""
+    text = unicodedata.normalize('NFKD', str(raw)).encode('ascii', 'ignore').decode()
+    return text.replace('#', '').strip().lower().replace(' ', '_')
+
+
+def _now_cdmx() -> str:
+    # México ya no usa horario de verano: UTC-6 fijo.
+    return datetime.now(timezone(timedelta(hours=-6))).strftime('%d/%m/%Y %H:%M:%S')
 
 
 def _flag(name: str, default: str = 'false') -> bool:
@@ -106,6 +124,19 @@ class VoboSheet:
     def ids(self) -> list:
         return list(self.orders)
 
+    def annotate(self, order_id, odoo_id=None, tienda=None):
+        """
+        Guarda datos que el script ya conoce de la orden (SO de Odoo, tienda) para
+        escribirlos junto con el resultado. Se ignora si la orden no tiene VoBo.
+        """
+        entry = self.orders.get(str(order_id).strip())
+        if not entry:
+            return
+        if odoo_id and odoo_id != 'N/A':
+            entry['odoo_id'] = str(odoo_id)
+        if tienda:
+            entry['tienda_auto'] = str(tienda)
+
     def note(self, order_id) -> str:
         """Texto corto para dejar constancia del VoBo en los sheets originales."""
         entry = self.orders.get(str(order_id).strip())
@@ -134,7 +165,7 @@ class VoboSheet:
                 return self
 
             # 'Marketplace ID' -> marketplace_id, '# Intentos' -> intentos
-            headers = [str(h).replace('#', '').strip().lower().replace(' ', '_') for h in values[0]]
+            headers = [_header(h) for h in values[0]]
             missing = [c for c in _REQUIRED_COLUMNS if c not in headers]
             if missing:
                 logger.error(
@@ -206,25 +237,31 @@ class VoboSheet:
             estado = EST_EXHAUSTED
 
         try:
-            self._write(entry['row'], order_id, estado, attempts)
+            self._write(entry, order_id, estado, attempts)
             logger.info(f"VoBo [{self.marketplace}]: {order_id} -> {estado} (intentos={attempts})")
         except Exception as e:
             logger.error(f"VoBo [{self.marketplace}]: no se pudo registrar {order_id} -> {estado}: {e}")
         return estado
 
-    def _write(self, row: int, order_id: str, estado: str, attempts: int):
+    def _write(self, entry: dict, order_id: str, estado: str, attempts: int):
+        row = entry['row']
+        cells = [('estado', estado), ('intentos', attempts)]
+        if entry.get('odoo_id'):
+            cells.append(('odoo_id', entry['odoo_id']))
+        if entry.get('tienda_auto') and not entry.get('tienda'):
+            cells.append(('tienda', entry['tienda_auto']))
+        if estado == EST_OK:
+            cells.append(('fecha_guia', _now_cdmx()))
+        # Las columnas automáticas son opcionales: si no existen en la pestaña, se omiten.
+        data = [{'range': gspread.utils.rowcol_to_a1(row, self._cols[name] + 1), 'values': [[value]]}
+                for name, value in cells if name in self._cols]
         for attempt in (1, 2):
             try:
                 id_col = self._cols['marketplace_id'] + 1
                 # Si alguien insertó/borró filas durante la corrida, no se escribe a ciegas.
                 if (self._ws.cell(row, id_col).value or '').strip().lstrip("'") != order_id:
                     raise ValueError(f"la fila {row} ya no corresponde a la orden {order_id}")
-                self._ws.batch_update([
-                    {'range': gspread.utils.rowcol_to_a1(row, self._cols['estado'] + 1),
-                     'values': [[estado]]},
-                    {'range': gspread.utils.rowcol_to_a1(row, self._cols['intentos'] + 1),
-                     'values': [[attempts]]},
-                ], value_input_option='USER_ENTERED')
+                self._ws.batch_update(data, value_input_option='USER_ENTERED')
                 return
             except gspread.exceptions.APIError as api_err:
                 if attempt == 2:
