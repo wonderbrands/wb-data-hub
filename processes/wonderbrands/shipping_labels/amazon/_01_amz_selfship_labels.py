@@ -56,7 +56,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger()
 
 # Órdenes con VoBo humano (sheet de reproceso). Se carga en el main.
-VOBO = VoboSheet('Amazon')
+VOBO = VoboSheet('Amazon_self')
 
 
 # ==========================================
