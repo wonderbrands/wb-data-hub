@@ -99,6 +99,9 @@ LIMIT_RATIO_PERCENTAGE = float(os.getenv('LIMIT_RATIO_PERCENTAGE', '0.21'))
 
 # Clave SAT genérica de mercancía para el complemento carta porte.
 SAT_BIENES_TRANSP = os.getenv('SAT_BIENES_TRANSP', '50161815')
+# Valor de mercancía que se declara al generar la guía de una orden con VoBo cuyo
+# valor es <= 0 (la paquetería no acepta declarar 0). No afecta al resto de órdenes.
+ZERO_VALUE_DECLARED_MXN = float(os.getenv('ZERO_VALUE_DECLARED_MXN', '1'))
 
 MARKETPLACE_NAME = 'TikTok'
 

@@ -888,6 +888,9 @@ VOBO = VoboSheet('Coppel')
 VOBO_BLOCKED_SHEETS = ('SO_no_bloqueadas / canceladas', 'PICK-pendiente', 'Fulfillment')
 # Hojas de log cuyo rechazo no deja registro en tools.shipping_labels por sí solo.
 VOBO_DB_SHEETS = VOBO_BLOCKED_SHEETS + ('Sin_cobertura',)
+# Valor de mercancía que se declara en la guía de una orden con VoBo cuyo valor es 0
+# (la paquetería no acepta declarar 0). No afecta al resto de órdenes.
+ZERO_VALUE_DECLARED_MXN = float(os.getenv('ZERO_VALUE_DECLARED_MXN', '1'))
 
 # Columna (1-based) del ID de orden en 'Costo_guia_excesivo' (A=Fecha_Log, B=fecha, C=orden).
 COSTO_EXCESIVO_ORDER_COL = 3
@@ -1360,7 +1363,10 @@ def procesar_ordenes_coppel():
                     "price": float(line['price']), "name": line.get('product_title', 'Producto Coppel')
                 })
                 total_order_value += float(line['price'])
-            if total_order_value == 0: raise ValueError("Valor total de la orden es 0.")
+            if total_order_value <= 0 and order_id in VOBO:
+                logger.info(f"VoBo: la orden {order_id} tiene valor <= 0 pero tiene VoBo. Se continúa sin ratio de costo.")
+            elif total_order_value == 0:
+                raise ValueError("Valor total de la orden es 0.")
         except Exception as e:
             reason = f"Error al extraer datos de Mirakl: {e}"
             logger.error(f"Orden {order_id}: {reason}")
@@ -1392,7 +1398,8 @@ def procesar_ordenes_coppel():
         # --- PASO C: Validar Costo Total ---
         total_shipping_cost_cents = sum(r['total_price'] for r in best_rates_map.values())
         total_shipping_cost_mxn = total_shipping_cost_cents / 100.0
-        cost_ratio = total_shipping_cost_mxn / total_order_value
+        # Con valor <= 0 (sólo llega aquí con VoBo) no hay ratio que validar.
+        cost_ratio = total_shipping_cost_mxn / total_order_value if total_order_value > 0 else 0.0
         if cost_ratio > PERCENTAGE_COST_LIMIT and order_id in VOBO:
             logger.info(f"VoBo: la orden {order_id} supera el límite ({cost_ratio:.1%}) pero tiene VoBo. Se continúa.")
         elif cost_ratio > PERCENTAGE_COST_LIMIT:
@@ -1431,7 +1438,8 @@ def procesar_ordenes_coppel():
         logger.info(f"Orden {order_id} APROBADA. Generando {len(best_rates_map)} guías...")
 
         # --- PASO D: Generar Guías ---
-        labels = generate_labels(best_rates_map, recipient_data, total_order_value)
+        declared_value = total_order_value if total_order_value > 0 else ZERO_VALUE_DECLARED_MXN
+        labels = generate_labels(best_rates_map, recipient_data, declared_value)
         if not labels or len(labels) != len(best_rates_map):
             reason = f"Fallo al generar guías (Se generaron {len(labels)} de {len(best_rates_map)})."
             logger.error(f"Orden {order_id}: {reason}")

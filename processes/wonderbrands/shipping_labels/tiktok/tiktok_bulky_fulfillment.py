@@ -1680,9 +1680,12 @@ def process_order(order, shop, access_token, conn, models, uid,
         return 'manual'
 
     if total_order_value <= 0:
-        register_manual(conn, sheet_manual, ctx, 'ORDER_VALUE_ZERO',
-                        "El valor de la orden es 0; no se puede validar el ratio de costo.")
-        return 'manual'
+        if order_id in VOBO:
+            logger.info(f"VoBo: la orden {order_id} tiene valor <= 0 pero tiene VoBo. Se continúa sin ratio de costo.")
+        else:
+            register_manual(conn, sheet_manual, ctx, 'ORDER_VALUE_ZERO',
+                            "El valor de la orden es 0; no se puede validar el ratio de costo.")
+            return 'manual'
 
     recipient_data = build_recipient_data(order)
     if not recipient_data['zip']:
@@ -1738,7 +1741,8 @@ def process_order(order, shop, access_token, conn, models, uid,
 
     # --- Regla del 21% ---------------------------------------------------
     shipping_cost = sum(r['total_price'] for r in best_rates_map.values()) / 100.0
-    cost_ratio = shipping_cost / total_order_value
+    # Con valor <= 0 (sólo llega aquí con VoBo) no hay ratio que validar.
+    cost_ratio = shipping_cost / total_order_value if total_order_value > 0 else 0.0
 
     # Carrier cotizado: se registra aunque la guía no llegue a generarse.
     quoted_service = str(list(best_rates_map.values())[0].get('service_name') or '')
@@ -1796,7 +1800,8 @@ def process_order(order, shop, access_token, conn, models, uid,
         return 'skipped'
 
     # --- Generación de guías ---------------------------------------------
-    labels = generate_labels(best_rates_map, recipient_data, total_order_value)
+    declared_value = total_order_value if total_order_value > 0 else cfg.ZERO_VALUE_DECLARED_MXN
+    labels = generate_labels(best_rates_map, recipient_data, declared_value)
     if not labels:
         register_manual(conn, sheet_manual, ctx, 'LABEL_GENERATION_FAILED',
                         "La API interna no generó ninguna guía para la orden.",
