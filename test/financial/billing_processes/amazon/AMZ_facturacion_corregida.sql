@@ -326,3 +326,11 @@ WHERE marketplace='AMAZON' AND mkp_order_id = '702-6841264-9666630';
 
 SELECT * FROM finance.mkp_billing_staging
 WHERE marketplace='AMAZON' AND mkp_order_id = '701-3940186-6256218';
+
+
+# ------------------------------------------------------------
+
+SELECT settlement_id, settlement_start_date, settlement_end_date, deposit_date
+FROM somos_reyes.amz_settlement_report
+WHERE deposit_date >= '2026-10-01'
+ORDER BY deposit_date;

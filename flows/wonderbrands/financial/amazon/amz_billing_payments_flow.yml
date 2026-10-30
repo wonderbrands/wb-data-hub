@@ -50,9 +50,10 @@ variables:
   db_name: "finance"
   db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
   scripts: "processes/wonderbrands/financial/billing_processes/amazon"
-  # Marca de agua inicial de 02 (tabla de cobros vacía): no levantar cobros
-  # anteriores a octubre. Finanzas cierra la historia en contabilidad.
-  payments_desde: "2026-10-21 00:00:00"
+  # Marca de agua inicial de 02 (solo si la tabla de cobros esta vacia). 02 le
+  # resta 15 dias: 16-oct -> lee depositos desde el 1-oct. Nada de septiembre:
+  # Finanzas cierra la historia en contabilidad.
+  payments_desde: "2026-10-16 00:00:00"
 
 tasks:
   - id: working_env_amazon
