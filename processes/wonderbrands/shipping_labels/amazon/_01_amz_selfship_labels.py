@@ -24,6 +24,7 @@ from _00_shipping_labels_db import (
     sku_shipping_cost_from_labels,
     sku_shipping_cost_from_rates,
 )
+from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
 
 # --- CONFIGURACIÓN DE ENTORNO ---
 dotenv.load_dotenv()
@@ -54,6 +55,9 @@ SHIPPER_DATA = {
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
+# Órdenes con VoBo humano (sheet de reproceso). Se carga en el main.
+VOBO = VoboSheet('Amazon_self')
+
 
 # ==========================================
 # FUNCIONES DB
@@ -78,6 +82,58 @@ def fetch_pending_orders(conn):
     rows = cursor.fetchall()
     cursor.close()
     return rows
+
+
+def reactivate_vobo_orders(conn):
+    """
+    Devuelve a la cola ('pending') las órdenes con VoBo que habían sido rechazadas
+    (LIMIT_RATIO_OVERCOME / SKU_NOT_SUPPORT). Ese rechazo deja label_generated=1,
+    por lo que sin esto fetch_pending_orders nunca las volvería a tomar.
+    Nunca toca filas con guía generada ni canceladas.
+    """
+    order_ids = VOBO.ids()
+    if not order_ids:
+        return
+    try:
+        cursor = conn.cursor()
+        placeholders = ", ".join(["%s"] * len(order_ids))
+        cursor.execute(f"""
+            UPDATE amz_label_queue
+            SET label_generated = 0, status = 'pending'
+            WHERE amazonorderid IN ({placeholders})
+              AND label_generated = 1
+              AND status IN ('LIMIT_RATIO_OVERCOME', 'SKU_NOT_SUPPORT')
+              AND cancellation_reason IS NULL
+        """, tuple(order_ids))
+        conn.commit()
+        logger.info(f"VoBo: {cursor.rowcount} renglón(es) devueltos a la cola para reproceso.")
+        cursor.close()
+    except Exception as e:
+        logger.error(f"VoBo: error reactivando órdenes en la cola: {e}")
+
+
+def report_vobo_results(conn):
+    """Registra en el sheet de reproceso el resultado de cada orden con VoBo."""
+    for order_id in VOBO.ids():
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT status, cancellation_reason FROM amz_label_queue WHERE amazonorderid = %s",
+                (order_id,)
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            if not rows:
+                logger.warning(f"VoBo: la orden {order_id} no está en amz_label_queue. Sin intento.")
+                continue
+            if any(r[1] for r in rows):
+                VOBO.mark(order_id, EST_BLOCKED)  # cancelada en Amazon
+            elif all(r[0] == 'LABELS_GENERATED' for r in rows):
+                VOBO.mark(order_id, EST_OK)
+            else:
+                VOBO.mark(order_id, EST_FAIL)
+        except Exception as e:
+            logger.error(f"VoBo: error registrando resultado de {order_id}: {e}")
 
 
 def get_order_details_from_crawler(conn, amazonorderid):
@@ -490,9 +546,13 @@ def process_amazon_self_ship_labels():
     conn = get_db_connection()
     models, uid = connect_to_odoo()
 
+    VOBO.load()
+    reactivate_vobo_orders(conn)
+
     rows = fetch_pending_orders(conn)
     if not rows:
         logger.info("No hay órdenes pendientes.")
+        report_vobo_results(conn)
         if conn: conn.close()
         return
 
@@ -509,6 +569,7 @@ def process_amazon_self_ship_labels():
 
         # ids Odoo
         so_id, so_name = get_order_ids_from_odoo(models, uid, order_id)
+        VOBO.annotate(order_id, odoo_id=so_name)
         if not so_id:
             logger.warning(f"Orden {order_id} no encontrada en Odoo. Aún así se intentará generar guía.")
 
@@ -579,7 +640,9 @@ def process_amazon_self_ship_labels():
         # El ratio se calcula contra paid_by_buyer
         cost_ratio = total_shipping_cost_mxn / paid_by_buyer if paid_by_buyer > 0 else 0
 
-        if cost_ratio > LIMIT_RATIO_PERCENTAGE:
+        if cost_ratio > LIMIT_RATIO_PERCENTAGE and order_id in VOBO:
+            logger.info(f"VoBo: la orden {order_id} supera el límite ({cost_ratio:.1%}) pero tiene VoBo. Se continúa.")
+        elif cost_ratio > LIMIT_RATIO_PERCENTAGE:
             logger.warning(
                 f"RECHAZADA: Costo de envío excesivo (${total_shipping_cost_mxn:.2f}) representa el {cost_ratio:.1%} del valor (${paid_by_buyer:.2f}) de la orden {order_id}.")
             for row in order_rows:
@@ -723,6 +786,8 @@ def process_amazon_self_ship_labels():
                     carrier_service_level=None,
                     error_log=f"Se generaron guías para la orden {order_id}, pero ninguna correspondió a este SKU parent."
                 )
+
+    report_vobo_results(conn)
 
     if conn:
         conn.close()

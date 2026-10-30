@@ -18,6 +18,7 @@ variables:
   db_name: "tools"
   db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
   spreadsheet_tiktok_id: "1eMbXb_lb8WRYO1jr8jcBnfq495kaLc3Do9Wyf8BxTnM"
+  spreadsheet_reprocess_id: "1bnymFhXE75ejJVAF9FepTpBQrRocCcmE9NA6VO6-_ac"
 
 tasks:
   - id: working_env_tiktok
@@ -39,10 +40,6 @@ tasks:
           pullPolicy: NEVER
         # El reintento es seguro: una orden que ya tiene guía queda con
         # label_generated=1 en tools.shipping_labels y se omite en el reintento.
-        retry:
-          type: constant
-          interval: PT1M
-          maxAttempts: 3
         env:
           # ============================================================
           # --- API interna de cotización y generación de guías ---
@@ -89,6 +86,11 @@ tasks:
           odoo_dbV18: "{{ vars.odoo_db }}"
           SPREADSHEET_TIKTOK_ID: "{{ vars.spreadsheet_tiktok_id }}"
 
+          # --- Reproceso de guías con VoBo (sheet de control de reprocesamiento) ---
+          SPREADSHEET_REPROCESS_ID: "{{ vars.spreadsheet_reprocess_id }}"
+          MAX_REPROCESS_ATTEMPTS: "3"
+          VOBO_DRY_RUN: "false"
+
           # --- Ejecución ---
           # ERROR silencia el detalle técnico. El resumen operativo (una línea
           # por orden + totales) usa su propio logger y se ve de todas formas.
@@ -96,7 +98,7 @@ tasks:
           TIKTOK_BULKY_DRY_RUN: "false"
           TEST_API_LABELS_SR: "false"
           TIKTOK_BULKY_MAX_ORDERS: "0"
-          TIKTOK_BULKY_LOOKBACK_HOURS: 120"
+          TIKTOK_BULKY_LOOKBACK_HOURS: "120"
           TIKTOK_BULKY_PAGE_SIZE: "50"
           SLEEP_BETWEEN_ORDERS: "1"
 

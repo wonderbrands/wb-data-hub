@@ -31,6 +31,7 @@ from _00_shipping_labels_db import (
 )
 import pricing_check
 from pricing_check import check_pricing
+from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
 
 # ------------------------------------------------------------
 
@@ -878,6 +879,74 @@ def log_to_sr_sheet(sh_sr, sheet_name: str, row_data: list):
         logger.error(f"Sheet SR: ERROR FATAL al registrar en '{sheet_name}': {e}", exc_info=True)
 
 
+# --- REPROCESO CON VoBo ---
+
+# Órdenes con VoBo humano (sheet de reproceso). Se carga en el main.
+VOBO = VoboSheet('Coppel')
+
+# Hojas de log que significan "la validación de Odoo/Mirakl no pasa": no se reintenta.
+VOBO_BLOCKED_SHEETS = ('SO_no_bloqueadas / canceladas', 'PICK-pendiente', 'Fulfillment')
+# Hojas de log cuyo rechazo no deja registro en tools.shipping_labels por sí solo.
+VOBO_DB_SHEETS = VOBO_BLOCKED_SHEETS + ('Sin_cobertura',)
+
+# Columna (1-based) del ID de orden en 'Costo_guia_excesivo' (A=Fecha_Log, B=fecha, C=orden).
+COSTO_EXCESIVO_ORDER_COL = 3
+COSTO_EXCESIVO_ESTADO_COL = 9  # columna I
+
+
+def update_costo_excesivo_estado(sh_sr, order_id: str, estado: str):
+    """Escribe el estado del reproceso en la columna 'Estado' de 'Costo_guia_excesivo'."""
+    try:
+        worksheet = sh_sr.worksheet('Costo_guia_excesivo')
+        header = [h.strip().lower() for h in worksheet.row_values(1)]
+        estado_col = header.index('estado') + 1 if 'estado' in header else COSTO_EXCESIVO_ESTADO_COL
+        for row_number, value in enumerate(worksheet.col_values(COSTO_EXCESIVO_ORDER_COL), start=1):
+            if row_number > 1 and value.strip().lstrip("'") == order_id:
+                worksheet.update_cell(row_number, estado_col, estado)
+    except Exception as e:
+        logger.error(f"VoBo: no se pudo actualizar 'Estado' en Costo_guia_excesivo para {order_id}: {e}")
+
+
+def register_vobo_result(conn, sh_sr, order: dict, sheet_name: str, data: list):
+    """
+    Registra el resultado de una orden con VoBo a partir de la hoja de log a la
+    que cayó (la hoja ya resume el desenlace). Actualiza el sheet de reproceso,
+    la columna 'Estado' del sheet original y, cuando el flujo original no deja
+    huella en tools.shipping_labels, también la BD. Se ignora si no hay VoBo.
+    """
+    order_id = order['order_id']
+    if order_id not in VOBO:
+        return
+
+    if sheet_name == 'Guias_generadas':
+        estado = EST_OK
+    elif sheet_name in VOBO_BLOCKED_SHEETS or (
+            sheet_name == 'Sin_cobertura' and 'NO existe en Odoo' in str(data[4])):
+        estado = EST_BLOCKED
+    else:
+        estado = EST_FAIL
+
+    VOBO.annotate(order_id, odoo_id=data[2] if len(data) > 2 else None)
+    estado = VOBO.mark(order_id, estado)
+    if not estado:  # ya registrada en esta corrida
+        return
+    update_costo_excesivo_estado(sh_sr, order_id, estado)
+
+    if sheet_name in VOBO_DB_SHEETS:
+        for line in order.get('order_lines', []):
+            insert_shipping_label(
+                conn,
+                marketplace_id=order_id,
+                marketplace='Coppel',
+                sku=line.get('offer_sku'),
+                qty_ordered=int(line.get('quantity', 0)),
+                status=estado,
+                label_generated=False,
+                label_origin='SRS_GENERATED',
+                error_log=f"{sheet_name}: " + " | ".join(str(x) for x in data[4:6])
+            )
+
+
 # --- FUNCIONES CORE (COTIZACIÓN Y GUÍAS) ---
 
 def get_best_rates_per_box(payload: dict) -> Optional[dict]:
@@ -1122,6 +1191,8 @@ def procesar_ordenes_coppel():
         logger.error(f"No se pudo abrir el Google Sheet de Logs (SR) con ID {SPREADSHEET_ID_SR}: {e}")
         sh_sr = None  # El script continuará, pero sin loguear en SR
 
+    VOBO.load(gc)
+
     #Conexión Odoo
     models, db, uid, password = connect_to_odoo(ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD)
     if not models: return
@@ -1160,10 +1231,12 @@ def procesar_ordenes_coppel():
         # Si ya se procesó con éxito o es Fulfillment, la omitimos por completo y ahorramos procesamiento
         if db_sheet in ['Guias_generadas', 'Fulfillment']:
             logger.info(f"Orden {order_id} ya procesada exitosamente o permanentemente ({db_sheet}). Omitiendo.")
+            VOBO.mark(order_id, EST_OK if db_sheet == 'Guias_generadas' else EST_BLOCKED)
             continue
 
         # Función auxiliar para registrar en Sheets y DB evitando el spam
         def smart_log(sheet_name, data):
+            register_vobo_result(conn, sh_sr, order, sheet_name, data)
             if db_sheet == sheet_name:
                 logger.info(f"  -> Orden {order_id}: Ya registrada en '{sheet_name}'. Evitando spam en Sheets.")
             else:
@@ -1233,7 +1306,11 @@ def procesar_ordenes_coppel():
             continue
 
         # --- Check de pricing (ANTES de cotizar/generar guía) ---
-        pricing_problems = check_order_pricing(order, conn, gc)
+        if order_id in VOBO:
+            logger.info(f"VoBo: la orden {order_id} tiene VoBo. Se omite el check de pricing.")
+            pricing_problems = []
+        else:
+            pricing_problems = check_order_pricing(order, conn, gc)
         if pricing_problems:
             pricing_status, reason = pricing_check.resolve_pricing_outcome(pricing_problems)
             logger.warning(f"Orden {order_id}: pricing no aprobado ({pricing_status}): {pricing_problems}")
@@ -1316,7 +1393,9 @@ def procesar_ordenes_coppel():
         total_shipping_cost_cents = sum(r['total_price'] for r in best_rates_map.values())
         total_shipping_cost_mxn = total_shipping_cost_cents / 100.0
         cost_ratio = total_shipping_cost_mxn / total_order_value
-        if cost_ratio > PERCENTAGE_COST_LIMIT:
+        if cost_ratio > PERCENTAGE_COST_LIMIT and order_id in VOBO:
+            logger.info(f"VoBo: la orden {order_id} supera el límite ({cost_ratio:.1%}) pero tiene VoBo. Se continúa.")
+        elif cost_ratio > PERCENTAGE_COST_LIMIT:
             reason_int = f"Costo de envío excesivo: ${total_shipping_cost_mxn:.2f} ({cost_ratio:.1%})"
             reason = 'No fue posible generar guía: RSL'  # Rate Superior al Limite
             logger.warning(f"Orden {order_id} RECHAZADA: {reason_int}")
