@@ -261,7 +261,7 @@ ORDER BY posted_date DESC;
 SELECT * FROM somos_reyes.amz_transactions LIMIT 1;
 
 SELECT * FROM somos_reyes.amz_b2b_invoices
-WHERE order_id in ('701-2593380-9743412');#LIMIT 1;
+WHERE order_id in ('702-6841264-9666630');#LIMIT 1;
 
 SELECT * FROM somos_reyes.amz_settlement_report order by updated_at DESC LIMIT 10;
 
@@ -272,41 +272,57 @@ SELECT status, COUNT(*), SUM(amount)
 FROM finance.mkp_payments_staging WHERE marketplace='AMAZON' GROUP BY status;
 
 SELECT * FROM somos_reyes.amz_transactions
-WHERE order_id in ('701-2593380-9743412'); 
+WHERE order_id in ('702-6841264-9666630'); 
 
 # somos_reyes-amz_transaction_items--701-0599283-6185052
 SELECT * FROM somos_reyes.amz_transaction_items
-WHERE order_id in ('701-2593380-9743412');   
+WHERE order_id in ('702-6841264-9666630');   
 
 SELECT count(*) as TOTAL, marketplace FROM finance.mkp_billing_staging group by marketplace;
 
-SELECT * FROM finance.mkp_billing_staging WHERE marketplace='Amazon';
+# B2B contra el CFDI de Amazon y B2C a público en general
+SELECT * FROM finance.mkp_billing_staging WHERE marketplace='AMAZON';
 
-SELECT s.mkp_order_id, s.odoo_so_name, s.created_at, f.uuid
-FROM finance.mkp_billing_staging s
-JOIN somos_reyes.amz_b2b_invoices f ON f.order_id=s.mkp_order_id
-AND f.receipt_type='I'
-AND (f.status IS NULL OR f.status<>'CANCEL')
-WHERE s.marketplace='AMAZON' AND s.status='ODOO_INVOICED';
+# Liberado, lo aplicado y el excedente en error_log
+SELECT * FROM finance.mkp_payments_staging
+WHERE marketplace='AMAZON'
+AND mkp_order_id = '702-6841264-9666630';
 
-SELECT COUNT(*) b2b_en_ventana, SUM(s.id IS NOT NULL) ya_en_control
-FROM (SELECT DISTINCT f.order_id FROM somos_reyes.amz_b2b_invoices f
-JOIN somos_reyes.amz_transactions t ON t.order_id=f.order_id
-WHERE f.receipt_type='I'
-AND (f.status IS NULL OR f.status<>'CANCEL') AND t.description='Order Payment' AND t.transaction_status<>'DEFERRED'
-AND DATE(DATE_SUB(t.posted_date, INTERVAL 6 HOUR)) BETWEEN '2026-07-20' AND '2026-08-26') o
-LEFT JOIN finance.mkp_billing_staging s ON s.marketplace='AMAZON' AND s.mkp_order_id=o.order_id;
 
+
+# ******************************************************************
+# ========== CAUTION  CAUTION  CAUTION  CAUTION  CAUTION ==========
+DELETE FROM finance.mkp_payments_staging WHERE marketplace='AMAZON';
+DELETE FROM finance.mkp_billing_staging WHERE marketplace='AMAZON';
+# =================================================================
+# ******************************************************************
 
 
 # ===================================================================
 SELECT marketplace, mkp_order_id, odoo_so_name, total_amount, status, error_log, created_at, processed_at
 FROM finance.mkp_billing_staging WHERE created_at > '2026-09-18' order by id DESC LIMIT 500;
 
-UPDATE finance.mkp_billing_staging SET status='PENDING_WB_INVOICE', cfdi_uuid=NULL, error_log=NULL, retry_count_loader=0, raw_json=NULL WHERE marketplace='AMAZON';
+SELECT status, COUNT(*) FROM finance.mkp_billing_staging WHERE marketplace='AMAZON' GROUP BY status;
+SELECT mkp_order_id, status, error_log FROM finance.mkp_billing_staging WHERE odoo_so_name='SO10293777';
 
 # ========================== PAGOS ==========================
 
 SELECT * FROM finance.mkp_payments_staging 
-order by created_at DESC LIMIT 2;
+WHERE marketplace = 'AMAZON' order by id DESC;
 
+
+SELECT mkp_order_id, error_log
+FROM finance.mkp_payments_staging
+WHERE marketplace='AMAZON' AND
+(error_log LIKE '%CENTAVO%' OR error_log LIKE '%REDONDEO%');
+
+
+UPDATE finance.mkp_payments_staging
+SET status='PENDING', error_log=NULL, processed_at=NULL
+WHERE marketplace='AMAZON' AND mkp_order_id = '702-6841264-9666630';
+
+SELECT * FROM finance.mkp_payments_staging
+WHERE marketplace='AMAZON' AND mkp_order_id = '702-6841264-9666630';
+
+SELECT * FROM finance.mkp_billing_staging
+WHERE marketplace='AMAZON' AND mkp_order_id = '701-3940186-6256218';

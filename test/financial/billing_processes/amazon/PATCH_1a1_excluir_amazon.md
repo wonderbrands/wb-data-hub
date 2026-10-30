@@ -1,86 +1,84 @@
-# Patch: excluir Amazon de `facturacion_automatica_1a1.py`
+# Corte: Amazon sale del 1a1 y pasa a `01_amz_billing.py`
 
-Amazon pasa a tener su propio proceso (`01_amz_billing.py`). El script 1 a 1 debe dejar de facturarlo, o las dos corridas competirían por las mismas órdenes.
+**Estado (2-oct-2026):** cambio de código listo en el PR [wonderbrands/wb-data-hub#5](https://github.com/wonderbrands/wb-data-hub/pull/5), **sin mergear**. El filtro `marketplace` de ML, que es prerrequisito, está en el PR [wonderbrands/wb-data-hub#4](https://github.com/wonderbrands/wb-data-hub/pull/4).
 
-> **No apliques este patch hasta que `01_amz_billing.py` esté validado en pruebas.** El orden correcto es el de la sección "Secuencia de corte" al final. Entre medias hay una ventana en la que Amazon se queda sin facturar por nadie.
+Decisión del Tech Lead: Amazon sale del 1a1 desde el **2-oct-2026**. Las órdenes de octubre se facturan con el proceso nuevo dentro del mes.
 
 ---
 
-## El cambio
+## El cambio (PR #5)
 
-Archivo: `processes/wonderbrands/financial/billing_processes/odoo/facturacion_automatica_1a1.py`
-Función: `filter_and_group_by_team()`, al final (~línea 640)
+`processes/wonderbrands/financial/billing_processes/odoo/facturacion_automatica_1a1.py`, en `filter_and_group_by_team()`:
 
 ```python
     teams_dict.pop('Team_Walmart', None)
     teams_dict.pop('Salderos / Facebook', None)
 
-+   # Amazon migro a su propio proceso: test/financial/billing_processes/amazon/01_amz_billing.py
-+   # Necesita reglas que el resto de marketplaces NO debe heredar (exclusion
-+   # de ordenes B2B y facturacion sin restriccion de OUT).
-+   # Se remueve por coincidencia de nombre, igual que account_for_team().
-+   for _team in [t for t in teams_dict if 'Amazon' in t]:
-+       teams_dict.pop(_team, None)
-
-    return teams_dict
+    for _team in [t for t in teams_dict if 'Amazon' in t]:
+        teams_dict.pop(_team, None)
 ```
 
-Se filtra por coincidencia (`'Amazon' in t`) y no por nombre exacto porque `account_for_team()` ya usa ese criterio — si existieran `Team_Amazon` y `Team_Amazon_FBA`, ambos quedan cubiertos.
+El equipo en Odoo es `Team_Amazon`. Se filtra por coincidencia de nombre, el mismo criterio que `account_for_team()`, para cubrir cualquier variante.
 
-**Verificar antes de aplicar** cuáles son los nombres reales:
+`context.accounts['amazon']` y la rama `'Amazon' in team_name` de `account_for_team()` no se tocan: no cuestan nada y evitan un `KeyError` si algo vuelve a entrar.
 
-```python
-models.execute_kw(db, uid, pwd, 'crm.team', 'search_read',
-                  [[('name', 'ilike', 'Amazon')]], {'fields': ['id', 'name']})
+---
+
+## Reglas del corte
+
+**R1. El 1a1 deja de facturar todo Amazon, de cualquier fecha.** No se usa un corte por fecha como `cutoff_ml`: el 1a1 filtra por `date_order` y `01` por `posted_date`, así que una fecha deja una franja de órdenes visible para los dos flujos. Son flujos de Kestra distintos y su `concurrency: limit 1` no los separa entre sí; es el patrón del incidente del 26-jul.
+
+**R2. `01` factura desde `AMZ_START_DATE` (`posted_date`, hora CDMX), sin `AMZ_END_DATE`.** Es la única fecha de corte. Propuesta: `2026-04-17`, el arranque de Odoo 18 en producción, para que el barrido histórico cubra lo que el 1a1 dejó sin facturar.
+
+Rezago medido por el Tech Lead, SO de Amazon pendientes de factura en Odoo:
+
+| Mes | abr | may | jun | jul | ago | sep | **Total** |
+|---|---|---|---|---|---|---|---|
+| SO | 135 | 190 | 436 | 128 | 126 | 73 | **1,088** |
+
+**R3. Lo que el 1a1 ya facturó dentro de la ventana no se toca.** `01` lo ve como `ALREADY_ODOO_INVOICED` por la idempotencia compartida (`ref = AUTOINV:<SO>` + `invoice_origin`). Esto incluye las B2B que el 1a1 facturó a público en general cuando Amazon ya había emitido el CFDI (doble CFDI): `01` **no** las corrige. Se identifican con `000_historical_billing_back_analysis.py` y su corrección es decisión de Finanzas.
+
+**R4. Lo anterior a `AMZ_START_DATE` sin factura no lo factura nadie.** Con `AMZ_START_DATE = 2026-04-17` el universo queda cubierto desde el arranque de Odoo 18.
+
+**R5. Prerrequisitos en producción:**
+
+| Prerrequisito | Estado |
+|---|---|
+| Filtro `marketplace` en los 4 scripts de ML | PR #4, sin mergear |
+| `status` de `mkp_*_prod` en `VARCHAR(40)` | ✅ |
+| Diario *Amazon Settlements* → `102.02.008`, con la configuración de "Pagado" | Lo crea Finanzas en producción |
+| Índices MySQL de las fuentes de Amazon | Pendiente (ver abajo) |
+| Flujos de Kestra de Amazon (facturación y cobros) | Pendiente |
+| Nombre del equipo en Odoo | ✅ `Team_Amazon` |
+| Tope de arranque `AMZ_PROD_MAX_FACTURAS` | ✅ en `01` |
+
+**R6. Secuencia:**
+
+1. Mergear el PR #4 (ML). No cambia el comportamiento de ML.
+2. Esperar a que no haya un 1a1 corriendo y mergear el PR #5. Desde la siguiente ejecución del 1a1, nadie factura Amazon hasta el paso 4.
+3. Cargar los flujos de Kestra de Amazon en un horario que **nunca** se cruce con el del 1a1.
+4. Primera corrida de `01` en producción con `AMZ_PROD_MAX_FACTURAS` (por ejemplo 50) y revisión manual. Después, el barrido por tramos.
+
+**R7. Controles después de cada corrida:**
+
+- La query de doble CFDI devuelve 0: ninguna orden con CFDI de Amazon Business facturada como B2C por `01`.
+- Ninguna SO con más de una factura viva sin desglose B2B.
+
+**R8. Reversa:** pausar el flujo de Amazon y revertir el commit del PR #5. La idempotencia compartida evita que el 1a1 duplique lo que `01` haya facturado.
+
+---
+
+## Índices pendientes
+
+La query del lote (`QUERY_LOTE`) tarda más de 4 min. En Kestra eso es un timeout esperando a pasar. Antes de crearlos hay que ver qué existe (`SHOW INDEX FROM ...`):
+
+```sql
+somos_reyes.amz_transactions       (description, transaction_status, posted_date)
+somos_reyes.amz_transactions       (shipment_id, posted_date)
+somos_reyes.amz_transactions       (order_id)
+somos_reyes.amz_transaction_items  (transaction_id)
+somos_reyes.amz_b2b_invoices       (order_id, receipt_type)
+somos_reyes.amazon_orders          (amazonorderid)
+somos_reyes.odoo_master_txns_c     (marketplace_order_id)
+somos_reyes.amz_settlement_report  (settlement_id)
 ```
-
----
-
-## Lo que NO se toca
-
-`context.accounts['amazon']` y la rama `'Amazon' in team_name` de `account_for_team()` se quedan como están. Cuestan nada y evitan un `KeyError` si algo vuelve a entrar por ahí.
-
----
-
-## Por qué el prefijo de idempotencia es compartido
-
-`01_amz_billing.py` escribe `ref = 'AUTOINV:<SO>'` — el **mismo** prefijo que el 1 a 1.
-
-Es deliberado. Durante la transición los dos scripts pueden llegar a ver la misma orden, y `count_live_invoices()` de ambos busca por `invoice_origin` **o** por `ref`. Comparten la llave, así que cada uno ve las facturas del otro y ninguno puede duplicar.
-
-Si le pusiéramos un prefijo distinto (`AMZINV:`), cada script sería ciego a las facturas del otro. Sería exactamente el escenario del 26-jul: dos procesos con snapshots independientes que no se ven.
-
----
-
-## Secuencia de corte
-
-Sin traslape y sin hueco:
-
-1. **Crear las tablas** — `DDL_amz_tables.sql`.
-2. **Verificar el diario `AMZ`** — que exista y apunte a `102.02.008`. `03_loader_amz_payments.py` aborta si no.
-3. **Correr `01_amz_billing.py` con `TEST_ORDER_LIMIT = 5`**, con el 1 a 1 todavía facturando Amazon. Las 5 órdenes de prueba deben salir como `IGNORED_DUPLICATE` si el 1 a 1 ya las tomó — eso **prueba que la idempotencia compartida funciona**. Si alguna se factura dos veces, parar todo.
-4. **Definir `AMZ_START_DATE`** con Finanzas. Marca desde cuándo aplica la facturación sin restricción de OUT. Órdenes anteriores conservan el tratamiento actual.
-5. **Aplicar este patch** y desplegar el 1 a 1 sin Amazon.
-6. **Activar `01_amz_billing.py` en Kestra** con `concurrency: limit 1, behavior: FAIL`. No es opcional.
-7. **Quitar `TEST_ORDER_LIMIT`** (ponerlo en `None`) una vez validado.
-
-Entre los pasos 5 y 6 nadie factura Amazon. Que sea el mismo despliegue.
-
----
-
-## Riesgo abierto: el backlog del cambio de regla
-
-En el momento en que se factura sin restricción de OUT, todas las órdenes de Amazon que hoy quedan fuera se vuelven elegibles **de golpe**.
-
-`AMZ_START_DATE` es la contención: acota el universo a órdenes recientes. Pero conviene medir el volumen antes de correr en serio:
-
-```python
-# Cuántas órdenes de Amazon se volverían facturables
-domain = [('team_id', 'in', team_ids),
-          ('state', '=', 'sale'),
-          ('invoice_status', '=', 'to invoice'),
-          ('date_order', '>=', '2026-08-01')]
-models.execute_kw(db, uid, pwd, 'sale.order', 'search_count', [domain])
-```
-
-Si el número sorprende, subir `AMZ_START_DATE` antes de la primera corrida real.

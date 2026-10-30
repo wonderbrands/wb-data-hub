@@ -228,9 +228,11 @@ cfdi_iva   = our_price_tax + shipping_tax + shipping_tax_discount + our_price_ta
 cfdi_total = cfdi_base + cfdi_iva
 
 neto = cfdi_total + amazon_fees + marketplace_vat_principal
-                  + marketplace_vat_shipping + amazon_for_all_fee + shipping_hb
-     = total_amount   (cabecera de amz_transactions)
+                  + marketplace_vat_shipping
+     = item_amount por pieza  ·  = total_amount   (cabecera de amz_transactions)
 ```
+
+**`amazon_fees` ya incluye `amazon_for_all_fee` y `shipping_hb`.** Sumarlos aparte los cuenta dos veces (24% de las piezas los traen). Con solo `amazon_fees` el 99.7% de las piezas cuadra contra `item_amount`. `marketplace_vat_*` es el IVA que retiene Amazon (50% del IVA del CFDI).
 
 Verificación (`702-6941044-9293042`, envío gratis promocional):
 `1555.21 + 50.86 − 50.86 = 1555.21` base · `248.83 + 8.14 − 8.14 = 248.83` IVA (16% exacto) · `1804.04 − 444.45 − 124.42 = 1235.17 = total_amount` ✓
@@ -280,6 +282,8 @@ Amazon **no expone el XML** del CFDI de Amazon Business. `amz_b2b_invoices` solo
 
 Todos en `test/financial/billing_processes/amazon/`.
 
+**Producción (29-oct-2026):** `_amz_common`, `00_amz_precheck_prod` (solo lectura), `01`, `02`, `03` y `11` están copiados **idénticos** en `processes/wonderbrands/financial/billing_processes/amazon/`, con `ACTIVAR_AMAZON_PRODUCCION.md`. Flujos: `flows/wonderbrands/financial/amazon/amz_billing_payments_flow.yml` (00→01→02→03, inputs `settlement_id`, `max_facturas`, `payments_batch`, `cobros`) y `amz_cierre_205_flow.yml` (11 + correo). Cron de los dos **apagado** hasta el barrido. Todo cambio a un script va en las dos copias.
+
 | Script | Función | Estado |
 |---|---|---|
 | `_amz_common.py` | Config, interruptor `ENTORNO`, `OdooModelProxy`, cuentas | ✅ |
@@ -288,6 +292,10 @@ Todos en `test/financial/billing_processes/amazon/`.
 | `03_loader_amz_payments.py` | **Loader** de cobros: aplica pagos en Odoo | 🔨 pruebas |
 | `000_historical_billing_back_analysis.py` | Detecta doble CFDI (Amazon + nuestro). Solo lectura | ✅ |
 | `05_amz_orders_control.py` | Control cruzado Odoo ↔ Amazon ↔ facturas. Solo alerta | ✅ |
+| `06_reset_lote_test.py` | Libera órdenes en el espejo (solo staging). `RESET_ORDENES` = lista explícita | 🔨 pruebas |
+| `09_reporte_lote_finanzas.py` | Excel del lote para Finanzas (modo settlement con `AMZ_SETTLEMENT_ID`) | ✅ |
+| `10_conciliar_205.py` | Rehace la conciliación 205.06.003 de facturas ya creadas | ✅ |
+| `11_ajuste_cogs_205.py` | Ajuste mensual al COGS por diferencia de costeo factura vs salida | ✅ |
 | `AMZ_facturacion_corregida.sql` | Reporte BI 3.0 con los 3 fixes | ✅ |
 | `04_amz_billing_test_batch.py` | **DEPRECADO** — absorbido por `01` | ⛔ |
 | `DDL_amz_tables.sql` | **DEPRECADO** — se usan las tablas `mkp_*` | ⛔ |
@@ -305,13 +313,37 @@ PENDING_WB_INVOICE     nos toca emitir el CFDI
 PROCESSING             tomada por una corrida (candado)
 ODOO_B2B_LINKED        factura creada con el UUID de Amazon sellado
 ODOO_INVOICED          CFDI emitido por WB
-ALREADY_ODOO_INVOICED  ya tenía factura viva en Odoo
+ALREADY_ODOO_INVOICED  ya tenía factura viva en Odoo (incluye factura global)
+B2B_FACTURADA_PG       B2B con factura viva a público general: anularla antes de vincular (se reevalúa)
 SKIPPED_GRACE          dentro del periodo de gracia
-SO_CANCELLED           SO cancelada → requiere NC Tipo A
-SO_DRAFT               SO en borrador, fuera de alcance
+SO_CANCELLED           ya no se produce: la SO cancelada SE FACTURA (NC por devoluciones)
+SO_DRAFT               SO en borrador que Odoo no dejó confirmar (la que sí, se confirma y factura)
 NO_SO_IN_ODOO          sin SO cruzada → solo alerta
+ENVIO_SIN_CONFIRMAR    OrderTotal > SO y ninguna segunda fuente confirma envío (se reevalúa)
 ERROR                  fallo recuperable
 ```
+
+`status` es `varchar(40)` en staging y prod. Staging era `varchar(20)` y truncaba `ALREADY_ODOO_INVOICED` (corregido el 28-oct-2026).
+
+## Reglas del correo de Finanzas del 28-oct-2026 (flujo v2)
+
+- **Toda venta que Amazon cobró se factura.** SO en borrador → `action_confirm` y factura. SO cancelada → se factura sin reabrirla (la NC sale por devoluciones). Las excepciones viejas (`SO_DRAFT`, `SO_CANCELLED`, `B2B_NO_RECEPTOR`, `B2B_FACTURADA_PG`) se reevalúan en cada corrida.
+- **Factura global:** `facturas_existentes()` también lee `sale.order.invoice_ids`; una SO dentro de una global (invoice_origin con comas) no se refactura.
+- **Cliente B2B nuevo:** se crea con el RFC del CFDI y teléfono/correo genéricos de Yuju (`11111` / `market@somos-reyes.com`).
+- **205.06.003 (Mercancías facturadas - no enviadas):** `conciliar_salida()` en 01, después de publicar: rompe la conciliación de la salida con facturas canceladas o revertidas, concilia la factura vieja con su NC si la hubo, y concilia la vigente con la salida (por producto; kits por importe). Con OUT posterior, Odoo concilia solo al validar la salida. Si el costo promedio cambió entre factura y salida queda un residuo en la 205.06.003 (probado: +10% → 106.14).
+- **Primera corrida en producción = un settlement completo:** `AMZ_SETTLEMENT_ID` en 01, 02 y 09 (`AMZ_ORDER_IDS` agrega órdenes sueltas, solo pruebas).
+- **XML-RPC:** `reconcile` y `remove_move_reconcile` no devuelven nada; hacen el trabajo y fallan al responder ("cannot marshal None"). Usar `ejecutar_sin_retorno()` y confirmar leyendo.
+
+## Reglas del correo de Finanzas del 28-oct-2026, segundo
+
+- **Kits en SO cancelada:** la línea del kit se crea **sin** `sale_line_ids` para que Odoo tome el costo del kit (ligada, el costo sale 0 porque los movimientos están cancelados), y **después de publicar** se vuelve a ligar (`religar_kits`): el asiento no cambia y la SO ve su factura. En SO no cancelada se deja ligada (costo exacto de los componentes). La 205.06.003 de una SO cancelada se concilia con la NC, no con un OUT.
+- **Kit con lista de materiales en 0** (TOLIXKIT#4-CLA1ROJ / CLA1BLA piden 0 sillas → costo del kit 0): la factura sale sin costo; 01 lo avisa (`kit_sin_costo`) y el cierre mensual asienta el costo de lo que salió. Corregir la lista es de Catálogo.
+- **Envío:** Yuju no pone C-ENVIO en la SO. Fuente 1: campos de envío del settlement. Si no vienen, `OrderTotal − SO` es envío solo si lo confirma el **depósito** (`item_amount − venta − comisiones − IVA retenido = envío × (1 − 0.08/1.16)`) o la **API** (`getOrderItems` ShippingPrice + ShippingTax). Sin confirmación → `ENVIO_SIN_CONFIRMAR`. La cuenta 401.01.002 la pone el producto C-ENVIO (no se fuerza en el script).
+- **Factura ya emitida sin envío** (1a1): factura aparte `AUTOINV:<SO>:ENVIO` con solo C-ENVIO. 01 no la cuenta como duplicado; 03 reparte el cobro entre las dos y la regla de promoción usa la suma.
+- **Envío fuera de los campos del settlement:** 02 lo suma al cobro (3 órdenes sep-oct, todas FBA de $59).
+- **B2C:** el centavo se ajusta para que la factura sea igual a OrderTotal (mismo mecanismo que B2B).
+- **Cierre mensual de la 205.06.003** (`11_ajuste_cogs_205.py`): SO de Amazon con cada línea entregada y facturada completa (`qty_delivered`/`qty_invoiced` por línea; `delivery_status` no basta con devoluciones), factura propia y salida en la 205.06.003. Residuo → 501.01.001 con conciliación completa. Dos etiquetas: "…diferencia de costeo de producto entre facturación y salida" y "…diferencia entre kit facturado y componentes despachados" (incluye factura de kit sin costo). Reporte `reporte_kits_<mes>.csv`: diferencia de costo / de cantidad / factura sin costo. **No ajusta** (solo cuenta): devoluciones pendientes de NC, facturas globales, y SO cuya salida no está en la 205.06.003 (hueco histórico del 1a1: ~855 SO).
+- **Redondeo:** 704.23.001 confirmada para producción. **B2B ya facturada a público general:** cancelación SAT motivo 02.
 
 ## `payment_id` compuesto en cobros
 

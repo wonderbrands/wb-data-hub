@@ -1,4 +1,5 @@
 """
+
 02_miner_amz_payments.py
 ------------------------
 MINER DE COBROS AMAZON
@@ -134,6 +135,7 @@ hay que corregir.
 """
 
 import os
+import re
 import sys
 import time as tm
 import logging
@@ -202,7 +204,25 @@ SOLO_FACTURADAS = os.getenv(
 # Estados de mkp_billing_* que cuentan como "tiene factura viva en Odoo".
 # Incluye ALREADY_ODOO_INVOICED igual que 03_miner_ml_payments.py: una orden
 # facturada por otra via sigue necesitando que se le aplique el cobro.
-STATUS_FACTURADAS = ('ODOO_INVOICED', 'ODOO_B2B_LINKED', 'ALREADY_ODOO_INVOICED')
+#
+# B2B_FACTURADA_PG tambien: la orden tiene una factura viva a publico general
+# (pendiente de anular para vincular el CFDI de Amazon) y el dinero ya llego.
+STATUS_FACTURADAS = ('ODOO_INVOICED', 'ODOO_B2B_LINKED', 'ALREADY_ODOO_INVOICED',
+                     'B2B_FACTURADA_PG')
+
+# Primera corrida en produccion: un settlement completo (correo de Jero,
+# 28-oct-2026). Con AMZ_SETTLEMENT_ID se leen solo los cobros de ese
+# settlement y la marca de agua no aplica. Debe ir con el mismo valor que en
+# 01_amz_billing.py.
+AMZ_SETTLEMENT_ID = os.getenv('AMZ_SETTLEMENT_ID', '').strip() or None
+
+# Ordenes sueltas de pruebas (mismas que en 01): sus cobros entran aunque
+# esten en otro settlement, siempre que ese settlement ya este depositado.
+AMZ_ORDER_IDS = [o.strip() for o in os.getenv('AMZ_ORDER_IDS', '').split(',') if o.strip()]
+
+# Con alcance, se leen depositos desde SETTLEMENT_MARGEN_DIAS antes del
+# deposito del settlement, para alcanzar los cobros de las ordenes sueltas.
+SETTLEMENT_MARGEN_DIAS = 60
 
 # Margen hacia atras sobre la marca de agua: Amazon puede re-publicar una
 # transaccion despues de que la procesamos.
@@ -241,9 +261,10 @@ SELECT
 
     -- Comisiones (negativas). Diferencia entre lo facturado y lo depositado;
     -- explica el saldo de 102.02.008 contra el extracto bancario.
+    -- amazon_fees YA incluye amazon_for_all_fee y shipping_hb: sumarlos
+    -- aparte los contaba dos veces. cfdi_total + fees_total = amount_deposited.
     ROUND(SUM(IFNULL(b.amazon_fees,0) + IFNULL(b.marketplace_vat_principal,0)
-            + IFNULL(b.marketplace_vat_shipping,0) + IFNULL(b.amazon_for_all_fee,0)
-            + IFNULL(b.shipping_hb,0)), 2)       AS fees_total,
+            + IFNULL(b.marketplace_vat_shipping,0)), 2)       AS fees_total,
 
     ROUND(SUM(IFNULL(b.item_amount,0)), 2)       AS amount_deposited
 
@@ -286,6 +307,7 @@ WHERE a.transaction_status <> 'DEFERRED'
   AND a.description = 'Order Payment'
   AND e.deposit_date >= %s
   AND e.deposit_date <= NOW()
+  {FILTRO_SETTLEMENT}
 
 GROUP BY a.settlement_id, a.order_id, c.so, e.deposit_date
 HAVING cfdi_total > 0
@@ -300,8 +322,23 @@ def construir_query():
     parametros posicionales que ya tiene QUERY_COBROS. La lista de estados se
     interpola porque es una constante del codigo, no un dato de entrada.
     """
+    # Settlement y ordenes vienen de la configuracion; se validan contra su
+    # formato (digitos / 999-9999999-9999999) antes de interpolarlos.
+    filtro = ''
+    if AMZ_SETTLEMENT_ID:
+        if not AMZ_SETTLEMENT_ID.isdigit():
+            raise Exception(f"AMZ_SETTLEMENT_ID invalido: '{AMZ_SETTLEMENT_ID}'")
+        partes = [f"a.settlement_id = '{AMZ_SETTLEMENT_ID}'"]
+        if AMZ_ORDER_IDS:
+            malas = [o for o in AMZ_ORDER_IDS if not re.fullmatch(r'\d{3}-\d{7}-\d{7}', o)]
+            if malas:
+                raise Exception(f"AMZ_ORDER_IDS invalidos: {malas}")
+            partes.append(f"a.order_id IN ({', '.join(repr(o) for o in AMZ_ORDER_IDS)})")
+        filtro = f"AND ({' OR '.join(partes)})"
+    sql = QUERY_COBROS.replace('{FILTRO_SETTLEMENT}', filtro)
+
     if not SOLO_FACTURADAS:
-        return QUERY_COBROS.replace('{JOIN_FACTURADAS}', '')
+        return sql.replace('{JOIN_FACTURADAS}', '')
 
     estados = ', '.join(f"'{s}'" for s in STATUS_FACTURADAS)
     join = (f"-- ALCANCE ACOTADO: solo ordenes ya facturadas en Odoo\n"
@@ -309,7 +346,7 @@ def construir_query():
             f"    ON fac.marketplace = '{MARKETPLACE}'\n"
             f"   AND fac.mkp_order_id = a.order_id\n"
             f"   AND fac.status IN ({estados})")
-    return QUERY_COBROS.replace('{JOIN_FACTURADAS}', join)
+    return sql.replace('{JOIN_FACTURADAS}', join)
 
 
 # =============================================================================
@@ -373,13 +410,26 @@ def upsert_cobros(db_conn, rows):
     """
     cursor = db_conn.cursor()
     res = {'insertados': 0, 'refrescados': 0, 'protegidos': 0,
-           'parciales': [], 'sin_so': []}
+           'parciales': [], 'sin_so': [], 'envio_oculto': []}
 
     for r in rows:
         order_id = r['mkp_order_id']
         settlement_id = str(r['settlement_id'])
         payment_id = build_payment_id(settlement_id, order_id)
         importe = a_float(r['cfdi_total'])
+
+        # Envio acreditado FUERA de los campos de envio (correo de Jero del
+        # 28-oct, segundo, 701-4769487-1597824): Amazon deposito 221.32 contra 166.39
+        # de venta - comisiones - IVA retenido. La diferencia, 54.93, es un
+        # envio de 59.00 menos los 4.07 de IVA que Amazon retiene sobre el.
+        # El cobro es lo que Amazon acredito, asi que se suma el envio. 3
+        # ordenes asi entre sep y oct.
+        excedente = round(a_float(r['amount_deposited']) - importe
+                          - a_float(r['fees_total']), 2)
+        if excedente > 0.005:
+            oculto = round(excedente / (1 - 0.08 / 1.16), 2)
+            importe = round(importe + oculto, 2)
+            res['envio_oculto'].append(f"{order_id} / {settlement_id}: envio {oculto:,.2f}")
 
         if not r['odoo_so_name']:
             res['sin_so'].append(order_id)
@@ -425,10 +475,26 @@ def upsert_cobros(db_conn, rows):
 def run():
     db_conn = get_db_connection()
 
-    watermark = get_watermark(db_conn)
-    desde = aplicar_lookback(watermark)
-    log.info(f"Marca de agua: {watermark} | leyendo desde {desde} "
-             f"(lookback {LOOKBACK_DAYS} dias)")
+    if AMZ_SETTLEMENT_ID:
+        cur = db_conn.cursor()
+        cur.execute("""SELECT MAX(deposit_date) FROM somos_reyes.amz_settlement_report
+                       WHERE settlement_id = %s""", (AMZ_SETTLEMENT_ID,))
+        fila = cur.fetchone()
+        cur.close()
+        if not fila or not fila[0]:
+            raise Exception(f"El settlement {AMZ_SETTLEMENT_ID} no tiene fecha de "
+                            f"deposito: todavia no se libera.")
+        deposito = fila[0]
+        desde = ((deposito - timedelta(days=SETTLEMENT_MARGEN_DIAS)) if AMZ_ORDER_IDS
+                 else deposito).strftime('%Y-%m-%d %H:%M:%S')
+        log.info(f"ALCANCE: settlement {AMZ_SETTLEMENT_ID} (depositado {deposito})"
+                 f"{f' + {len(AMZ_ORDER_IDS)} orden(es) sueltas' if AMZ_ORDER_IDS else ''}. "
+                 f"Depositos desde {desde}. La marca de agua no aplica.")
+    else:
+        watermark = get_watermark(db_conn)
+        desde = aplicar_lookback(watermark)
+        log.info(f"Marca de agua: {watermark} | leyendo desde {desde} "
+                 f"(lookback {LOOKBACK_DAYS} dias)")
 
     if SOLO_FACTURADAS:
         log.warning(f"ALCANCE ACOTADO: solo ordenes con factura en Odoo "
@@ -466,6 +532,11 @@ def run():
     log.info('')
     log.info(f"Insertados   : {res['insertados']}")
     log.info(f"Refrescados  : {res['refrescados']}")
+    if res['envio_oculto']:
+        log.info(f"Con envio fuera de los campos de envio (sumado al cobro): "
+                 f"{len(res['envio_oculto'])}")
+        for e in res['envio_oculto']:
+            log.info(f"  {e}")
     log.info(f"Protegidos   : {res['protegidos']}  (ya cobrados en Odoo)")
 
     if res['sin_so']:

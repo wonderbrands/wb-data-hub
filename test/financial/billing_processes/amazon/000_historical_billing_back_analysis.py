@@ -23,8 +23,17 @@ CLASIFICACION
 ===============================================================================
 Para cada orden de Amazon con CFDI de Amazon Business:
 
-  DOBLE_CFDI          Amazon timbro Y nosotros timbramos, con UUID distintos.
+  DOBLE_CFDI          Amazon timbro Y nosotros timbramos, con UUID distintos,
+                      y nuestra factura sigue viva sin NC que la contrarreste.
                       >>> INCIDENCIA FISCAL. Es lo que hay que corregir.
+                      Incluye la refacturacion al cliente con su RFC: si
+                      Amazon ya emitio el CFDI B2B, nuestra refactura es un
+                      segundo comprobante al mismo cliente.
+
+  DOBLE_CFDI_CON_NC   Hubo doble CFDI, pero nuestra factura esta
+                      contrarrestada por una nota de credito viva. El efecto
+                      contable y fiscal ya se corrigio; quedan los tres
+                      comprobantes (Amazon, el nuestro y la NC). Informativo.
 
   VINCULADA_OK        Nuestra factura en Odoo lleva el UUID de Amazon.
                       Correcto: es "jalar el CFDI", no una segunda emision.
@@ -61,7 +70,9 @@ load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Claude_proyect
 # CONFIGURACION
 # =============================================================================
 
-FECHA_DESDE = '2026-01-01'      # desde cuando revisar
+# Desde cuando revisar. Por defecto el arranque de Odoo 18 en produccion
+# (17-abr-2026): antes de esa fecha las facturas no viven en esta instancia.
+FECHA_DESDE = os.getenv('AMZ_DOBLE_DESDE', '2026-04-17')
 CHUNK_ODOO = 200                # SOs por consulta a Odoo
 OUT_CSV = f"amz_doble_facturacion_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 
@@ -160,8 +171,11 @@ LEFT JOIN (
     FROM somos_reyes.amazon_orders
     GROUP BY amazonorderid
 ) d ON i.order_id = d.amazonorderid
-WHERE i.receipt_type = 'Invoice'
-  AND (i.status IS NULL OR i.status <> 'Cancelado')
+-- Mismos filtros que 01_amz_billing.py. La version anterior usaba
+-- receipt_type = 'Invoice' y status <> 'Cancelado', valores que la tabla no
+-- tiene ('I' y 'CANCEL'): el analisis devolvia cero casos.
+WHERE i.receipt_type = 'I'
+  AND (i.status IS NULL OR i.status <> 'CANCEL')
   AND (i.cancellation_date IS NULL OR i.cancellation_date = '')
   AND i.date >= %s
 GROUP BY i.order_id, c.so
@@ -182,28 +196,58 @@ def obtener_cfdi_amazon(db_conn):
 # LADO ODOO
 # =============================================================================
 
+CAMPOS_DOC = ['id', 'name', 'state', 'move_type', 'invoice_origin',
+              'amount_total', 'l10n_mx_edi_cfdi_uuid', 'invoice_date', 'ref',
+              'reversed_entry_id']
+
+
 def obtener_facturas_odoo(models, uid, so_names):
-    """Facturas de cliente por SO. Devuelve {so_name: [facturas]}.
+    """Facturas y notas de credito VIVAS por SO: {so_name: [docs]}.
+
+    Tres caminos (igual que 06_reset_lote_test.py, documentos_vivos):
+    sale.order.invoice_ids (lo ligado a las lineas, incluidas las NC que
+    contrarrestan), invoice_origin = SO, y las NC que reversan alguno de los
+    anteriores (una NC creada como reversa no hereda invoice_origin). Sin el
+    tercero, una factura ya contrarrestada saldria como DOBLE_CFDI.
 
     Se consulta por lotes para no reventar el XML-RPC con miles de nombres.
     """
-    resultado = {}
     lista = [s for s in so_names if s]
-
+    so_de = {}
     for i in range(0, len(lista), CHUNK_ODOO):
         chunk = lista[i:i + CHUNK_ODOO]
-        facturas = leer(models, uid, 'account.move', 'search_read',
-                        [[('invoice_origin', 'in', chunk),
-                          ('move_type', '=', 'out_invoice'),
-                          ('state', '!=', 'cancel')]],
-                        {'fields': ['id', 'name', 'state', 'invoice_origin',
-                                    'amount_total', 'l10n_mx_edi_cfdi_uuid',
-                                    'invoice_date', 'ref']})
-        for f in facturas:
-            resultado.setdefault(f['invoice_origin'], []).append(f)
-
+        for so in leer(models, uid, 'sale.order', 'search_read',
+                       [[('name', 'in', chunk)]],
+                       {'fields': ['name', 'invoice_ids']}):
+            for mid in so.get('invoice_ids') or []:
+                so_de.setdefault(mid, so['name'])
+        for mv in leer(models, uid, 'account.move', 'search_read',
+                       [[('invoice_origin', 'in', chunk),
+                         ('move_type', 'in', ['out_invoice', 'out_refund'])]],
+                       {'fields': ['invoice_origin']}):
+            so_de.setdefault(mv['id'], mv['invoice_origin'])
         log.info(f"  Odoo: {min(i + CHUNK_ODOO, len(lista))}/{len(lista)} SOs "
                  f"consultadas")
+
+    ids = list(so_de)
+    for i in range(0, len(ids), CHUNK_ODOO):
+        for mv in leer(models, uid, 'account.move', 'search_read',
+                       [[('reversed_entry_id', 'in', ids[i:i + CHUNK_ODOO]),
+                         ('move_type', 'in', ['out_invoice', 'out_refund'])]],
+                       {'fields': ['reversed_entry_id']}):
+            origen = mv['reversed_entry_id'][0] if mv.get('reversed_entry_id') else None
+            if origen in so_de:
+                so_de.setdefault(mv['id'], so_de[origen])
+
+    resultado = {}
+    ids = list(so_de)
+    for i in range(0, len(ids), CHUNK_ODOO):
+        for f in leer(models, uid, 'account.move', 'search_read',
+                      [[('id', 'in', ids[i:i + CHUNK_ODOO]),
+                        ('move_type', 'in', ['out_invoice', 'out_refund']),
+                        ('state', '!=', 'cancel')]],
+                      {'fields': CAMPOS_DOC}):
+            resultado.setdefault(so_de[f['id']], []).append(f)
     return resultado
 
 
@@ -224,9 +268,11 @@ def clasificar(caso, facturas_odoo):
     if not so:
         return 'SIN_SO', 'La orden no cruza con ninguna SO de Odoo'
 
-    facturas = facturas_odoo.get(so, [])
+    docs = facturas_odoo.get(so, [])
+    facturas = [f for f in docs if f.get('move_type') == 'out_invoice']
+    ncs = [f for f in docs if f.get('move_type') == 'out_refund']
     if not facturas:
-        return 'SOLO_AMAZON', 'Amazon timbro; en Odoo no hay factura'
+        return 'SOLO_AMAZON', 'Amazon timbro; en Odoo no hay factura viva'
 
     uuids_amazon = {normalizar_uuid(u)
                     for u in (caso['uuids_amazon'] or '').split(' | ')
@@ -240,16 +286,26 @@ def clasificar(caso, facturas_odoo):
                 f"{len(sin_timbre)} factura(s) en Odoo sin UUID "
                 f"(estado: {', '.join(f['state'] for f in sin_timbre)})")
 
-    uuids_odoo = {normalizar_uuid(f['l10n_mx_edi_cfdi_uuid']) for f in con_timbre}
-    ajenos = uuids_odoo - uuids_amazon
+    # Facturas NUESTRAS (UUID distinto al de Amazon). Las que tienen una NC
+    # viva que las reversa ya estan contrarrestadas.
+    revertidas = {nc['reversed_entry_id'][0] for nc in ncs
+                  if nc.get('reversed_entry_id')}
+    nuestras = [f for f in con_timbre
+                if normalizar_uuid(f['l10n_mx_edi_cfdi_uuid']) not in uuids_amazon]
 
-    if not ajenos:
+    if not nuestras:
         return ('VINCULADA_OK',
                 'Nuestra factura lleva el UUID de Amazon: esta vinculada')
 
+    vivas = [f for f in nuestras if f['id'] not in revertidas]
+    if not vivas:
+        return ('DOBLE_CFDI_CON_NC',
+                f"Nuestro(s) CFDI {', '.join(f['name'] for f in nuestras)} "
+                f"contrarrestado(s) por NC viva")
+
     return ('DOBLE_CFDI',
-            f"Amazon: {len(uuids_amazon)} UUID | Nuestro(s) UUID distinto(s): "
-            f"{', '.join(sorted(ajenos))}")
+            f"Amazon: {len(uuids_amazon)} UUID | Nuestro(s) CFDI vivo(s) sin "
+            f"NC: {', '.join(f['name'] + ' ' + normalizar_uuid(f['l10n_mx_edi_cfdi_uuid']) for f in vivas)}")
 
 
 # =============================================================================
@@ -292,8 +348,8 @@ def corregir_caso(models, uid, caso, clasificacion):
 CAMPOS_CSV = ['clasificacion', 'amz_order_id', 'odoo_so_name',
               'is_business_order', 'n_cfdi_amazon', 'uuids_amazon',
               'total_amazon', 'receiver_rfc', 'receiver_name',
-              'facturas_odoo', 'uuids_odoo', 'total_odoo', 'primera_fecha',
-              'detalle']
+              'facturas_odoo', 'uuids_odoo', 'total_odoo', 'ncs_odoo',
+              'primera_fecha', 'mes', 'detalle']
 
 
 def escribir_csv(resultados):
@@ -327,7 +383,9 @@ def run():
         clasificacion, detalle = clasificar(caso, facturas_odoo)
         conteo[clasificacion] = conteo.get(clasificacion, 0) + 1
 
-        facturas = facturas_odoo.get(caso['odoo_so_name'], [])
+        docs = facturas_odoo.get(caso['odoo_so_name'], [])
+        facturas = [f for f in docs if f.get('move_type') == 'out_invoice']
+        ncs = [f for f in docs if f.get('move_type') == 'out_refund']
         resultados.append({
             'clasificacion': clasificacion,
             'amz_order_id': caso['amz_order_id'],
@@ -343,7 +401,9 @@ def run():
                 normalizar_uuid(f['l10n_mx_edi_cfdi_uuid']) or '-'
                 for f in facturas) or None,
             'total_odoo': sum(f['amount_total'] for f in facturas) if facturas else None,
+            'ncs_odoo': ', '.join(f['name'] for f in ncs) or None,
             'primera_fecha': caso['primera_fecha'],
+            'mes': str(caso['primera_fecha'] or '')[:7],
             'detalle': detalle,
         })
 
@@ -357,8 +417,8 @@ def run():
     log.info('=' * 78)
     log.info('ANALISIS RETROSPECTIVO -- RESULTADOS')
     log.info('=' * 78)
-    orden = ['DOBLE_CFDI', 'NUESTRA_SIN_TIMBRE', 'SOLO_AMAZON',
-             'VINCULADA_OK', 'SIN_SO']
+    orden = ['DOBLE_CFDI', 'DOBLE_CFDI_CON_NC', 'NUESTRA_SIN_TIMBRE',
+             'SOLO_AMAZON', 'VINCULADA_OK', 'SIN_SO']
     for clave in orden:
         if clave in conteo:
             marca = ' <<< INCIDENCIA FISCAL' if clave == 'DOBLE_CFDI' else ''
@@ -374,6 +434,16 @@ def run():
         log.warning(f"{len(dobles)} orden(es) con DOS CFDI timbrados.")
         log.warning(f"Importe facturado por nosotros en esos casos: "
                     f"${importe:,.2f}")
+        log.info('')
+        log.info('Por mes del CFDI de Amazon (para decidir por periodo):')
+        por_mes = {}
+        for r in dobles:
+            m = por_mes.setdefault(r['mes'] or 'sin fecha', [0, 0.0])
+            m[0] += 1
+            m[1] += r['total_odoo'] or 0
+        for mes in sorted(por_mes):
+            log.info(f"  {mes:<10}{por_mes[mes][0]:>6} ordenes   "
+                     f"${por_mes[mes][1]:>14,.2f}")
         log.info('')
         log.info('Primeros 10 casos:')
         for r in dobles[:10]:

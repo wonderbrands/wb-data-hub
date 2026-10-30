@@ -68,15 +68,22 @@ ESTADOS EN finance.mkp_billing_{staging|prod}
   PROCESSING             tomada por una corrida (candado)
   ODOO_B2B_LINKED        factura creada con el UUID de Amazon sellado
   ODOO_INVOICED          CFDI emitido por WB
-  ALREADY_ODOO_INVOICED  ya tenia factura viva en Odoo
+  ALREADY_ODOO_INVOICED  ya tenia factura viva en Odoo (incluye factura global)
+  B2B_FACTURADA_PG       B2B con factura viva a publico general: anularla
+                         antes de vincular el CFDI de Amazon. Se reevalua.
   SKIPPED_GRACE          dentro del periodo de gracia
   TOTAL_DIFF             el importe de Odoo no cuadra con el de Amazon. NO se
                          factura; sale en el reporte de Finanzas.
   B2B_SPLIT_MISMATCH     Amazon emitio varios CFDI y no se pudieron repartir
                          contra los envios / las lineas de la SO.
-  B2B_NO_RECEPTOR        el CFDI de Amazon no trae RFC receptor utilizable
-  SO_CANCELLED           SO cancelada. Requiere nota de credito Tipo A.
-  SO_DRAFT               SO en borrador. Fuera de alcance.
+  B2B_NO_RECEPTOR        el CFDI de Amazon no trae RFC receptor utilizable, u
+                         Odoo rechazo el alta del cliente. Se reevalua.
+  SO_CANCELLED           ya no se produce: la SO cancelada se factura (correo
+                         de Jero, 28-oct-2026). Filas viejas se reevaluan.
+  SO_DRAFT               SO en borrador que Odoo no dejo confirmar. Se
+                         reevalua; la que si se confirma, se factura.
+  ENVIO_SIN_CONFIRMAR    el cliente pago mas que la SO y ninguna segunda
+                         fuente confirma que sea envio. Se reevalua.
   NO_SO_IN_ODOO          sin SO cruzada. Solo alerta: las crea Yuju.
   ERROR                  fallo recuperable
 """
@@ -102,9 +109,10 @@ if _dir not in sys.path:
 from _amz_common import (
     ENTORNO, TBL_BILLING, MARKETPLACE,
     TAX_ID_MARKETPLACES, PARTNER_ID_PUBLICO_GENERAL, ACCOUNT_AMAZON_CXC,
-    IDEMPOTENCY_PREFIX, KESTRA_EXECUTION_ID,
+    ACCOUNT_MERC_NO_ENVIADA, IDEMPOTENCY_PREFIX, KESTRA_EXECUTION_ID,
     validar_entorno, banner, notify_slack, get_db_connection,
     OdooModelProxy, OdooWriteUncertain, get_account_id, a_float,
+    ejecutar_sin_retorno, sp_api_token, get_order_items,
 )
 
 # =============================================================================
@@ -119,7 +127,7 @@ RUN_LOADER = True
 # >>> DEFINIR CON FINANZAS ANTES DE PASAR A PRODUCCION <<<
 # Valor de PRUEBAS: inicio del settlement 27044880571 (depositado el 30-jul).
 # Ver la nota de AMZ_END_DATE para por que se eligio esta ventana.
-AMZ_START_DATE = os.getenv('AMZ_START_DATE', '2026-07-20')
+AMZ_START_DATE = os.getenv('AMZ_START_DATE', '2026-08-27')
 
 # =============================================================================
 # LIMITE SUPERIOR DE VENTANA -- HERRAMIENTA DE PRUEBAS
@@ -170,8 +178,29 @@ AMZ_START_DATE = os.getenv('AMZ_START_DATE', '2026-07-20')
 # puntual, pero entonces hay que ponerlo a proposito.
 # =============================================================================
 
-_END_DATE_DEFECTO = '2026-08-26' if ENTORNO == 'staging' else ''
+_END_DATE_DEFECTO = '2026-10-04' if ENTORNO == 'staging' else ''
 AMZ_END_DATE = os.getenv('AMZ_END_DATE', _END_DATE_DEFECTO).strip() or None
+
+# =============================================================================
+# ALCANCE POR SETTLEMENT -- PRIMERA CORRIDA EN PRODUCCION
+# =============================================================================
+# Finanzas (correo de Jero, 28-oct-2026) pide que la primera corrida real sea
+# un settlement COMPLETO, para cuadrar la transitoria 102.02.008 contra lo
+# liberado antes de soltar el resto. Con AMZ_SETTLEMENT_ID el miner toma
+# solo las ordenes con Order Payment en ese settlement (TODAS sus piezas,
+# aunque alguna haya caido en otro settlement: la factura es por orden) y el
+# loader procesa solo esas. Las fechas AMZ_START_DATE / AMZ_END_DATE dejan de
+# acotar: manda el settlement.
+#
+# AMZ_ORDER_IDS (lista separada por comas) agrega ordenes sueltas al alcance.
+# Es para pruebas: meter en el lote casos que no estan en el settlement (una
+# orden en factura global, las excepciones del lote anterior).
+#
+# Con alcance, las cuotas de pruebas no aplican: se procesa todo el alcance.
+# =============================================================================
+AMZ_SETTLEMENT_ID = os.getenv('AMZ_SETTLEMENT_ID', '').strip() or None
+AMZ_ORDER_IDS = [o.strip() for o in os.getenv('AMZ_ORDER_IDS', '').split(',') if o.strip()]
+CON_ALCANCE = bool(AMZ_SETTLEMENT_ID or AMZ_ORDER_IDS)
 
 # Dias que se le dan al cliente para autofacturar con su RFC antes de que
 # emitamos a publico en general.
@@ -181,6 +210,20 @@ GRACE_DAYS = int(os.getenv('AMZ_GRACE_DAYS', '5'))
 # Amazon ocurren dentro de ~15-45 dias; 90 da holgura y evita que el GROUP BY
 # recorra todo el historico en cada corrida.
 DEDUP_LOOKBACK_DAYS = 90
+
+# Contacto generico para clientes B2B nuevos. Odoo (validacion de "Ventas al
+# Mayoreo") no deja crear un contacto sin telefono ni correo, y el CFDI de
+# Amazon Business no los trae: en el lote del 27-oct, 12 de 15 B2B quedaron sin
+# factura por eso. Se usa lo mismo que los contactos genericos de Yuju
+# (Mercado Libre Oficiales: 11111 / market@somos-reyes.com). El correo es un
+# buzon interno a proposito: nada que Odoo mande al cliente sale de la empresa.
+# Envio cobrado al cliente. El ingreso (401.01.002) lo pone la cuenta del
+# producto: Finanzas se la asigno en produccion el 28-oct, segundo (antes caia en
+# 401.01.001 en todos los canales).
+PRODUCTO_ENVIO = 'C-ENVIO'
+
+B2B_TELEFONO_GENERICO = os.getenv('AMZ_B2B_TELEFONO', '11111')
+B2B_CORREO_GENERICO = os.getenv('AMZ_B2B_CORREO', 'market@somos-reyes.com')
 
 # Timbrado. En pruebas se deja apagado: publicar la factura ya genera el
 # asiento, que es lo que Finanzas necesita revisar.
@@ -204,8 +247,24 @@ DO_STAMPING = (ENTORNO == 'prod')
 # En produccion ambas son None: sin limite, se factura todo lo elegible.
 # =============================================================================
 
-QUOTA_B2B = None if ENTORNO == 'prod' else int(os.getenv('AMZ_TEST_QUOTA_B2B', '50'))
-QUOTA_B2C = None if ENTORNO == 'prod' else int(os.getenv('AMZ_TEST_QUOTA_B2C', '50'))
+QUOTA_B2B = None if ENTORNO == 'prod' or CON_ALCANCE else int(os.getenv('AMZ_TEST_QUOTA_B2B', '6'))
+QUOTA_B2C = None if ENTORNO == 'prod' or CON_ALCANCE else int(os.getenv('AMZ_TEST_QUOTA_B2C', '30'))
+
+# =============================================================================
+# TOPE DE ARRANQUE EN PRODUCCION
+# =============================================================================
+# En produccion las cuotas son None: se factura todo lo elegible. Para las
+# primeras corridas reales (y para el barrido historico desde el 17-abr-2026,
+# ~1,088 SO) conviene avanzar por tramos y revisar entre uno y otro. Este tope
+# corta el LOADER despues de N facturas creadas en total (B2B + B2C). Lo que
+# queda pendiente sigue en la tabla de control y lo toma la corrida siguiente
+# (el loader va en orden FIFO en produccion).
+#
+# Solo aplica con AMZ_ENTORNO='prod'; en pruebas mandan las cuotas por tipo.
+# 0 o vacio = sin tope. Una vez estable, se quita la variable del flujo.
+# =============================================================================
+PROD_MAX_FACTURAS = (int(os.getenv('AMZ_PROD_MAX_FACTURAS', '0') or 0) or None
+                     if ENTORNO == 'prod' else None)
 
 # El miner tiene que sembrar MAS candidatos de los que el loader necesita:
 # parte se caera en SO cancelada, sin SO o ya facturada.
@@ -227,7 +286,20 @@ MINER_OVERFETCH = int(os.getenv('AMZ_MINER_OVERFETCH', '3'))
 # Estados desde los que una fila de la tabla de control TODAVIA se puede
 # reevaluar. El miner refresca estas; las demas (ya facturadas, canceladas,
 # TOTAL_DIFF...) se dan por cerradas y una relectura de Amazon no las reabre.
-REFRESCABLES = ('PENDING_B2B_LINK', 'PENDING_WB_INVOICE', 'SKIPPED_GRACE', 'ERROR')
+#
+# Excepciones que se resuelven solas en una corrida posterior y por eso se
+# reevaluan (correo de Jero, 28-oct-2026: "las excepciones se resuelven, no
+# se saltean"): SO_DRAFT (fallo la confirmacion), SO_CANCELLED (filas de
+# antes de que se facturaran las SO canceladas), B2B_NO_RECEPTOR (Odoo
+# rechazo el alta del cliente) y B2B_FACTURADA_PG (en cuanto se anule la
+# factura a publico general, la orden se vincula al CFDI de Amazon).
+REFRESCABLES = ('PENDING_B2B_LINK', 'PENDING_WB_INVOICE', 'SKIPPED_GRACE', 'ERROR',
+                'SO_DRAFT', 'SO_CANCELLED', 'B2B_NO_RECEPTOR', 'B2B_FACTURADA_PG',
+                'ENVIO_SIN_CONFIRMAR')
+
+# Las que el miner regresa a pendiente al refrescarlas (todas menos ERROR, que
+# se reintenta por retry_count_loader y lo revisa una persona).
+REABRIBLES = tuple(s for s in REFRESCABLES if s != 'ERROR')
 
 # Centinela: armar_partes_split lo devuelve cuando la SO no tiene nada
 # pendiente. No es un error de reparto, es una orden ya facturada.
@@ -275,6 +347,8 @@ SELECT
     MAX(e.deposit_date)                           AS deposit_date,
     MAX(DATE_SUB(a.posted_date, INTERVAL 6 HOUR)) AS posted_date,
     MAX(IFNULL(d.IsBusinessOrder, 0))             AS is_business_order,
+    MAX(d.tot_min)                                AS amz_order_total_min,
+    MAX(d.tot_max)                                AS amz_order_total_max,
     COUNT(*)                                      AS n_items,
     COUNT(DISTINCT COALESCE(a.shipment_id, a.transaction_id)) AS n_envios,
     GROUP_CONCAT(DISTINCT b.sku ORDER BY b.sku SEPARATOR ', ') AS skus,
@@ -291,9 +365,20 @@ SELECT
             + IFNULL(b.our_price_tax,0) + IFNULL(b.shipping_tax,0)
             + IFNULL(b.shipping_tax_discount,0) + IFNULL(b.our_price_tax_disc,0)), 2)
                                                   AS cfdi_total,
+    -- Envio cobrado al cliente (neto de envio gratis), base e IVA. Yuju no
+    -- pone la linea de envio en la SO: el loader la agrega a la factura.
+    ROUND(SUM(IFNULL(b.shipping,0) + IFNULL(b.shipping_discount,0)), 2)
+                                                  AS envio_base,
+    ROUND(SUM(IFNULL(b.shipping_tax,0) + IFNULL(b.shipping_tax_discount,0)), 2)
+                                                  AS envio_iva,
+    -- Lo que Amazon deposito por la orden. Contra venta - comisiones - IVA
+    -- retenido revela un envio acreditado fuera de los campos de envio.
+    ROUND(SUM(IFNULL(b.item_amount,0)), 2)        AS deposito,
+    -- amazon_fees YA incluye amazon_for_all_fee y shipping_hb: sumarlos
+    -- aparte los contaba dos veces (24% de las piezas). Asi cfdi_total +
+    -- fees_total = item_amount, el deposito.
     ROUND(SUM(IFNULL(b.amazon_fees,0) + IFNULL(b.marketplace_vat_principal,0)
-            + IFNULL(b.marketplace_vat_shipping,0) + IFNULL(b.amazon_for_all_fee,0)
-            + IFNULL(b.shipping_hb,0)), 2)        AS fees_total,
+            + IFNULL(b.marketplace_vat_shipping,0)), 2)        AS fees_total,
 
     f.uuid       AS amz_cfdi_uuid,
     f.uuids      AS amz_cfdi_uuids,
@@ -360,9 +445,19 @@ LEFT JOIN (
     GROUP BY marketplace_order_id
 ) c ON a.order_id = c.marketplace_order_id
 
--- CORRECCION 1: deduplicado
+-- CORRECCION 1: deduplicado.
+-- Trae ademas lo que Amazon le COBRO al comprador (OrderTotalAmount), que es
+-- la fuente independiente de la regla de promocion financiada por Amazon en
+-- B2C (ver PROMOCIONES FINANCIADAS POR AMAZON). amazon_orders tiene N filas
+-- por orden: se guardan el minimo y el maximo, y si no coinciden el loader
+-- descarta el dato en vez de elegir uno. Se ignoran importes en cero o vacios
+-- (filas de una orden todavia pendiente) y monedas distintas de MXN.
 LEFT JOIN (
-    SELECT amazonorderid, MAX(IsBusinessOrder) AS IsBusinessOrder
+    SELECT amazonorderid, MAX(IsBusinessOrder) AS IsBusinessOrder,
+           MIN(CASE WHEN OrderTotalCurrency = 'MXN' AND OrderTotalAmount > 0
+                    THEN CAST(OrderTotalAmount AS DECIMAL(14,2)) END) AS tot_min,
+           MAX(CASE WHEN OrderTotalCurrency = 'MXN' AND OrderTotalAmount > 0
+                    THEN CAST(OrderTotalAmount AS DECIMAL(14,2)) END) AS tot_max
     FROM somos_reyes.amazon_orders
     GROUP BY amazonorderid
 ) d ON a.order_id = d.amazonorderid
@@ -431,12 +526,59 @@ ORDER BY posted_date DESC
 """
 
 
-def construir_query_lote():
+def filtro_alcance():
+    """(sql, params) que limita las ordenes al settlement y/o la lista de
+    AMZ_ORDER_IDS. Vacio si no hay alcance."""
+    partes, params = [], []
+    if AMZ_SETTLEMENT_ID:
+        partes.append("a.order_id IN (SELECT s.order_id FROM somos_reyes.amz_transactions s"
+                      " WHERE s.settlement_id = %s AND s.description = 'Order Payment'"
+                      " AND s.transaction_status <> 'DEFERRED')")
+        params.append(AMZ_SETTLEMENT_ID)
+    if AMZ_ORDER_IDS:
+        partes.append(f"a.order_id IN ({', '.join(['%s'] * len(AMZ_ORDER_IDS))})")
+        params += AMZ_ORDER_IDS
+    if not partes:
+        return '', []
+    return f"AND ({' OR '.join(partes)})", params
+
+
+def inicio_del_alcance(db_conn):
+    """Primer dia con Order Payment de las ordenes del alcance (fecha local).
+
+    Con alcance no manda AMZ_START_DATE sino el settlement: hay que leer
+    desde la primera pieza de sus ordenes, aunque haya caido en un settlement
+    anterior, o la factura saldria corta.
+    """
+    filtro, params = filtro_alcance()
+    cur = db_conn.cursor()
+    cur.execute(f"""SELECT DATE(DATE_SUB(MIN(a.posted_date), INTERVAL 6 HOUR))
+                    FROM somos_reyes.amz_transactions a
+                    WHERE a.description = 'Order Payment'
+                      AND a.transaction_status <> 'DEFERRED' {filtro}""", tuple(params))
+    fila = cur.fetchone()
+    cur.close()
+    if not fila or not fila[0]:
+        raise Exception(f"El alcance (settlement {AMZ_SETTLEMENT_ID}, ordenes "
+                        f"{AMZ_ORDER_IDS}) no tiene Order Payment en Amazon.")
+    return str(fila[0])
+
+
+def construir_query_lote(desde=None):
     """QUERY_LOTE lista para ejecutar, con sus parametros.
 
     Devuelve (sql, params) para que quien la use no tenga que saber cuantos
     placeholders lleva segun haya o no limite superior de ventana.
+
+    Con alcance (AMZ_SETTLEMENT_ID / AMZ_ORDER_IDS) la ventana empieza en
+    'desde' (inicio_del_alcance) y no hay limite superior.
     """
+    if CON_ALCANCE:
+        inicio = desde or AMZ_START_DATE
+        filtro, extra = filtro_alcance()
+        sql = QUERY_LOTE.replace('{FILTRO_FIN}', filtro)
+        return sql, tuple([inicio, DEDUP_LOOKBACK_DAYS, inicio] + extra)
+
     params = [AMZ_START_DATE, DEDUP_LOOKBACK_DAYS, AMZ_START_DATE]
     if AMZ_END_DATE:
         sql = QUERY_LOTE.replace(
@@ -585,6 +727,21 @@ def emparejar_cfdi_con_envios(cursor, order_id):
     return parejas, None
 
 
+def total_cobrado_cliente(row):
+    """Lo que Amazon le cobro al comprador (amazon_orders.OrderTotalAmount).
+
+    None si no hay dato o si las filas de amazon_orders no coinciden entre si:
+    en ese caso no se elige ninguna y la regla de promocion no se aplica (la
+    orden sigue el camino normal, que termina en TOTAL_DIFF si no cuadra).
+    """
+    lo, hi = row.get('amz_order_total_min'), row.get('amz_order_total_max')
+    if lo is None or hi is None:
+        return None
+    if abs(a_float(lo) - a_float(hi)) > 0.005:
+        return None
+    return a_float(hi)
+
+
 def construir_raw_json(row, tipo, desglose=None):
     """Log de conciliacion de Finanzas.
 
@@ -608,6 +765,9 @@ def construir_raw_json(row, tipo, desglose=None):
             'cfdi_base': a_float(row['cfdi_base']),
             'cfdi_iva': a_float(row['cfdi_iva']),
             'cfdi_total': a_float(row['cfdi_total']),
+            'envio_base': a_float(row.get('envio_base')),
+            'envio_iva': a_float(row.get('envio_iva')),
+            'deposito': a_float(row.get('deposito')),
             'fees_total': a_float(row['fees_total']),
         },
         'amazon': {
@@ -618,6 +778,12 @@ def construir_raw_json(row, tipo, desglose=None):
             'n_items': row['n_items'],
             'n_envios': row['n_envios'],
             'skus': row['skus'],
+            # Cobrado al comprador segun amazon_orders. Lo usa la regla de
+            # promocion financiada por Amazon (B2C). min/max se guardan para
+            # auditar por que se descarto cuando no coinciden.
+            'order_total_cliente': total_cobrado_cliente(row),
+            'order_total_min': a_float(row.get('amz_order_total_min')) or None,
+            'order_total_max': a_float(row.get('amz_order_total_max')) or None,
         },
         # Datos fiscales del CFDI que emitio Amazon. El loader los usa para
         # replicar el comprobante en Odoo (receptor, uso de CFDI, forma de
@@ -664,18 +830,33 @@ def existe_en_staging(cursor, mkp_order_id):
     return cursor.fetchone()
 
 
+# Ordenes que leyo el miner cuando hay alcance (settlement / lista). El loader
+# procesa solo estas: sin esto tomaria tambien pendientes viejos de la tabla
+# y el settlement ya no se podria cuadrar por separado.
+ORDENES_DEL_ALCANCE = set()
+
+
 def run_miner(db_conn):
     lector = db_conn.cursor(dictionary=True)
-    log.info(f"[MINER] Leyendo transacciones de Amazon desde {AMZ_START_DATE}"
-             f"{' hasta ' + AMZ_END_DATE if AMZ_END_DATE else ''} "
-             f"(dedup con {DEDUP_LOOKBACK_DAYS} dias de margen)...")
+    if CON_ALCANCE:
+        desde = inicio_del_alcance(db_conn)
+        log.info(f"[MINER] ALCANCE: settlement {AMZ_SETTLEMENT_ID or '-'} + "
+                 f"{len(AMZ_ORDER_IDS)} orden(es) sueltas. Transacciones desde "
+                 f"{desde} (dedup con {DEDUP_LOOKBACK_DAYS} dias de margen)...")
+    else:
+        desde = None
+        log.info(f"[MINER] Leyendo transacciones de Amazon desde {AMZ_START_DATE}"
+                 f"{' hasta ' + AMZ_END_DATE if AMZ_END_DATE else ''} "
+                 f"(dedup con {DEDUP_LOOKBACK_DAYS} dias de margen)...")
     t0 = tm.time()
-    sql, params = construir_query_lote()
+    sql, params = construir_query_lote(desde)
     lector.execute(sql, params)
     rows = lector.fetchall()
     lector.close()
     log.info(f"[MINER] {len(rows)} orden(es) leidas en "
              f"{round(tm.time() - t0, 1)}s")
+    if CON_ALCANCE:
+        ORDENES_DEL_ALCANCE.update(r['mkp_order_id'] for r in rows)
 
     if not rows:
         return {'b2b': 0, 'b2c': 0, 'ya_existian': 0, 'gracia': 0,
@@ -796,6 +977,9 @@ def run_miner(db_conn):
         # ON DUPLICATE KEY sobre uk_mkp_order (marketplace, mkp_order_id).
         # El UPDATE es defensivo: solo refresca filas que siguen pendientes.
         # Si la orden ya se facturo, una re-lectura de Amazon NO la reabre.
+        # Las listas de estados son constantes del codigo, no datos de entrada.
+        refrescables = ', '.join(f"'{s}'" for s in REFRESCABLES)
+        reabribles = ', '.join(f"'{s}'" for s in REABRIBLES)
         w.execute(f"""
             INSERT INTO {TBL_BILLING}
                 (marketplace, mkp_order_id, odoo_so_name, cfdi_uuid,
@@ -803,11 +987,11 @@ def run_miner(db_conn):
                  retry_count, retry_count_loader)
             VALUES (%s, %s, %s, %s, %s, NULL, %s, %s, 0, 0)
             ON DUPLICATE KEY UPDATE
-                odoo_so_name = IF(status IN ('PENDING_B2B_LINK','PENDING_WB_INVOICE','SKIPPED_GRACE','ERROR'), VALUES(odoo_so_name), odoo_so_name),
-                cfdi_uuid    = IF(status IN ('PENDING_B2B_LINK','PENDING_WB_INVOICE','SKIPPED_GRACE','ERROR'), VALUES(cfdi_uuid),    cfdi_uuid),
-                total_amount = IF(status IN ('PENDING_B2B_LINK','PENDING_WB_INVOICE','SKIPPED_GRACE','ERROR'), VALUES(total_amount), total_amount),
-                raw_json     = IF(status IN ('PENDING_B2B_LINK','PENDING_WB_INVOICE','SKIPPED_GRACE','ERROR'), VALUES(raw_json),     raw_json),
-                status       = IF(status IN ('PENDING_B2B_LINK','PENDING_WB_INVOICE','SKIPPED_GRACE'),          VALUES(status),       status)
+                odoo_so_name = IF(status IN ({refrescables}), VALUES(odoo_so_name), odoo_so_name),
+                cfdi_uuid    = IF(status IN ({refrescables}), VALUES(cfdi_uuid),    cfdi_uuid),
+                total_amount = IF(status IN ({refrescables}), VALUES(total_amount), total_amount),
+                raw_json     = IF(status IN ({refrescables}), VALUES(raw_json),     raw_json),
+                status       = IF(status IN ({reabribles}),   VALUES(status),       status)
         """, (MARKETPLACE, row['mkp_order_id'], row['odoo_so_name'],
               row['amz_cfdi_uuid'], importe_ref,
               construir_raw_json(row, tipo, desglose), status))
@@ -917,6 +1101,10 @@ def fetch_pendientes(db_conn):
         rows = (_fetch_por_status(cursor, 'PENDING_B2B_LINK', None, 'ASC')
                 + _fetch_por_status(cursor, 'PENDING_WB_INVOICE', None, 'ASC'))
         cursor.close()
+        if CON_ALCANCE:
+            rows = [r for r in rows if r['mkp_order_id'] in ORDENES_DEL_ALCANCE]
+            log.info(f"[LOADER] Alcance: {len(rows)} pendiente(s) de "
+                     f"{len(ORDENES_DEL_ALCANCE)} orden(es) leidas por el miner.")
         return rows
 
     margen = MINER_OVERFETCH * 2
@@ -951,7 +1139,10 @@ def claim(db_conn, record_id):
 
 
 def update_staging(db_conn, record_id, status, cfdi_uuid=None, error_log=None,
-                   sumar_retry=False):
+                   sumar_retry=False, total_amount=None):
+    """total_amount solo se pasa cuando lo facturado no es la referencia que
+    sembro el miner (promocion financiada por Amazon): asi la tabla dice lo
+    que se facturo, igual que en B2B, y error_log explica la diferencia."""
     cursor = db_conn.cursor()
     cursor.execute(f"""
         UPDATE {TBL_BILLING}
@@ -959,9 +1150,11 @@ def update_staging(db_conn, record_id, status, cfdi_uuid=None, error_log=None,
             cfdi_uuid = COALESCE(%s, cfdi_uuid),
             error_log = %s,
             retry_count_loader = retry_count_loader + %s,
+            total_amount = COALESCE(%s, total_amount),
             processed_at = NOW()
         WHERE id = %s
-    """, (status, cfdi_uuid, error_log, 1 if sumar_retry else 0, record_id))
+    """, (status, cfdi_uuid, error_log, 1 if sumar_retry else 0,
+          total_amount, record_id))
     db_conn.commit()
     cursor.close()
 
@@ -1027,12 +1220,13 @@ def buscar_so(odoo, so_name):
     r = odoo.execute_kw('sale.order', 'search_read', [[('name', '=', so_name)]],
                         {'fields': ['id', 'name', 'state', 'team_id',
                                     'invoice_status', 'invoice_count',
-                                    'order_line', 'partner_id', 'date_order'],
+                                    'invoice_ids', 'order_line', 'partner_id',
+                                    'date_order'],
                          'limit': 1})
     return r[0] if r else None
 
 
-def facturas_existentes(odoo, so_name):
+def facturas_existentes(odoo, so_name, so=None):
     """Facturas vivas de la SO, con su ref.
 
     Antes esto era un search_count. Ahora devuelve las filas porque una orden
@@ -1041,14 +1235,92 @@ def facturas_existentes(odoo, so_name):
 
     La ref sigue llevando el prefijo compartido 'AUTOINV:' a proposito: asi el
     1 a 1 generico y este script se siguen viendo mutuamente.
+
+    Tres caminos (correo de Jero, 28-oct-2026: "SO dentro de una factura
+    global anterior: no refacturar"):
+      1. invoice_origin = SO       la factura 1 a 1
+      2. ref AUTOINV:<SO>...       la clave de idempotencia
+      3. sale.order.invoice_ids    lo ligado a las lineas de la SO. Es el unico
+                                   que ve una factura GLOBAL: su invoice_origin
+                                   lista cientos de SO separadas por coma.
+    Se descartan las facturas ya revertidas por completo con NC
+    (payment_state 'reversed'): no son una factura viva de la orden, y
+    contarlas daria un falso "incidente fiscal" en la SO refacturada.
     """
     domain = ['&', ('move_type', '=', 'out_invoice'), ('state', '!=', 'cancel'),
               '|', ('invoice_origin', '=', so_name),
               ('ref', 'like', f'{IDEMPOTENCY_PREFIX}{so_name}%')]
-    return odoo.execute_kw('account.move', 'search_read', [domain],
-                           {'fields': ['id', 'name', 'state', 'ref',
-                                       'amount_total', 'l10n_mx_edi_cfdi_uuid'],
-                            'order': 'id asc'})
+    campos = ['id', 'name', 'state', 'ref', 'amount_total', 'invoice_origin',
+              'payment_state', 'l10n_mx_edi_cfdi_uuid']
+    filas = odoo.execute_kw('account.move', 'search_read', [domain],
+                            {'fields': campos, 'order': 'id asc'})
+    vistas = {f['id'] for f in filas}
+    ligadas = [i for i in (so or {}).get('invoice_ids') or [] if i not in vistas]
+    if ligadas:
+        filas += odoo.execute_kw(
+            'account.move', 'search_read',
+            [[('id', 'in', ligadas), ('move_type', '=', 'out_invoice'),
+              ('state', '!=', 'cancel')]],
+            {'fields': campos, 'order': 'id asc'})
+    return [f for f in filas if f.get('payment_state') != 'reversed']
+
+
+def netear_con_nc(odoo, so, existentes):
+    """Quita de 'existentes' las facturas neutralizadas por una NC publicada
+    de la misma SO y del mismo importe. Devuelve (netas, neutralizadas).
+
+    Caso del lote 7 (44 de 46 alertas de "INCIDENTE FISCAL"): refacturacion
+    del portal a un cliente con RFC = factura a publico general + NC "por
+    refacturacion" + factura al cliente, las tres timbradas y sin conciliar
+    entre si (por eso la primera no sale como 'reversed'). Hay UNA venta con
+    UNA factura vigente, no un CFDI duplicado. Una NC en borrador no
+    neutraliza nada: ese si es un doble real y se sigue alertando.
+    """
+    if len(existentes) < 2:
+        return existentes, []
+    ncs = odoo.execute_kw(
+        'account.move', 'search_read',
+        [['&', '&', ('move_type', '=', 'out_refund'), ('state', '=', 'posted'),
+          '|', ('id', 'in', so.get('invoice_ids') or []),
+          ('invoice_origin', '=', so['name'])]],
+        {'fields': ['amount_total']})
+    netas, neutralizadas = list(existentes), []
+    for nc in ncs:
+        # La que se neutraliza es la mas vieja del mismo importe: la de
+        # publico general que se refacturo.
+        par = next((f for f in netas
+                    if abs(a_float(f['amount_total']) - a_float(nc['amount_total'])) <= 0.01), None)
+        if par:
+            netas.remove(par)
+            neutralizadas.append(par)
+    return netas, neutralizadas
+
+
+def es_global(factura):
+    """La factura ampara varias SO (factura global a publico en general)."""
+    return ',' in (factura.get('invoice_origin') or '')
+
+
+def confirmar_so(odoo, so):
+    """Confirma una SO en borrador. Devuelve None si quedo confirmada, o el
+    motivo por el que no.
+
+    Se relee el estado despues: action_confirm puede no fallar y aun asi no
+    confirmar (una validacion que regresa un asistente en vez de error).
+    """
+    try:
+        odoo.execute_kw('sale.order', 'action_confirm', [[so['id']]])
+    except OdooWriteUncertain as e:
+        log.warning(f"{so['name']}: confirmacion incierta, se verifica leyendo: {e}")
+    except xmlrpc.client.Fault as e:
+        return f"Odoo no permitio confirmar la SO: {e.faultString[:300]}"
+    estado = odoo.execute_kw('sale.order', 'read', [[so['id']]],
+                             {'fields': ['state']})[0]['state']
+    if estado != 'sale':
+        return f"La SO sigue en '{estado}' despues de confirmarla."
+    so['state'] = estado
+    log.info(f"{so['name']}: SO en borrador confirmada (Amazon ya cobro la venta).")
+    return None
 
 
 def buscar_por_ref(odoo, ref):
@@ -1119,6 +1391,264 @@ def comando_linea(line, qty):
     })
 
 
+# Ref de la factura aparte de envio: AUTOINV:<SO>:ENVIO. Lleva el prefijo
+# compartido, asi el 1a1 y este script la ven y no la duplican.
+SUFIJO_ENVIO = ':ENVIO'
+
+
+def facturar_envio_aparte(odoo, db_conn, record, so, vivas, de_envio,
+                          account_cxc, catalogos, stats):
+    """Factura solo por el envio cuando la orden ya tiene factura sin envio.
+
+    Caso de Jero (28-oct, segundo): 702-0447823-8163428, factura del 1a1 por 1,600.00
+    y el cliente pago 1,659.00. Con la factura de 59.00 por el envio la SO
+    suma lo que pago el cliente y la promocion de 199.00 se puede asentar
+    (03 compara la SUMA de las facturas de la SO contra OrderTotal).
+
+    Mismo receptor y uso de CFDI que la factura que complementa. Idempotente
+    por ref. Devuelve la nota para la tabla de control, o None.
+    """
+    so_name = so['name']
+    if de_envio:
+        return f"Envio ya facturado aparte: {de_envio[0]['name']}"
+
+    ids = [v['id'] for v in vivas]
+    ya_facturado = round(sum(a_float(v['amount_total']) for v in vivas), 2)
+    # Primero con los datos de Amazon (sin llamar a Odoo): la gran mayoria de
+    # las ordenes ya facturadas no tienen envio pendiente.
+    envio = envio_por_facturar(db_conn, record, ya_facturado, catalogos, False)
+    if not envio:
+        return None
+    if odoo.execute_kw('account.move.line', 'search_count',
+                       [[('move_id', 'in', ids),
+                         ('product_id', '=', catalogos.get('producto_envio'))]]):
+        return None
+    if envio.get('error'):
+        stats['envio_sin_confirmar'].append(f"{so_name}: {envio['error']}")
+        return f"ENVIO_SIN_CONFIRMAR: {envio['error']}"
+
+    ref = f"{IDEMPOTENCY_PREFIX}{so_name}{SUFIJO_ENVIO}"
+    ya = buscar_por_ref(odoo, ref)
+    if ya:
+        return f"Envio ya facturado aparte: {ya[0]['name']}"
+
+    base = odoo.execute_kw('account.move', 'read', [[ids[0]]],
+                           {'fields': ['partner_id', 'l10n_mx_edi_usage',
+                                       'l10n_mx_edi_payment_method_id']})[0]
+    vals = {
+        'ref': ref,
+        'move_type': 'out_invoice',
+        'partner_id': base['partner_id'][0] if base['partner_id'] else PARTNER_ID_PUBLICO_GENERAL,
+        'invoice_origin': so_name,
+        'invoice_line_ids': [comando_envio(envio['base'], catalogos)],
+        'l10n_mx_edi_usage': base.get('l10n_mx_edi_usage') or 'S01',
+        'l10n_mx_edi_payment_method_id': (base['l10n_mx_edi_payment_method_id'][0]
+                                          if base.get('l10n_mx_edi_payment_method_id') else 3),
+        'l10n_mx_edi_payment_policy': 'PUE',
+        'team_id': so['team_id'][0],
+        'invoice_payment_term_id': 1,
+    }
+    try:
+        inv_id = odoo.execute_kw('account.move', 'create', [vals])
+    except OdooWriteUncertain:
+        ya = buscar_por_ref(odoo, ref)
+        if not ya:
+            return "ENVIO: create incierto; revisar a mano"
+        inv_id = ya[0]['id']
+    except xmlrpc.client.Fault as e:
+        return f"ENVIO: Odoo rechazo la factura de envio: {e.faultString[:200]}"
+
+    cxc = odoo.execute_kw('account.move.line', 'search_read',
+                          [[('move_id', '=', inv_id), ('account_type', '=', 'asset_receivable')]],
+                          {'fields': ['id']})
+    if cxc:
+        odoo.execute_kw('account.move', 'write',
+                        [[inv_id], {'line_ids': [(1, l['id'], {'account_id': account_cxc}) for l in cxc]}],
+                        {'context': {'tracking_disable': True}})
+    try:
+        odoo.execute_kw('account.move', 'action_post', [[inv_id]])
+    except OdooWriteUncertain as e:
+        log.warning(f"{so_name}: post incierto de la factura de envio: {e}")
+    except xmlrpc.client.Fault as e:
+        return f"ENVIO: fallo el post de la factura de envio: {e.faultString[:200]}"
+    if DO_STAMPING:
+        try:
+            ctx = {'active_model': 'account.move', 'active_ids': [inv_id]}
+            wiz = odoo.execute_kw('account.move.send.wizard', 'create',
+                                  [{'is_download_only': False}], {'context': ctx})
+            odoo.execute_kw('account.move.send.wizard', 'action_send_and_print',
+                            [[wiz]], {'context': ctx})
+        except Exception as e:
+            log.warning(f"{so_name}: fallo el timbrado de la factura de envio: {e}")
+
+    nombre = odoo.execute_kw('account.move', 'read', [[inv_id]], {'fields': ['name']})[0]['name']
+    try:
+        odoo.execute_kw('account.move', 'message_post', [inv_id], {
+            'body': '\n'.join([
+                "FACTURA DE ENVIO (AMAZON)",
+                f"Amazon order_id: {record['mkp_order_id']}",
+                f"SO Odoo: {so_name}",
+                f"Complementa a: {', '.join(v['name'] for v in vivas)} "
+                f"({ya_facturado:,.2f}), que no incluia el envio.",
+                f"Envio cobrado al cliente: {envio['total']:,.2f} "
+                f"(base {envio['base']:,.2f} + IVA {envio['iva']:,.2f}; fuente: {envio['fuente']}).",
+                f"Ejecucion Kestra: {KESTRA_EXECUTION_ID}",
+            ]),
+            'message_type': 'comment'})
+    except Exception as e:
+        log.warning(f"No se pudo postear el chatter en {inv_id}: {e}")
+    stats['envio_aparte'].append(f"{so_name} {nombre} {envio['total']:,.2f} ({envio['fuente']})")
+    log.info(f"{so_name}: factura de envio aparte {nombre} por {envio['total']:,.2f} "
+             f"(complementa {', '.join(v['name'] for v in vivas)}; fuente {envio['fuente']}).")
+    return f"ENVIO_FACTURADO_APARTE {nombre} {envio['total']:.2f}"
+
+
+def religar_kits(odoo, inv_id, religar, so_name):
+    """Liga las lineas de kit de una factura YA PUBLICADA a su linea de SO.
+
+    Probado en el espejo el 29-oct (INV/2026/150950 / SO10298832): el asiento
+    no cambia (el costo ya se calculo al publicar) y la SO pasa a ver la
+    factura (invoice_count, qty_invoiced). Si falla, la factura queda
+    correcta pero suelta: solo se avisa.
+    """
+    lineas = odoo.execute_kw('account.move.line', 'search_read',
+                             [[('move_id', '=', inv_id), ('display_type', '=', 'product'),
+                               ('sale_line_ids', '=', False)]],
+                             {'fields': ['id', 'product_id']})
+    for product_id, sale_line_id in religar:
+        linea = next((l for l in lineas
+                      if l['product_id'] and l['product_id'][0] == product_id), None)
+        if not linea:
+            continue
+        lineas.remove(linea)
+        try:
+            odoo.execute_kw('account.move.line', 'write',
+                            [[linea['id']], {'sale_line_ids': [(4, sale_line_id)]}])
+        except Exception as e:
+            log.warning(f"{so_name}: no se pudo ligar a la SO la linea de kit "
+                        f"{linea['id']}: {e}")
+
+
+def es_kit(odoo, product_id, catalogos):
+    """True si el producto tiene lista de materiales tipo kit (phantom)."""
+    cache = catalogos.setdefault('kits', {})
+    if product_id not in cache:
+        tmpl = odoo.execute_kw('product.product', 'read', [[product_id]],
+                               {'fields': ['product_tmpl_id']})[0]['product_tmpl_id'][0]
+        cache[product_id] = bool(odoo.execute_kw(
+            'mrp.bom', 'search_count',
+            [['|', ('product_id', '=', product_id),
+              '&', ('product_id', '=', False), ('product_tmpl_id', '=', tmpl),
+              ('type', '=', 'phantom')]]))
+    return cache[product_id]
+
+
+def pagado_por_cliente(record):
+    """OrderTotal de Amazon guardado por el miner, o None."""
+    try:
+        raw = json.loads(record['raw_json']) if record.get('raw_json') else {}
+    except (ValueError, TypeError):
+        return None
+    valor = raw.get('amazon', {}).get('order_total_cliente')
+    return a_float(valor) if valor else None
+
+
+def comando_envio(base, catalogos):
+    """Linea C-ENVIO de factura. El ingreso lo pone la cuenta del producto
+    (401.01.002: Finanzas se la asigno en produccion el 28-oct, segundo)."""
+    return (0, 0, {
+        'display_type': 'product',
+        'sequence': 999,
+        'name': 'Costo de envio cobrado por Amazon',
+        'product_id': catalogos['producto_envio'],
+        'quantity': 1.0,
+        'discount': 0.0,
+        'price_unit': base,
+        'tax_ids': [(6, 0, [TAX_ID_MARKETPLACES])],
+    })
+
+
+# IVA que Amazon retiene sobre el envio que acredita: la mitad del IVA. Un
+# envio de 59.00 (IVA 8.14) entra al deposito por 59.00 - 4.07 = 54.93.
+FACTOR_DEPOSITO_ENVIO = 1 - 0.08 / 1.16
+
+
+def envio_por_facturar(db_conn, record, ya_facturado, catalogos, tiene_envio):
+    """Envio que el cliente pago y que falta facturar.
+
+    Devuelve None (no hay), {'base', 'iva', 'total', 'fuente'} o
+    {'error': motivo} cuando hay una diferencia que nadie confirma.
+
+    ya_facturado: lo que ya va en la factura (o la suma de las facturas
+    vivas) SIN envio. tiene_envio: ya lleva una linea C-ENVIO.
+
+    Fuentes, en orden (correo de Jero del 28-oct, segundo):
+      1. settlement: los campos de envio de las transacciones.
+      2. Si no vienen ahi, OrderTotal - ya_facturado es envio SOLO si una
+         segunda fuente lo confirma:
+         a. deposito: Amazon deposito de mas, neto del IVA que retiene
+            (701-4769487-1597824: 54.93 = 59.00 - 4.07);
+         b. API de ordenes: ShippingPrice + ShippingTax de getOrderItems.
+         Si ninguna confirma, excepcion: no cualquier diferencia se factura
+         como envio.
+    """
+    if tiene_envio or not catalogos.get('producto_envio'):
+        return None
+    try:
+        raw = json.loads(record['raw_json']) if record.get('raw_json') else {}
+    except (ValueError, TypeError):
+        raw = {}
+    imp = raw.get('importes', {})
+    cliente = raw.get('amazon', {}).get('order_total_cliente')
+
+    base = round(a_float(imp.get('envio_base')), 2)
+    if base > 0.005:
+        iva = round(a_float(imp.get('envio_iva')), 2)
+        total = round(base + iva, 2)
+        # Si ya se facturo lo que pago el cliente, el envio ya va incluido.
+        if cliente is not None and abs(a_float(cliente) - ya_facturado) <= 0.05:
+            return None
+        return {'base': base, 'iva': iva, 'total': total, 'fuente': 'settlement'}
+
+    if cliente is None:
+        return None
+    # Si las transacciones ya suman lo que pago el cliente, la diferencia no
+    # es envio escondido: es la SO la que no cuadra (TOTAL_DIFF, como antes).
+    if abs(a_float(imp.get('cfdi_total')) - a_float(cliente)) <= 0.05:
+        return None
+    dif = round(a_float(cliente) - ya_facturado, 2)
+    if dif <= 0.05:
+        return None
+
+    def envio_de(total, fuente):
+        # El importe es el de la fuente que confirma (59.00), no la resta
+        # contra la factura (58.99 si la factura salio un centavo arriba).
+        total = round(total, 2)
+        base_e = round(total / 1.16, 2)
+        return {'base': base_e, 'iva': round(total - base_e, 2), 'total': total,
+                'fuente': fuente}
+
+    exc = round(a_float(imp.get('deposito')) - a_float(imp.get('cfdi_total'))
+                - a_float(imp.get('fees_total')), 2)
+    if exc > 0.005 and abs(round(exc / FACTOR_DEPOSITO_ENVIO, 2) - dif) <= 0.05:
+        return envio_de(exc / FACTOR_DEPOSITO_ENVIO, 'deposito')
+
+    try:
+        api = 0.0
+        for it in get_order_items(sp_api_token(db_conn), record['mkp_order_id']):
+            for k in ('ShippingPrice', 'ShippingTax'):
+                api += a_float((it.get(k) or {}).get('Amount'))
+            api -= a_float((it.get('ShippingDiscount') or {}).get('Amount'))
+        if api > 0.005 and abs(round(api, 2) - dif) <= 0.05:
+            return envio_de(api, 'api')
+    except Exception as e:
+        log.warning(f"{record['mkp_order_id']}: no se pudo consultar la API de ordenes: {e}")
+
+    return {'error': (f"El cliente pago {a_float(cliente):,.2f} (OrderTotal) y la SO "
+                      f"suma {ya_facturado:,.2f}: {dif:,.2f} de diferencia que ni el "
+                      f"settlement, ni el deposito, ni la API confirman como envio.")}
+
+
 def armar_lineas(odoo, so):
     """Lineas del CFDI sobre la cantidad PEDIDA (caso normal, una factura)."""
     return [comando_linea(l, l['product_uom_qty']) for l in leer_lineas_so(odoo, so)]
@@ -1161,7 +1691,14 @@ def cargar_catalogos(odoo):
     mx = odoo.execute_kw('res.country', 'search', [[('code', '=', 'MX')]],
                          {'limit': 1})
     log.info(f"Catalogo de formas de pago SAT: {len(metodos)} claves.")
-    return {'formas_pago': metodos, 'mx_country_id': mx[0] if mx else False}
+    envio = odoo.execute_kw('product.product', 'search',
+                            [[('default_code', '=', PRODUCTO_ENVIO)]], {'limit': 1})
+    if not envio:
+        log.warning(f"No existe el producto {PRODUCTO_ENVIO}: las facturas con "
+                    f"envio cobrado y SO sin envio saldran en TOTAL_DIFF.")
+    return {'formas_pago': metodos, 'mx_country_id': mx[0] if mx else False,
+            'cuenta_merc_no_enviada': get_account_id(odoo, ACCOUNT_MERC_NO_ENVIADA),
+            'producto_envio': envio[0] if envio else None}
 
 
 def extraer_desglose_b2b(record):
@@ -1318,6 +1855,12 @@ def resolver_partner_b2b(odoo, cfdi, so, catalogos, cache):
         'l10n_mx_edi_fiscal_regime': cfdi.get('receiver_tax_regime') or False,
         'country_id': catalogos['mx_country_id'],
         'company_type': 'person' if len(rfc) == 13 else 'company',
+        # Genericos: ver B2B_TELEFONO_GENERICO. Solo al crear; un cliente que
+        # ya existe conserva sus datos.
+        'phone': B2B_TELEFONO_GENERICO,
+        'email': B2B_CORREO_GENERICO,
+        'comment': ("Creado desde el CFDI de Amazon Business. Telefono y correo "
+                    "genericos: el CFDI no trae datos de contacto."),
     }
     try:
         nuevo = odoo.execute_kw('res.partner', 'create', [vals],
@@ -1331,7 +1874,8 @@ def resolver_partner_b2b(odoo, cfdi, so, catalogos, cache):
         return None
 
 
-def postear_chatter(odoo, inv_id, record, tipo, uuid, parte=None):
+def postear_chatter(odoo, inv_id, record, tipo, uuid, parte=None, inv=None,
+                    extra=None):
     """Log de conciliacion en el chatter.
 
     Acordado con Finanzas como solucion temporal mientras no existan los
@@ -1367,10 +1911,34 @@ def postear_chatter(odoo, inv_id, record, tipo, uuid, parte=None):
         f"Tipo: {tipo}",
         f"CFDI UUID: {uuid or 'pendiente'}",
         "",
-        f"Base: {imp.get('cfdi_base', 0):,.2f}",
-        f"IVA: {imp.get('cfdi_iva', 0):,.2f}",
-        f"Total: {imp.get('cfdi_total', 0):,.2f}",
-        f"Comisiones Amazon: {imp.get('fees_total', 0):,.2f}",
+    ]
+    # Factura y venta acreditada por separado. Antes solo salian las
+    # transacciones rotuladas "Base/IVA/Total", y en una promocion pagada por
+    # Amazon (702-6841264-9666630: 1,999.00 vs factura 1,399.28) parecian los
+    # importes de la factura.
+    if inv:
+        lineas.append(f"Factura Odoo: base {a_float(inv.get('amount_untaxed')):,.2f}"
+                      f" | IVA {a_float(inv.get('amount_tax')):,.2f}"
+                      f" | total {a_float(inv.get('amount_total')):,.2f}")
+    cliente = amz.get('order_total_cliente')
+    if cliente is not None:
+        lineas.append(f"Pagado por el comprador (Amazon OrderTotal): "
+                      f"{a_float(cliente):,.2f}")
+    lineas += [
+        f"Venta acreditada por Amazon (transacciones): "
+        f"base {imp.get('cfdi_base', 0):,.2f} | IVA {imp.get('cfdi_iva', 0):,.2f}"
+        f" | total {imp.get('cfdi_total', 0):,.2f}",
+        f"Comisiones e IVA retenido por Amazon: {imp.get('fees_total', 0):,.2f} "
+        f"(desglose en el chatter del cobro)",
+    ]
+    promo = (parte or {}).get('promo')
+    if not promo and cliente is not None \
+            and a_float(imp.get('cfdi_total')) - a_float(cliente) > 0.01:
+        lineas.append(f"Diferencia venta acreditada - comprador: "
+                      f"{a_float(imp.get('cfdi_total')) - a_float(cliente):,.2f}"
+                      f" (promocion pagada por Amazon; se registra al aplicar "
+                      f"el cobro).")
+    lineas += [
         f"Fecha de liberacion: {amz.get('deposit_date') or 'n/d'}",
         f"Red: {amz.get('fulfillment_network') or 'n/d'} | "
         f"Piezas: {amz.get('n_items') or 'n/d'} | "
@@ -1380,6 +1948,23 @@ def postear_chatter(odoo, inv_id, record, tipo, uuid, parte=None):
     # En una orden repartida, cada factura lleva los datos de SU CFDI, no los
     # agregados de la orden.
     cfdi = (parte or {}).get('cfdi') or raw.get('cfdi_amazon_business') or {}
+
+    # Con promocion de Amazon la venta acreditada (precio completo) NO es la
+    # factura: se dice explicitamente.
+    if promo:
+        lineas += [
+            "",
+            "PROMOCION FINANCIADA POR AMAZON",
+            f"Pagado por el cliente (Amazon OrderTotal): "
+            f"{promo['cobrado_cliente']:,.2f}",
+            f"Total segun transacciones de Amazon: "
+            f"{promo['transacciones']:,.2f}",
+            f"Excedente absorbido por Amazon: {promo['excedente']:,.2f}",
+            "La factura va por lo que pago el cliente (monto de la SO). La "
+            "venta acreditada de arriba son las transacciones, no la factura. "
+            "El excedente no se aplica a la CxC: se registra al aplicar el "
+            "cobro (403.01.002 + 208.01.001).",
+        ]
 
     envio = (parte or {}).get('envio')
     if envio:
@@ -1426,12 +2011,76 @@ def postear_chatter(odoo, inv_id, record, tipo, uuid, parte=None):
             "expone metadata del comprobante.",
         ]
 
+    if extra:
+        lineas += [""] + extra
+
     body = '\n'.join(lineas)
     try:
         odoo.execute_kw('account.move', 'message_post', [inv_id],
                         {'body': body, 'message_type': 'comment'})
     except Exception as e:
         log.warning(f"No se pudo postear el chatter en {inv_id}: {e}")
+
+
+# =============================================================================
+# PROMOCIONES FINANCIADAS POR AMAZON (B2C)
+# =============================================================================
+# Amazon a veces absorbe parte del precio: el cliente paga menos y Amazon le
+# liquida al vendedor el precio completo. amz_transaction_items NO trae ese
+# descuento (no lo paga el vendedor), asi que la suma de transacciones sale
+# por el precio completo y no cuadra con la SO, que Yuju crea por lo que pago
+# el cliente.
+#
+# En B2B ya se resolvia solo: la referencia es el CFDI de Amazon, que va por
+# lo que pago el cliente. En B2C la referencia es la suma de transacciones y
+# estas ordenes caian en TOTAL_DIFF. Casos de la prueba del 26-sep, todos con
+# un cupon de $100:
+#
+#   orden                SO (Odoo)   transacciones   amazon_orders.OrderTotal
+#   701-7403714-0375443    515.01       615.00              515.00
+#   701-2640601-6960243  2,149.00     2,249.00            2,149.00
+#   702-1844782-3257848  7,898.00     7,998.00            7,898.00
+#   702-3221480-9299457    899.00       999.00              899.00
+#
+# Y el de control B2B: 701-2593380-9743412, SO 1,741.13, CFDI de Amazon
+# 1,741.13, OrderTotal 1,741.13, transacciones 2,597.69.
+#
+# REGLA (acordada con Finanzas): facturar por la SO cuando coincide con lo que
+# Amazon le cobro al cliente y es MENOR que las transacciones. Las tres
+# condiciones, y no solo "la SO es menor":
+#
+#   1. Hay un OrderTotal inequivoco en amazon_orders (ver
+#      total_cobrado_cliente). Es la fuente independiente: sin ella, un error
+#      de la SO se facturaria sin que nadie lo vea.
+#   2. La SO coincide con ese OrderTotal (+-TOLERANCIA_TOTAL).
+#   3. La SO es MENOR que las transacciones. Si fuera mayor no es una
+#      promocion de Amazon, es otra cosa, y sigue a TOTAL_DIFF.
+#
+# El excedente (transacciones - SO) no se factura ni se aplica a la CxC.
+# 03_loader_amz_payments.py lo marca como EXCEDENTE_NO_APLICADO cuando llega
+# el cobro. Su tratamiento contable y fiscal (cuenta, IVA, CFDI) esta
+# pendiente de Finanzas.
+# =============================================================================
+
+def evaluar_promo_amazon(record, parte):
+    """Detalle de la promocion si la orden cumple la regla; si no, None."""
+    try:
+        raw = json.loads(record['raw_json']) if record.get('raw_json') else {}
+    except (ValueError, TypeError):
+        return None
+    cobrado = raw.get('amazon', {}).get('order_total_cliente')
+    if not cobrado:
+        return None
+
+    estimado = parte['estimado']
+    transacciones = parte['referencia']
+    if abs(estimado - cobrado) > TOLERANCIA_TOTAL:
+        return None                    # la SO no es lo que pago el cliente
+    if estimado >= transacciones - TOLERANCIA_TOTAL:
+        return None                    # no hay nada que Amazon haya absorbido
+    return {'cobrado_cliente': cobrado,
+            'transacciones': transacciones,
+            'excedente': round(transacciones - estimado, 2)}
 
 
 def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache):
@@ -1452,45 +2101,108 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
         stats['sin_so'].append(so_name)
         return
 
-    # --- Guard de estado de la SO ---
-    # Una SO cancelada NO se factura. Si Amazon registro Order Payment y la
-    # orden esta cancelada, lo correcto es factura + nota de credito Tipo A,
-    # no facturar a ciegas.
-    if so['state'] == 'cancel':
-        update_staging(db_conn, record['id'], 'SO_CANCELLED',
-                       error_log='SO cancelada. Requiere nota de credito Tipo A.')
+    # --- Estado de la SO: toda venta que Amazon cobro se factura ---
+    # Regla de Finanzas (correo de Jero, 28-oct-2026, flujo v2 paso 2). Antes
+    # las SO canceladas y en borrador se apartaban como excepcion.
+    #
+    # SO cancelada: se factura igual. La venta existio y Amazon la cobro; el
+    # reembolso lleva su NC por el flujo de devoluciones, aunque venta y
+    # reembolso caigan en el mismo settlement. Cada operacion queda con su
+    # soporte fiscal. NO se reabre la SO (action_draft + confirmar crearia
+    # salidas de almacen de algo que no se va a enviar): la factura se liga a
+    # sus lineas tal como estan. En el lote 6 los 4 casos tenian venta y
+    # reembolso total en el mismo settlement.
+    so_cancelada = so['state'] == 'cancel'
+    if so_cancelada:
         stats['canceladas'].append(so_name)
-        return
+        log.info(f"{so_name}: SO cancelada en Odoo y cobrada por Amazon. Se "
+                 f"factura; la NC sale por el flujo de devoluciones.")
 
+    # SO en borrador o cotizacion enviada: se confirma y se factura. En el
+    # lote 6 eran 5, todas FBA y sin salida. Confirmar no manda correo al
+    # cliente (Odoo solo lo hace con send_email en el contexto) y genera la
+    # salida de almacen que corresponde a una venta ya cobrada.
     if so['state'] in ('draft', 'sent'):
-        update_staging(db_conn, record['id'], 'SO_DRAFT',
-                       error_log=f"SO en estado '{so['state']}'")
-        stats['borrador'].append(so_name)
-        return
+        motivo = confirmar_so(odoo, so)
+        if motivo:
+            update_staging(db_conn, record['id'], 'SO_DRAFT', error_log=motivo,
+                           sumar_retry=True)
+            stats['borrador'].append(f"{so_name}: {motivo}")
+            return
+        stats['confirmadas'].append(so_name)
 
     # --- BLINDAJE 4: re-validacion FAIL-CLOSED ---
     # Se vuelve a preguntar a Odoo justo antes de crear. Si la consulta falla,
     # NO se crea: es la leccion del 26-jul-2026.
     try:
-        existentes = facturas_existentes(odoo, so_name)
+        existentes = facturas_existentes(odoo, so_name, so)
     except Exception as e:
         update_staging(db_conn, record['id'], 'ERROR',
                        error_log=f'No se pudo re-validar duplicidad: {e}',
                        sumar_retry=True)
         return
 
+    # La factura aparte de envio (AUTOINV:<SO>:ENVIO) no es "otra factura de
+    # la venta": complementa a la principal. No cuenta para duplicados.
+    de_envio = [e for e in existentes if (e.get('ref') or '').endswith(SUFIJO_ENVIO)]
+    existentes = [e for e in existentes if e not in de_envio]
+
     # Cuantas facturas DEBE tener esta orden. Normalmente una; tantas como
     # CFDI emitio Amazon cuando la orden viene repartida.
     desglose = extraer_desglose_b2b(record)
     esperadas = len(desglose) if desglose else 1
 
-    if len(existentes) >= esperadas:
-        if len(existentes) > esperadas:
-            stats['duplicados'].append(so_name)
-            log.error(f"{so_name}: {len(existentes)} facturas vivas y se "
-                      f"esperaban {esperadas}. INCIDENTE FISCAL.")
+    # --- Factura global anterior: la orden ya tiene soporte fiscal ---
+    globales = [e for e in existentes if es_global(e)]
+    if globales:
+        nombres = ', '.join(e['name'] for e in globales)
         update_staging(db_conn, record['id'], 'ALREADY_ODOO_INVOICED',
-                       error_log=f'Ya tenia {len(existentes)} factura(s) viva(s)')
+                       error_log=f'En factura global {nombres}. No se refactura.')
+        stats['ya_facturadas'] += 1
+        stats['en_global'].append(f"{so_name} ({nombres})")
+        return
+
+    # --- B2B que ya tiene una factura nuestra a publico en general ---
+    # Amazon emitio el CFDI al cliente y nosotros (el 1 a 1, antes de este
+    # proceso) otro a publico general: dos CFDI de la misma venta. Vincular el
+    # de Amazon encima seria una tercera factura. Hay que anular primero la de
+    # publico general: cancelacion ante el SAT con motivo 02 (confirmado por
+    # Finanzas el 28-oct, segundo). Mientras no se cancele, se aparta con estado propio;
+    # el miner la reevalua en cada corrida y se vincula en cuanto la factura
+    # anterior este cancelada o revertida.
+    if es_b2b and existentes:
+        uuid_amz = (record.get('cfdi_uuid') or '').upper()
+        ajenas = [e for e in existentes
+                  if (e.get('l10n_mx_edi_cfdi_uuid') or '').upper() != uuid_amz
+                  and not (e.get('ref') or '').startswith(f"{IDEMPOTENCY_PREFIX}{so_name}:")]
+        if ajenas:
+            nombres = ', '.join(e['name'] for e in ajenas)
+            update_staging(
+                db_conn, record['id'], 'B2B_FACTURADA_PG',
+                error_log=(f"Amazon ya emitio el CFDI B2B y la orden tiene "
+                           f"factura viva {nombres}. Cancelarla ante el SAT "
+                           f"(motivo 02) antes de vincular el CFDI de Amazon."))
+            stats['b2b_facturada_pg'].append(f"{so_name} ({nombres})")
+            return
+
+    if len(existentes) >= esperadas:
+        netas, neutralizadas = netear_con_nc(odoo, so, existentes)
+        if len(netas) > esperadas:
+            stats['duplicados'].append(so_name)
+            log.error(f"{so_name}: {len(netas)} facturas vivas y se "
+                      f"esperaban {esperadas}. INCIDENTE FISCAL.")
+        nota = f'Ya tenia {len(netas)} factura(s) viva(s)'
+        if neutralizadas:
+            nota += (f" (refacturada: {', '.join(f['name'] for f in neutralizadas)} "
+                     f"neutralizada con NC)")
+        # Factura sin el envio que pago el cliente (las del 1a1): se emite una
+        # factura aparte solo por el envio, con la misma SO.
+        if not es_b2b and len(netas) == esperadas:
+            nota_envio = facturar_envio_aparte(odoo, db_conn, record, so, netas,
+                                               de_envio, account_cxc, catalogos, stats)
+            if nota_envio:
+                nota += f" | {nota_envio}"
+        update_staging(db_conn, record['id'], 'ALREADY_ODOO_INVOICED', error_log=nota)
         stats['ya_facturadas'] += 1
         return
 
@@ -1516,6 +2228,7 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
         if not lineas:
             update_staging(db_conn, record['id'], 'ALREADY_ODOO_INVOICED',
                            error_log='Sin lineas pendientes de facturar')
+            stats['ya_facturadas'] += 1
             return
         partes = [{
             'ref': f'{IDEMPOTENCY_PREFIX}{so_name}',
@@ -1525,6 +2238,31 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
             'etiqueta': '',
         }]
 
+    # --- SO cancelada con KITS: la factura tiene que llevar el costo ---
+    # Para un kit Odoo calcula el costo con los movimientos de almacen de sus
+    # componentes ligados a la linea de la SO. En una SO cancelada estan
+    # cancelados: el costo da 0 y la factura sale SIN Dr 501.01.001 / Cr
+    # 205.06.003 (7 de 26 en el lote 7). Sin la liga, Odoo toma el costo del
+    # producto kit y el asiento sale completo. Despues de publicar se vuelve a
+    # ligar a la SO (religar_kits): el asiento no cambia y la SO ve su factura
+    # (hallazgo de Sergio, 29-oct: INV/2026/150950 no aparecia en SO10298832).
+    #
+    # Solo en SO cancelada. Una refactura de kit con su lista de materiales
+    # bien SI lleva costo ligada (SO10243073, lote 6), y ligada el costo es el
+    # de los componentes que salieron, que es el exacto. Las refacturas sin
+    # costo del correo de Jero del 29-oct (TOLIXKIT#4-CLA1ROJ) son otra cosa:
+    # su lista de materiales pide 0 sillas y el kit cuesta 0 en Odoo. Eso se
+    # avisa despues de publicar (kit_sin_costo) y lo asienta el cierre mensual.
+    for parte in partes:
+        parte['religar'] = []
+        if not so_cancelada:
+            continue
+        for cmd in parte['lineas']:
+            if cmd[2].get('product_id') and cmd[2].get('sale_line_ids') \
+                    and es_kit(odoo, cmd[2]['product_id'], catalogos):
+                ligas = cmd[2].pop('sale_line_ids')
+                parte['religar'] += [(cmd[2]['product_id'], l[1]) for l in ligas]
+
     # --- Validacion de importes ANTES de crear (patron de Mercado Libre) ---
     # Si lo que Odoo va a facturar no cuadra con la referencia de Amazon, no
     # se emite nada: queda en TOTAL_DIFF para el reporte de Finanzas. Un CFDI
@@ -1532,12 +2270,57 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
     #
     # En una orden repartida se valida el conjunto: si una parte no cuadra, no
     # se factura ninguna.
+
+    # --- Envio cobrado al cliente que la SO no trae (flujo v2, paso 2) ---
+    # Yuju no pone la linea de envio en la SO. En el lote 7 las 4 TOTAL_DIFF
+    # fueron eso: SO10276040 1,799.00 vs Amazon 1,858.00 = 59.00 de envio.
+    # Si Amazon liquido envio y la factura no tiene la linea C-ENVIO, se
+    # agrega a la FACTURA (401.01.002) por la base e IVA de las transacciones.
+    # La SO no se toca: es de Yuju. Solo B2C de factura unica; en B2B manda
+    # el CFDI de Amazon.
+    if not es_b2b and len(partes) == 1:
+        lineas0 = partes[0]['lineas']
+        envio = envio_por_facturar(
+            db_conn, record, total_estimado(lineas0), catalogos,
+            any(c[2].get('product_id') == catalogos.get('producto_envio') for c in lineas0))
+        if envio and envio.get('error'):
+            update_staging(db_conn, record['id'], 'ENVIO_SIN_CONFIRMAR',
+                           error_log=envio['error'])
+            stats['envio_sin_confirmar'].append(f"{so_name}: {envio['error']}")
+            log.warning(f"{so_name}: ENVIO_SIN_CONFIRMAR. {envio['error']}")
+            return
+        if envio:
+            lineas0.append(comando_envio(envio['base'], catalogos))
+            partes[0]['envio_agregado'] = envio['total']
+            # Fuera de los campos del settlement el envio tampoco esta en la
+            # referencia (transacciones): se suma para validar el total.
+            if envio['fuente'] != 'settlement':
+                partes[0]['referencia'] = round(partes[0]['referencia'] + envio['total'], 2)
+            log.info(f"{so_name}: la SO no trae el envio que cobro Amazon; se "
+                     f"agrega C-ENVIO {envio['total']:,.2f} (fuente: {envio['fuente']}).")
+
     malas = []
     for parte in partes:
         parte['estimado'] = total_estimado(parte['lineas'])
         dif_previa = parte['estimado'] - parte['referencia']
         if parte['referencia'] > 0 and abs(dif_previa) > TOLERANCIA_TOTAL:
             malas.append((parte, dif_previa))
+
+    # Promocion financiada por Amazon (ver bloque arriba de esta funcion).
+    # Solo B2C y solo factura unica: en B2B la referencia ya es el CFDI de
+    # Amazon y las ordenes repartidas son siempre B2B.
+    if malas and not es_b2b and len(partes) == 1:
+        promo = evaluar_promo_amazon(record, partes[0])
+        if promo:
+            partes[0]['promo'] = promo
+            # Desde aqui la referencia es lo que pago el cliente: contra eso
+            # se valida el total que deja Odoo despues de crear.
+            partes[0]['referencia'] = promo['cobrado_cliente']
+            malas = []
+            log.info(f"{so_name}: promocion financiada por Amazon. Se factura "
+                     f"lo que pago el cliente {promo['cobrado_cliente']:,.2f} "
+                     f"(transacciones {promo['transacciones']:,.2f}, "
+                     f"excedente {promo['excedente']:,.2f}).")
 
     if malas:
         detalle = '; '.join(
@@ -1554,12 +2337,17 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
         partner_b2b = resolver_partner_b2b(odoo, cfdi, so, catalogos,
                                            partner_cache)
         if not partner_b2b:
+            rfc = (cfdi.get('receiver_rfc') or '').strip().upper()
+            if rfc and rfc != 'XAXX010101000':
+                motivo = (f"Odoo no permitio crear el cliente {rfc} (ver el log "
+                          f"de la corrida).")
+            else:
+                motivo = (f"CFDI de Amazon sin RFC receptor utilizable "
+                          f"(receiver_rfc={cfdi.get('receiver_rfc')!r}).")
             update_staging(
                 db_conn, record['id'], 'B2B_NO_RECEPTOR',
-                error_log=(f"CFDI de Amazon sin RFC receptor utilizable "
-                           f"(receiver_rfc={cfdi.get('receiver_rfc')!r}). No se "
-                           f"factura a publico general para no contradecir el "
-                           f"comprobante de Amazon."))
+                error_log=(f"{motivo} No se factura a publico general para no "
+                           f"contradecir el comprobante de Amazon."))
             stats['b2b_sin_receptor'].append(so_name)
             return
 
@@ -1576,9 +2364,344 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
         if creada is None:
             return   # el error ya quedo registrado en la tabla de control
 
-    update_staging(db_conn, record['id'],
-                   'ODOO_B2B_LINKED' if es_b2b else 'ODOO_INVOICED',
-                   cfdi_uuid=record['cfdi_uuid'])
+    promo = partes[0].get('promo') if len(partes) == 1 else None
+    if promo:
+        stats['promo_amazon'].append(
+            f"{record['mkp_order_id']} | {so_name} | cliente "
+            f"{promo['cobrado_cliente']:,.2f} | transacciones "
+            f"{promo['transacciones']:,.2f} | excedente "
+            f"{promo['excedente']:,.2f}")
+    # error_log como bitacora de lo que paso con la orden; el reporte de
+    # Finanzas lo lee (SO_CANCELADA alimenta despues el flujo de NC).
+    notas = []
+    if promo:
+        notas.append(f"PROMO_AMAZON cliente {promo['cobrado_cliente']:.2f} "
+                     f"transacciones {promo['transacciones']:.2f} "
+                     f"excedente {promo['excedente']:.2f}")
+    if so_cancelada:
+        notas.append("SO_CANCELADA en Odoo: facturada porque Amazon cobro la "
+                     "venta; la NC sale por el flujo de devoluciones")
+    if so_name in stats['confirmadas']:
+        notas.append("SO_CONFIRMADA: estaba en borrador")
+    if len(partes) == 1 and partes[0].get('envio_agregado'):
+        notas.append(f"ENVIO_AGREGADO C-ENVIO {partes[0]['envio_agregado']:.2f}")
+    update_staging(
+        db_conn, record['id'],
+        'ODOO_B2B_LINKED' if es_b2b else 'ODOO_INVOICED',
+        cfdi_uuid=record['cfdi_uuid'],
+        error_log=' | '.join(notas) or None,
+        total_amount=promo['cobrado_cliente'] if promo else None)
+
+
+# =============================================================================
+# B2B: CUADRE AL CENTAVO CON EL CFDI DE AMAZON
+# =============================================================================
+# La factura B2B en Odoo REPRESENTA el CFDI que timbro Amazon: lleva su UUID.
+# Su total tiene que ser el del comprobante, al centavo. No lo era:
+#
+#                    base       IVA      total
+#   CFDI Amazon      1,206.29   193.00   1,399.29   (702-6841264-9666630)
+#   INV/2026/150708  1,206.28   193.00   1,399.28
+#
+# Odoo arma la factura desde la SO; Amazon parte del precio con IVA y reparte
+# base e IVA a su manera. El centavo puede caer en la BASE (este caso) o en
+# el IVA (base igual, Odoo redondea base x 16% distinto). Cuando se adjunte
+# el XML (D10) diria 1,399.29 y Odoo 1,399.28.
+#
+# Arreglo en dos pasos, con la factura todavia en borrador:
+#   1. Base (cuadrar_base_con_cfdi): se corrige el precio de UNA linea de
+#      producto para que la base sea la del CFDI. Mueve el centavo en 401
+#      (ventas): el CFDI de Amazon es la fuente de verdad. Va ANTES de poner
+#      la CxC de Amazon, porque cambiar un precio recalcula las lineas.
+#   2. IVA (cuadrar_con_cfdi): se corrige la LINEA DE IVA al importe del CFDI.
+#      Odoo permite editar el impuesto de un borrador (es lo que hace el
+#      widget de totales) y al hacerlo rebalancea solo la CxC.
+#
+# Solo se toca si es redondeo: diferencias de pocos centavos
+# (TOLERANCIA_CUADRE_CFDI). Cada paso relee la factura y, si no quedo igual
+# al CFDI, deshace su cambio. Si algo no cuadra o Odoo rechaza el cambio, la
+# factura se crea igual que antes y queda el aviso en el log: no se bloquea
+# la facturacion por esto.
+# =============================================================================
+
+TOLERANCIA_CUADRE_CFDI = 0.05
+
+
+def cuadrar_base_con_cfdi(odoo, inv_id, cfdi, etiqueta):
+    """Iguala la base de la factura a la del CFDI (subtotal - descuento)
+    corrigiendo el precio de una linea. Devuelve el ajuste (0.0 si no hubo)."""
+    if a_float(cfdi.get('total')) <= 0:
+        return 0.0
+    base_cfdi = round(a_float(cfdi.get('subtotal')) - a_float(cfdi.get('discount')), 2)
+    base_odoo = round(a_float(odoo.execute_kw(
+        'account.move', 'read', [[inv_id]],
+        {'fields': ['amount_untaxed']})[0]['amount_untaxed']), 2)
+    dif = round(base_cfdi - base_odoo, 2)
+    if dif == 0:
+        return 0.0
+    if abs(dif) > TOLERANCIA_CUADRE_CFDI:
+        log.warning(f"{etiqueta}: base Odoo {base_odoo:,.2f} vs CFDI "
+                    f"{base_cfdi:,.2f}. No es redondeo: no se ajusta.")
+        return 0.0
+
+    # Linea sin descuento; de preferencia de 1 pieza (el centavo cae exacto
+    # en el precio) y la de mayor importe (el producto, no el envio).
+    lineas = odoo.execute_kw(
+        'account.move.line', 'search_read',
+        [[('move_id', '=', inv_id), ('display_type', '=', 'product')]],
+        {'fields': ['id', 'quantity', 'price_unit', 'discount',
+                    'price_subtotal']})
+    candidatas = [l for l in lineas
+                  if not l['discount'] and a_float(l['quantity']) > 0]
+    if not candidatas:
+        log.warning(f"{etiqueta}: sin linea donde ajustar la base. No se ajusta.")
+        return 0.0
+    linea = max(candidatas, key=lambda l: (a_float(l['quantity']) == 1,
+                                           a_float(l['price_subtotal'])))
+    precio_previo = linea['price_unit']
+    nuevo = round((a_float(linea['price_subtotal']) + dif)
+                  / a_float(linea['quantity']), 6)
+
+    def escribir_precio(precio):
+        odoo.execute_kw('account.move', 'write',
+                        [[inv_id], {'invoice_line_ids': [(1, linea['id'], {
+                            'price_unit': precio})]}],
+                        {'context': {'tracking_disable': True}})
+
+    try:
+        escribir_precio(nuevo)
+    except Exception as e:
+        log.warning(f"{etiqueta}: Odoo rechazo el ajuste de la base: {e}")
+        return 0.0
+
+    final = round(a_float(odoo.execute_kw(
+        'account.move', 'read', [[inv_id]],
+        {'fields': ['amount_untaxed']})[0]['amount_untaxed']), 2)
+    if final != base_cfdi:
+        log.warning(f"{etiqueta}: tras el ajuste la base es {final:,.2f}, el "
+                    f"CFDI {base_cfdi:,.2f}. Se deshace el cambio.")
+        try:
+            escribir_precio(precio_previo)
+        except Exception as e:
+            log.error(f"{etiqueta}: no se pudo deshacer el precio de la linea "
+                      f"{linea['id']} ({precio_previo}). Revisar a mano: {e}")
+        return 0.0
+    log.info(f"{etiqueta}: base ajustada {dif:+.2f} para igualar el CFDI de "
+             f"Amazon ({base_cfdi:,.2f}).")
+    return dif
+
+
+def cuadrar_con_cfdi(odoo, inv_id, cfdi, etiqueta):
+    """Iguala el IVA (y por tanto el total) de la factura al CFDI de Amazon.
+    Devuelve el ajuste aplicado al IVA (0.0 si no hubo)."""
+    total_cfdi = round(a_float(cfdi.get('total')), 2)
+    iva_cfdi = round(a_float(cfdi.get('taxes')), 2)
+    base_cfdi = round(a_float(cfdi.get('subtotal')) - a_float(cfdi.get('discount')), 2)
+    if total_cfdi <= 0 or iva_cfdi <= 0:
+        return 0.0
+
+    inv = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                          {'fields': ['amount_untaxed', 'amount_tax',
+                                      'amount_total']})[0]
+    dif_total = round(total_cfdi - a_float(inv['amount_total']), 2)
+    if dif_total == 0:
+        return 0.0
+
+    base_odoo = round(a_float(inv['amount_untaxed']), 2)
+    dif_iva = round(iva_cfdi - a_float(inv['amount_tax']), 2)
+    if abs(dif_total) > TOLERANCIA_CUADRE_CFDI or base_odoo != base_cfdi \
+            or dif_iva != dif_total:
+        log.warning(f"{etiqueta}: total Odoo {inv['amount_total']:,.2f} vs CFDI "
+                    f"{total_cfdi:,.2f} (base Odoo {base_odoo:,.2f} / CFDI "
+                    f"{base_cfdi:,.2f}). No es redondeo del IVA: no se ajusta.")
+        return 0.0
+
+    lineas_iva = odoo.execute_kw(
+        'account.move.line', 'search_read',
+        [[('move_id', '=', inv_id), ('display_type', '=', 'tax')]],
+        {'fields': ['id', 'balance']})
+    if len(lineas_iva) != 1:
+        log.warning(f"{etiqueta}: {len(lineas_iva)} lineas de impuesto; se "
+                    f"esperaba 1. No se ajusta el centavo.")
+        return 0.0
+
+    # En una factura de cliente el IVA es un credito: balance negativo.
+    linea = lineas_iva[0]
+    nuevo = round(a_float(linea['balance']) - dif_iva, 2)
+    try:
+        odoo.execute_kw('account.move', 'write',
+                        [[inv_id], {'line_ids': [(1, linea['id'], {
+                            'amount_currency': nuevo, 'balance': nuevo})]}],
+                        {'context': {'tracking_disable': True}})
+    except Exception as e:
+        log.warning(f"{etiqueta}: Odoo rechazo el ajuste del IVA: {e}")
+        return 0.0
+
+    final = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                            {'fields': ['amount_total']})[0]['amount_total']
+    if round(a_float(final), 2) != total_cfdi:
+        log.warning(f"{etiqueta}: tras el ajuste el total es {final:,.2f}, el "
+                    f"CFDI {total_cfdi:,.2f}. Revisar a mano.")
+        return 0.0
+    log.info(f"{etiqueta}: IVA ajustado {dif_iva:+.2f} para igualar el CFDI "
+             f"de Amazon ({total_cfdi:,.2f}).")
+    return dif_iva
+
+
+# =============================================================================
+# CONCILIACION DE LA 205.06.003 (MERCANCIAS FACTURADAS - NO ENVIADAS)
+# =============================================================================
+# Con contabilidad anglosajona la factura acredita el costo en la 205.06.003 y
+# la salida de almacen (OUT) lo debita. Odoo concilia las dos partidas solo:
+# al publicar la factura si la salida ya existe, y al validar la salida si la
+# factura ya existe. Pero solo toma partidas que NO esten conciliadas.
+#
+# Al refacturar, la salida sigue conciliada con la factura anterior y Odoo no
+# la toca: la factura nueva queda abierta. Hallazgo de Jero en el lote 6 (44
+# de 48 facturas; ej. SO10307197: VALIN/2026/09/46644 conciliado con
+# INV/2026/145489 cancelada, INV/2026/150842 abierta). En pruebas la causa
+# fue 06_reset_lote_test.py, que cancelaba con un write directo y no
+# desconciliaba la 205.06.003. En produccion pasara cada vez que una factura
+# se anule para refacturar (los B2B que hoy estan a publico general).
+#
+# Lo que pide Finanzas, y lo que hace conciliar_salida() despues de publicar:
+#   (i)   rompe la conciliacion de la salida con una factura CANCELADA o
+#         revertida por completo con NC;
+#   (ii)  si la factura anterior se revirtio con NC, concilia su 205.06.003
+#         con la de la NC (la CxC ya la concilia Odoo al revertir);
+#   (iii) concilia la factura vigente con la salida, producto por producto.
+#
+# Una conciliacion con una factura VIVA no se toca nunca.
+#
+# reconcile y remove_move_reconcile no devuelven nada y por XML-RPC fallan al
+# responder despues de haber hecho el trabajo (ver ejecutar_sin_retorno): el
+# resultado se confirma releyendo.
+#
+# Si el costo promedio cambio entre la factura y la salida, los importes no
+# son iguales y la conciliacion queda parcial: el estado sale PARCIAL con el
+# residuo, para que Finanzas lo vea.
+# =============================================================================
+
+def conciliar_salida(odoo, so, inv_id, cuenta):
+    """Rehace la conciliacion de la 205.06.003 de una factura publicada.
+
+    Devuelve {'estado', 'detalle'}:
+      CONCILIADA   todas las partidas de la factura conciliadas con su salida
+      SIN_SALIDA   la orden todavia no sale del almacen (OUT posterior: Odoo
+                   concilia al validar la salida)
+      PARCIAL      quedo un residuo (salida parcial o costo distinto)
+      SIN_LINEAS   la factura no tiene 205.06.003 (solo servicio o envio)
+      ERROR        no se pudo; la factura queda como esta
+    """
+    campos = ['id', 'move_id', 'product_id', 'balance', 'amount_residual',
+              'reconciled', 'matched_debit_ids', 'matched_credit_ids']
+    try:
+        de_factura = odoo.execute_kw(
+            'account.move.line', 'search_read',
+            [[('move_id', '=', inv_id), ('account_id', '=', cuenta)]],
+            {'fields': campos})
+        if de_factura and all(l['reconciled'] for l in de_factura):
+            return {'estado': 'CONCILIADA', 'detalle': 'conciliada por Odoo al publicar'}
+
+        dominio_salida = [('account_id', '=', cuenta), ('parent_state', '=', 'posted'),
+                          ('move_id.stock_move_id.sale_line_id.order_id', '=', so['id']),
+                          ('balance', '>', 0)]
+        salidas = odoo.execute_kw('account.move.line', 'search_read',
+                                  [dominio_salida], {'fields': campos})
+        if not salidas:
+            if not de_factura:
+                return {'estado': 'SIN_LINEAS', 'detalle': ''}
+            return {'estado': 'SIN_SALIDA',
+                    'detalle': 'sin salida de almacen; Odoo concilia al validarla'}
+        # Aunque la factura vigente no traiga costo (kit refacturado antes de
+        # la correccion del 29-oct), la salida NO puede quedarse conciliada
+        # con la factura cancelada: asi el cierre mensual la ve abierta y le
+        # asienta el costo (SO10232549, SO10308861, SO10309861).
+
+        # (i) Conciliaciones de la salida con facturas canceladas o revertidas.
+        rotas, revertidas, nombres = [], set(), []
+        for l in salidas:
+            parciales = l['matched_debit_ids'] + l['matched_credit_ids']
+            if not parciales:
+                continue
+            pr = odoo.execute_kw('account.partial.reconcile', 'read', [parciales],
+                                 {'fields': ['debit_move_id', 'credit_move_id']})
+            otras = {p[k][0] for p in pr for k in ('debit_move_id', 'credit_move_id')
+                     if p[k] and p[k][0] != l['id']}
+            movs = odoo.execute_kw('account.move.line', 'read', [list(otras)],
+                                   {'fields': ['move_id']})
+            facturas = odoo.execute_kw(
+                'account.move', 'read', [list({m['move_id'][0] for m in movs})],
+                {'fields': ['name', 'state', 'payment_state']})
+            viejas = [f for f in facturas
+                      if f['state'] == 'cancel' or f['payment_state'] == 'reversed']
+            if viejas:
+                rotas.append(l['id'])
+                revertidas.update(f['id'] for f in viejas if f['state'] != 'cancel')
+                nombres += [f['name'] for f in viejas]
+        if rotas:
+            ejecutar_sin_retorno(odoo, 'account.move.line', 'remove_move_reconcile', rotas)
+
+        # (ii) Factura anterior revertida con NC: su 205.06.003 contra la de la NC.
+        for mid in revertidas:
+            ncs = odoo.execute_kw('account.move', 'search',
+                                  [[('reversed_entry_id', '=', mid), ('state', '=', 'posted')]])
+            par = odoo.execute_kw('account.move.line', 'search_read',
+                                  [[('move_id', 'in', [mid] + ncs), ('account_id', '=', cuenta),
+                                    ('reconciled', '=', False)]], {'fields': ['id', 'balance']})
+            if any(p['balance'] > 0 for p in par) and any(p['balance'] < 0 for p in par):
+                ejecutar_sin_retorno(odoo, 'account.move.line', 'reconcile',
+                                     [p['id'] for p in par])
+
+        if not de_factura:
+            return {'estado': 'SIN_LINEAS',
+                    'detalle': (f"rota con {', '.join(sorted(set(nombres)))}; la salida "
+                                f"queda abierta para el cierre mensual") if nombres else ''}
+
+        # (iii) Factura vigente contra la salida, por producto.
+        salidas = odoo.execute_kw('account.move.line', 'search_read',
+                                  [dominio_salida + [('reconciled', '=', False)]],
+                                  {'fields': campos})
+        for l in de_factura:
+            if l['reconciled']:
+                continue
+            prod = l['product_id'][0] if l['product_id'] else False
+            suyas = [s['id'] for s in salidas
+                     if (s['product_id'][0] if s['product_id'] else False) == prod]
+            if suyas:
+                ejecutar_sin_retorno(odoo, 'account.move.line', 'reconcile',
+                                     [l['id']] + suyas)
+
+        # KITS: la factura lleva el kit y la salida sus componentes (otro
+        # producto), asi que el paso por producto no los empareja. Ej.
+        # SO10243073: factura 1,737.39 contra dos salidas de 872.21 + 865.18.
+        # Si lo que queda abierto de la factura es IGUAL a lo que queda de
+        # las salidas de la SO, se concilian juntas. Si no es igual no se
+        # fuerza: puede ser de otra factura de la misma orden (reparto B2B).
+        restos_fac = odoo.execute_kw('account.move.line', 'search_read',
+                                     [[('move_id', '=', inv_id), ('account_id', '=', cuenta),
+                                       ('reconciled', '=', False)]],
+                                     {'fields': ['id', 'amount_residual']})
+        restos_sal = odoo.execute_kw('account.move.line', 'search_read',
+                                     [dominio_salida + [('reconciled', '=', False)]],
+                                     {'fields': ['id', 'amount_residual']})
+        if restos_fac and restos_sal:
+            neto = sum(a_float(r['amount_residual']) for r in restos_fac + restos_sal)
+            if abs(neto) <= 0.01 * (len(restos_fac) + len(restos_sal)):
+                ejecutar_sin_retorno(odoo, 'account.move.line', 'reconcile',
+                                     [r['id'] for r in restos_fac + restos_sal])
+
+        final = odoo.execute_kw('account.move.line', 'read',
+                                [[l['id'] for l in de_factura]],
+                                {'fields': ['reconciled', 'amount_residual']})
+        detalle = f"rota con {', '.join(sorted(set(nombres)))}" if nombres else ''
+        if all(f['reconciled'] for f in final):
+            return {'estado': 'CONCILIADA', 'detalle': detalle}
+        residuo = round(sum(a_float(f['amount_residual']) for f in final), 2)
+        return {'estado': 'PARCIAL',
+                'detalle': f"residuo {residuo:,.2f} {detalle}".strip()}
+    except Exception as e:
+        return {'estado': 'ERROR', 'detalle': str(e)[:300]}
 
 
 def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
@@ -1666,6 +2789,13 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
                        error_log=f'Odoo rechazo el create: {e}', sumar_retry=True)
         return None
 
+    # --- B2B, paso 1: la base de Odoo tiene que ser la del CFDI ---
+    # Antes de la CxC: cambiar un precio recalcula las lineas de la factura.
+    ajuste_base = 0.0
+    if es_b2b and cfdi:
+        ajuste_base = cuadrar_base_con_cfdi(odoo, inv_id, cfdi,
+                                            so_name + parte['etiqueta'])
+
     # --- CxC de Amazon + UUID de Amazon en el caso B2B ---
     # Mismo mecanismo que 02_loader_ml_billing.py, salvo el adjunto: Amazon no
     # expone el XML, asi que no se puede crear ir.attachment ni
@@ -1695,6 +2825,46 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         except OdooWriteUncertain as e:
             log.warning(f"{so_name}: write incierto de CxC/UUID: {e}")
 
+    # --- B2B, paso 2: el IVA (y el total) tiene que ser el del CFDI ---
+    ajuste_cfdi = 0.0
+    if es_b2b and cfdi:
+        ajuste_cfdi = cuadrar_con_cfdi(odoo, inv_id, cfdi,
+                                       so_name + parte['etiqueta'])
+
+    # --- B2C: el total tiene que ser lo que pago el cliente ---
+    # 701-4769487-1597824 salio por 399.01 y el cliente pago 399.00 (correo
+    # de Jero del 28-oct, segundo): Odoo redondea el IVA por linea (343.97 x 16% =
+    # 55.04) y Amazon cobro 55.03. Mismo ajuste del IVA que en B2B, contra el
+    # OrderTotal, solo si es redondeo (TOLERANCIA_CUADRE_CFDI).
+    if not es_b2b:
+        objetivo = pagado_por_cliente(record)
+        if objetivo:
+            leida = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                                    {'fields': ['amount_untaxed', 'amount_total']})[0]
+            dif = round(objetivo - a_float(leida['amount_total']), 2)
+            if dif and abs(dif) <= TOLERANCIA_CUADRE_CFDI:
+                base = round(a_float(leida['amount_untaxed']), 2)
+                ajuste_cfdi = cuadrar_con_cfdi(
+                    odoo, inv_id, {'total': objetivo, 'taxes': round(objetivo - base, 2),
+                                   'subtotal': base, 'discount': 0},
+                    so_name + parte['etiqueta'])
+                if ajuste_cfdi:
+                    stats['centavo_b2c'] += 1
+    if ajuste_cfdi and cxc:
+        # Editar el IVA rebalancea la CxC: se confirma que siga en la cuenta
+        # de Amazon y no en la del partner.
+        cuentas = odoo.execute_kw(
+            'account.move.line', 'search_read',
+            [[('move_id', '=', inv_id), ('account_type', '=', 'asset_receivable')]],
+            {'fields': ['id', 'account_id']})
+        fuera = [(1, l['id'], {'account_id': account_cxc}) for l in cuentas
+                 if l['account_id'] and l['account_id'][0] != account_cxc]
+        if fuera:
+            log.warning(f"{so_name}{parte['etiqueta']}: la CxC cambio de cuenta "
+                        f"al ajustar el IVA; se regresa a la de Amazon.")
+            odoo.execute_kw('account.move', 'write', [[inv_id], {'line_ids': fuera}],
+                            {'context': {'tracking_disable': True}})
+
     # --- POST: genera el asiento contable ---
     try:
         odoo.execute_kw('account.move', 'action_post', [[inv_id]])
@@ -1704,6 +2874,10 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         update_staging(db_conn, record['id'], 'ERROR',
                        error_log=f'Fallo el post: {e}', sumar_retry=True)
         return None
+
+    # --- KITS: de vuelta la liga a la SO, ya con el costo calculado ---
+    if parte.get('religar'):
+        religar_kits(odoo, inv_id, parte['religar'], so_name)
 
     # --- TIMBRADO: solo B2C. En B2B el comprobante ya existe. ---
     if DO_STAMPING and not es_b2b:
@@ -1717,14 +2891,52 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
             log.warning(f"{so_name}: fallo el timbrado: {e}")
 
     inv = odoo.execute_kw('account.move', 'read', [[inv_id]],
-                          {'fields': ['name', 'state', 'amount_total',
+                          {'fields': ['name', 'state', 'amount_untaxed',
+                                      'amount_tax', 'amount_total',
                                       'l10n_mx_edi_cfdi_uuid']})
     inv = inv[0] if inv else {}
     uuid_final = inv.get('l10n_mx_edi_cfdi_uuid') or uuid_amazon or None
     if uuid_final is False:
         uuid_final = None
 
-    postear_chatter(odoo, inv_id, record, tipo, uuid_final, parte)
+    # --- 205.06.003: la factura vigente queda conciliada con la salida ---
+    conc = conciliar_salida(odoo, so, inv_id, catalogos['cuenta_merc_no_enviada'])
+    # Factura con kit y SIN costo: lista de materiales en 0 (TOLIXKIT). Se
+    # avisa hoy; el cierre mensual le asienta el costo de lo que salio.
+    if conc['estado'] == 'SIN_LINEAS':
+        kits = [c[2]['product_id'] for c in parte['lineas']
+                if c[2].get('product_id') and es_kit(odoo, c[2]['product_id'], catalogos)]
+        if kits:
+            stats['kit_sin_costo'].append(so_name)
+            log.warning(f"{so_name}{parte['etiqueta']}: factura de kit SIN costo "
+                        f"(revisar la lista de materiales; costo del kit en 0). "
+                        f"El cierre mensual de la 205.06.003 le asienta el costo.")
+    # SO cancelada: no va a haber salida. La 205.06.003 de esta factura se
+    # concilia con la NC (tipo A), no con un OUT (correo de Jero, 28-oct, segundo).
+    if so['state'] == 'cancel' and conc['estado'] == 'SIN_SALIDA':
+        conc = {'estado': 'SO_CANCELADA',
+                'detalle': 'sin salida; la 205.06.003 se concilia con la NC (tipo A)'}
+    stats['conciliacion_205'][conc['estado']] = \
+        stats['conciliacion_205'].get(conc['estado'], 0) + 1
+    if conc['estado'] in ('PARCIAL', 'ERROR'):
+        log.warning(f"{so_name}{parte['etiqueta']}: 205.06.003 {conc['estado']} "
+                    f"{conc['detalle']}")
+
+    extra = [f"Mercancias facturadas - no enviadas ({ACCOUNT_MERC_NO_ENVIADA}): "
+             f"{conc['estado']}{' - ' + conc['detalle'] if conc['detalle'] else ''}"]
+    if parte.get('envio_agregado'):
+        extra.append(f"Envio cobrado al cliente que la SO no traia: se agrego "
+                     f"C-ENVIO por {parte['envio_agregado']:,.2f} (base e IVA de "
+                     f"las transacciones de Amazon).")
+        stats['envio_agregado'].append(so_name)
+    if so['state'] == 'cancel':
+        extra.append("SO CANCELADA en Odoo: se factura porque Amazon cobro la "
+                     "venta. La nota de credito sale por el flujo de "
+                     "devoluciones.")
+    if so_name in stats['confirmadas']:
+        extra.append("La SO estaba en borrador y se confirmo para facturarla "
+                     "(Amazon ya cobro la venta).")
+    postear_chatter(odoo, inv_id, record, tipo, uuid_final, parte, inv, extra)
 
     total_odoo = a_float(inv.get('amount_total'))
     total_amz = a_float(parte['referencia'])
@@ -1737,6 +2949,9 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         'total_amazon': total_amz, 'diferencia': dif,
         'marca': 'OK' if abs(dif) <= TOLERANCIA_TOTAL else 'DIFERENCIA',
         'uuid': uuid_final,
+        'ajuste_base': ajuste_base,
+        'ajuste_cfdi': ajuste_cfdi,
+        'conciliacion_205': conc['estado'],
     }
     stats['facturadas'].append(resultado)
 
@@ -1770,7 +2985,12 @@ def run_loader(db_conn):
     stats = {'facturadas': [], 'ya_facturadas': 0, 'adoptadas': 0,
              'sin_so': [], 'canceladas': [], 'borrador': [],
              'duplicados': [], 'inciertos': [], 'b2b_sin_receptor': [],
-             'total_diff': [], 'split_fallido': [],
+             'total_diff': [], 'split_fallido': [], 'promo_amazon': [],
+             'confirmadas': [], 'en_global': [], 'b2b_facturada_pg': [],
+             'envio_agregado': [], 'envio_sin_confirmar': [], 'envio_aparte': [],
+             'kit_sin_costo': [],
+             'centavo_b2c': 0,
+             'conciliacion_205': {},
              'reclasificadas_b2b': stats_reclasificadas,
              'cuota': {'B2B': 0, 'B2C_PUBLICO_GENERAL': 0}}
 
@@ -1792,6 +3012,14 @@ def run_loader(db_conn):
             log.info(f"[LOADER] Cuota de pruebas completa: "
                      f"B2B {hechas['B2B']}/{QUOTA_B2B}, "
                      f"B2C {hechas['B2C_PUBLICO_GENERAL']}/{QUOTA_B2C}.")
+            break
+        # Las facturas de envio aparte tambien cuentan: son CFDI timbrados.
+        if (PROD_MAX_FACTURAS is not None
+                and hechas['B2B'] + hechas['B2C_PUBLICO_GENERAL']
+                + len(stats['envio_aparte']) >= PROD_MAX_FACTURAS):
+            log.info(f"[LOADER] Tope de arranque alcanzado: "
+                     f"{PROD_MAX_FACTURAS} facturas (AMZ_PROD_MAX_FACTURAS). "
+                     f"Lo pendiente queda para la siguiente corrida.")
             break
 
         if not claim(db_conn, record['id']):
@@ -1848,10 +3076,20 @@ def reportar(stats):
     log.info(f"  B2C emitidas por WB             : {len(b2c)}")
     log.info(f"  Con diferencia > $1.00          : {len(difs)}")
     log.info(f"  Ya estaban facturadas           : {stats['ya_facturadas']}")
-    log.info(f"  SO canceladas (requieren NC)    : {len(stats['canceladas'])}")
-    log.info(f"  SO en borrador                  : {len(stats['borrador'])}")
+    log.info(f"     dentro de una factura global : {len(stats['en_global'])}")
+    log.info(f"  SO canceladas (facturadas, NC)  : {len(stats['canceladas'])}")
+    log.info(f"  SO en borrador confirmadas      : {len(stats['confirmadas'])}")
+    log.info(f"  SO en borrador sin confirmar    : {len(stats['borrador'])}")
+    log.info(f"  B2B con factura a publico gral. : {len(stats['b2b_facturada_pg'])}")
+    log.info(f"  Con envio agregado (C-ENVIO)    : {len(stats['envio_agregado'])}")
+    log.info(f"  Factura de envio aparte         : {len(stats['envio_aparte'])}")
+    log.info(f"  Envio sin confirmar (excepcion) : {len(stats['envio_sin_confirmar'])}")
+    log.info(f"  B2C con centavo ajustado        : {stats['centavo_b2c']}")
+    log.info(f"  205.06.003 de las facturas      : "
+             f"{', '.join(f'{k} {v}' for k, v in sorted(stats['conciliacion_205'].items())) or '-'}")
     log.info(f"  Sin SO en Odoo                  : {len(stats['sin_so'])}")
     log.info(f"  B2B sin receptor en el CFDI     : {len(stats['b2b_sin_receptor'])}")
+    log.info(f"  B2C con promocion de Amazon     : {len(stats['promo_amazon'])}")
     log.info(f"  TOTAL_DIFF (no facturadas)      : {len(stats['total_diff'])}")
     log.info(f"  Reparto B2B fallido             : {len(stats['split_fallido'])}")
     log.info(f"  Reclasificadas a B2B (tardias)  : {stats['reclasificadas_b2b']}")
@@ -1906,6 +3144,28 @@ def reportar(stats):
                  'Causa habitual: el precio de la SO difiere del liquidado por '
                  'Amazon, o la SO no incluye un flete que Amazon si cobro.')
 
+    if stats['promo_amazon']:
+        log.info('')
+        log.info(f"PROMOCION FINANCIADA POR AMAZON -- {len(stats['promo_amazon'])} "
+                 f"B2C facturada(s) por lo que pago el cliente:")
+        for p in stats['promo_amazon'][:20]:
+            log.info(f"  {p}")
+        log.info('  El excedente no se factura ni se aplica a la CxC; 03 lo '
+                 'marca al llegar el cobro. Tratamiento contable pendiente.')
+
+    for clave, titulo in (('b2b_facturada_pg', 'B2B CON FACTURA A PUBLICO GENERAL '
+                                               '(anular antes de vincular el CFDI de Amazon)'),
+                          ('borrador', 'SO EN BORRADOR QUE NO SE PUDIERON CONFIRMAR'),
+                          ('envio_aparte', 'FACTURAS DE ENVIO APARTE'),
+                          ('kit_sin_costo', 'FACTURAS DE KIT SIN COSTO (lista de materiales)'),
+                          ('envio_sin_confirmar', 'ENVIO SIN CONFIRMAR (no se facturo)'),
+                          ('en_global', 'ORDENES EN FACTURA GLOBAL (no se refacturan)')):
+        if stats[clave]:
+            log.info('')
+            log.info(f"{titulo} -- {len(stats[clave])}:")
+            for d in stats[clave][:20]:
+                log.info(f"  {d}")
+
     if stats['split_fallido']:
         log.info('')
         log.warning(f"REPARTO B2B FALLIDO -- {len(stats['split_fallido'])} "
@@ -1930,9 +3190,16 @@ def reportar(stats):
     if stats['canceladas']:
         notify_slack(
             f":warning: *{len(stats['canceladas'])} orden(es) de Amazon "
-            f"CANCELADAS* que Amazon si liquido. Quedan sin facturar y "
-            f"requieren nota de credito Tipo A.\n"
+            f"CANCELADAS en Odoo* que Amazon si liquido. Se facturaron; "
+            f"llevan NC por el flujo de devoluciones.\n"
             f"{', '.join(stats['canceladas'][:15])}")
+
+    if stats['b2b_facturada_pg']:
+        notify_slack(
+            f":warning: *{len(stats['b2b_facturada_pg'])} orden(es) B2B de "
+            f"Amazon con factura a publico general*. No se vinculo el CFDI de "
+            f"Amazon: primero hay que anular la factura anterior.\n"
+            f"{', '.join(stats['b2b_facturada_pg'][:15])}")
 
     if stats['sin_so']:
         notify_slack(
@@ -1972,12 +3239,19 @@ def main():
 
 if __name__ == '__main__':
     banner('FACTURACION AMAZON (MINER + LOADER)')
-    _cuota = ('sin limite' if QUOTA_B2B is None
-              else f"B2B={QUOTA_B2B} B2C={QUOTA_B2C} (facturas creadas)")
+    if QUOTA_B2B is not None:
+        _cuota = f"B2B={QUOTA_B2B} B2C={QUOTA_B2C} (facturas creadas)"
+    elif PROD_MAX_FACTURAS:
+        _cuota = f"sin limite por tipo; tope de arranque {PROD_MAX_FACTURAS} facturas"
+    else:
+        _cuota = 'sin limite'
+    if CON_ALCANCE:
+        _ventana = (f"ALCANCE settlement {AMZ_SETTLEMENT_ID or '-'} + "
+                    f"{len(AMZ_ORDER_IDS)} orden(es) sueltas")
+    else:
+        _ventana = f"Ventana: {AMZ_START_DATE} .. {AMZ_END_DATE or 'hoy'}"
     log.info(f"Timbrado: {'ACTIVADO' if DO_STAMPING else 'DESACTIVADO'} | "
-             f"Cuota: {_cuota} | "
-             f"Gracia: {GRACE_DAYS} dias | Ventana: {AMZ_START_DATE} .. "
-             f"{AMZ_END_DATE or 'hoy'}")
+             f"Cuota: {_cuota} | Gracia: {GRACE_DAYS} dias | {_ventana}")
     t0 = tm.time()
     try:
         main()

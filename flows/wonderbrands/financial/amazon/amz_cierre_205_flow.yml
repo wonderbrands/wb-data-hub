@@ -1,0 +1,113 @@
+id: amz_cierre_205_flow
+namespace: wonderbrands.financial.amazon
+description: |
+  Amazon: cierre mensual de la 205.06.003 (Mercancías facturadas - no enviadas).
+  Lleva a 501.01.001 las diferencias de costeo y de kits del mes, con conciliación
+  completa, y manda a Finanzas el reporte de kits (reporte_kits_<mes>.csv).
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: mes
+    type: STRING
+    defaults: "anterior"
+    displayName: "Mes a cerrar (AAAA-MM) o 'anterior'"
+  - id: seco
+    type: BOOLEAN
+    defaults: false
+    displayName: "En seco: solo lista y reporte, no asienta"
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  scripts: "processes/wonderbrands/financial/billing_processes/amazon"
+
+tasks:
+  - id: working_env_cierre
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: cierre_205
+        type: io.kestra.plugin.scripts.shell.Commands
+        timeout: PT4H
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          memory:
+            memory: "512MB"
+            memorySwap: "2048MB"
+        env:
+          AMZ_ENTORNO: "prod"
+          ODOO_URL: "{{ vars.odoo_url }}"
+          ODOO_DB: "{{ vars.odoo_db }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          DB_HOST: "{{ vars.db_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          SLACK_WEBHOOK: "{{ secret('SLACK_WEBHOOK') }}"
+          KESTRA_EXECUTION_ID: "{{ execution.id }}"
+        commands:
+          - "python {{ vars.scripts }}/11_ajuste_cogs_205.py {{ inputs.mes }} {{ inputs.seco ? '--seco' : '' }}"
+        outputFiles:
+          - "{{ vars.scripts }}/reporte_kits_*.csv"
+
+      # Sin kits con diferencia no hay CSV y el correo no sale (allowFailure).
+      - id: enviar_reporte_kits
+        type: io.kestra.plugin.email.MailSend
+        allowFailure: true
+        host: smtp.gmail.com
+        port: 587
+        transportStrategy: SMTP_TLS
+        username: "{{ secret('SMTP_USERNAME') }}"
+        password: "{{ secret('SMTP_PASSWORD') }}"
+        from: "data@wonderbrands.co"
+        to: "sergio@wonderbrands.co, jeronimo@wonderbrands.co, carlos.hinojosa@wonderbrands.co"
+        subject: "Amazon: kits con diferencia en el cierre de la 205.06.003"
+        htmlTextContent: |
+          <p>Reporte mensual de kits de Amazon con diferencia entre lo facturado y lo despachado:</p>
+          <ul>
+            <li><b>Diferencia de costo</b>: costo del kit distinto a la suma de sus componentes (Catálogo y Finanzas).</li>
+            <li><b>Diferencia de cantidad</b>: salieron más o menos componentes que los de la lista (Operaciones).</li>
+            <li><b>Factura sin costo</b>: la lista de materiales tiene el componente en 0.</li>
+          </ul>
+          <p>El ajuste a 501.01.001 ya quedó asentado y conciliado.</p>
+          <p>Saludos,<br><b>Data team</b></p>
+        attachments:
+          - name: "reporte_kits.csv"
+            uri: "{{ outputs.cierre_205.outputFiles.values() | first }}"
+
+triggers:
+  # Día 1 de cada mes, 09:00 CDMX (lejos de la corrida diaria de 06:30/18:30).
+  # APAGADO hasta revisar el primer cierre a mano con seco=true.
+  - id: cierre_mensual
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 1 * *"
+    timezone: America/Mexico_City
+    recoverMissedSchedules: LAST
+    disabled: true
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *Fallo en el cierre mensual de la 205.06.003 (Amazon)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+      }

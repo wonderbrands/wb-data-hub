@@ -1,0 +1,128 @@
+id: amz_billing_payments_flow
+namespace: wonderbrands.financial.amazon
+description: |
+  Amazon: facturación (01), cobros (02 → 03). Ver
+  processes/wonderbrands/financial/billing_processes/amazon/ACTIVAR_AMAZON_PRODUCCION.md
+
+  Un solo flujo para la corrida diaria, el barrido de octubre por settlement y el
+  saneamiento ene–sep: así la exclusión mutua cubre todas las corridas.
+
+# =====================================================================
+# EXCLUSION MUTUA (incidente del 26-jul-2026: 549 dobles CFDI).
+# FAIL: la ejecución nueva falla y avisa por Slack; no se encola.
+# =====================================================================
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: settlement_id
+    type: STRING
+    required: false
+    displayName: "Settlement completo (barrido). Vacío = ventana por fechas"
+  - id: start_date
+    type: STRING
+    defaults: "2026-10-01"
+    displayName: "Desde (AAAA-MM-DD). Se ignora si hay settlement"
+  - id: end_date
+    type: STRING
+    required: false
+    displayName: "Hasta, exclusivo (AAAA-MM-DD). Solo saneamiento"
+  - id: max_facturas
+    type: STRING
+    required: false
+    displayName: "Tope de facturas creadas en la corrida (vacío = sin tope)"
+  - id: payments_batch
+    type: STRING
+    defaults: "2000"
+    displayName: "Máximo de cobros que aplica 03 en la corrida"
+  - id: cobros
+    type: BOOLEAN
+    defaults: true
+    displayName: "Correr 02 y 03 (false en el saneamiento ene–sep)"
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  scripts: "processes/wonderbrands/financial/billing_processes/amazon"
+  # Marca de agua inicial de 02 (tabla de cobros vacía): no levantar cobros
+  # anteriores a octubre. Finanzas cierra la historia en contabilidad.
+  payments_desde: "2026-10-21 00:00:00"
+
+tasks:
+  - id: working_env_amazon
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      # Sin retry automático en ninguna tarea: reintentar a ciegas un script que
+      # timbra puede relanzar trabajo que ya se hizo. Un fallo se revisa a mano.
+      - id: amazon
+        type: io.kestra.plugin.scripts.shell.Commands
+        timeout: PT8H
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          memory:
+            memory: "512MB"
+            memorySwap: "2048MB"
+        env:
+          AMZ_ENTORNO: "prod"
+          ODOO_URL: "{{ vars.odoo_url }}"
+          ODOO_DB: "{{ vars.odoo_db }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          DB_HOST: "{{ vars.db_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          SLACK_WEBHOOK: "{{ secret('SLACK_WEBHOOK') }}"
+          KESTRA_EXECUTION_ID: "{{ execution.id }}"
+          AMZ_SETTLEMENT_ID: "{{ inputs.settlement_id ?? '' }}"
+          AMZ_START_DATE: "{{ inputs.start_date }}"
+          AMZ_END_DATE: "{{ inputs.end_date ?? '' }}"
+          AMZ_PROD_MAX_FACTURAS: "{{ inputs.max_facturas ?? '' }}"
+          AMZ_PAYMENTS_BATCH: "{{ inputs.payments_batch }}"
+          AMZ_PAYMENTS_DESDE: "{{ vars.payments_desde }}"
+        commands:
+          # 00 verifica configuración (solo lectura) y corta la corrida si falta algo.
+          - python {{ vars.scripts }}/00_amz_precheck_prod.py
+          - python {{ vars.scripts }}/01_amz_billing.py
+          - |
+            if [ "{{ inputs.cobros }}" = "true" ]; then
+              python {{ vars.scripts }}/02_miner_amz_payments.py &&
+              python {{ vars.scripts }}/03_loader_amz_payments.py
+            else
+              echo "cobros=false: 02 y 03 no se corren (saneamiento)."
+            fi
+
+triggers:
+  # APAGADO hasta terminar el barrido de octubre (ver el .md). Para encender:
+  # disabled: false. 06:30 y 18:30 CDMX.
+  - id: corrida_diaria
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 6,18 * * *"
+    timezone: America/Mexico_City
+    recoverMissedSchedules: LAST
+    disabled: true
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *Fallo en el pipeline de Amazon (01-02-03)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}\n_Si la causa es CONCURRENCY_LIMIT, otra ejecución sigue activa: NO relanzar a mano._"
+      }

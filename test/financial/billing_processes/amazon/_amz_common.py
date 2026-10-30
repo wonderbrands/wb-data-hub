@@ -27,12 +27,15 @@ import sys
 import json
 import time as tm
 import logging
+import urllib.parse
 import urllib.request
 import xmlrpc.client
 import mysql.connector
 from dotenv import load_dotenv
 
-load_dotenv(r'C:\Users\Sergio Gil Guerrero\Documents\WonderBrands\Claude_proyects\wb-data-hub\.env')
+# Busca el .env subiendo desde este archivo (en local, el de la raiz del
+# repo). En Kestra no hay .env: mandan las variables de entorno del flujo.
+load_dotenv()
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +71,30 @@ ACCOUNT_AMAZON_CXC         = '105.01.006'
 ACCOUNT_LIBERACIONES       = '102.02.008'  # Liberaciones Amazon Pend. de Procesar
 ACCOUNT_DEV_TRANSITO       = '107.06.001'  # Devoluciones en Transito
 
+# Transitoria del costo (contabilidad anglosajona): la factura la acredita y
+# la salida de almacen (OUT) la debita. Odoo concilia las dos partidas solo
+# cuando ninguna esta conciliada con otra cosa; al refacturar, la salida
+# seguia conciliada con la factura cancelada (correo de Jero, 28-oct-2026:
+# 44 de 48 facturas del lote). 01_amz_billing.py rehace esa conciliacion.
+ACCOUNT_MERC_NO_ENVIADA = os.getenv('AMZ_ACCOUNT_MERC_NO_ENVIADA', '205.06.003').strip()
+
+# Excedente de promociones financiadas por Amazon. Decision de Finanzas
+# (correo de Jero, oct-2026, sobre el lote 4): la parte sin IVA es ingreso en
+# 403.01.002 y el IVA va a 208.01.001. Ejemplo 701-0635257-8905020: Amazon
+# libero 3,200.00 sobre una factura de 2,900.00 -> 258.62 + 41.38.
+# Solo para promociones CONFIRMADAS como pagadas por Amazon, no para cualquier
+# diferencia (ver clasificar_excedente en 03_loader_amz_payments.py).
+ACCOUNT_CUPONES_AMAZON     = '403.01.002'  # CUPONES AMAZON
+ACCOUNT_IVA_TRASLADADO     = '208.01.001'  # IVA TRASLADADO COBRADO
+
+# Cuenta para saldar diferencias de 1 centavo entre lo liberado por Amazon y
+# la factura (redondeo del IVA de Odoo frente al precio con IVA de Amazon).
+# 704.23.001 OTROS PRODUCTOS: confirmada por Finanzas para produccion
+# (correo de Jero, 28-oct-2026, segundo). 03_loader_amz_payments.py sigue abortando si
+# llega vacia: en el lote 5 la variable no llego (sintaxis de bash en
+# PowerShell) y dos facturas quedaron en pago parcial por 0.01.
+ACCOUNT_REDONDEO = os.getenv('AMZ_ACCOUNT_REDONDEO', '704.23.001').strip()
+
 PAYMENT_METHOD_TRANSFERENCIA = 3           # l10n_mx_edi_payment_method_id
 
 # Diario de Odoo para los cobros de Amazon.
@@ -95,9 +122,8 @@ UTC_local = -6   # CDMX. Mexico no aplica horario de verano desde 2022.
 # =============================================================================
 
 if ENTORNO == 'staging':
-    ODOO_URL = os.getenv('ODOO_TEST_URL',
-                         'https://somosreyes-test26ago26-37337608.dev.odoo.com')
-    ODOO_DB = os.getenv('ODOO_TEST_DB', 'somosreyes-test26ago26-37337608')
+    ODOO_URL = os.getenv('ODOO_TEST_URL', 'https://somosreyes-test-05-10-2026-39264934.dev.odoo.com')
+    ODOO_DB = os.getenv('ODOO_TEST_DB', 'somosreyes-test-05-10-2026-39264934')
     ODOO_USER = os.getenv('ODOO_TEST_USER') or os.getenv('odoo_user_dataV18')
     ODOO_PWD = os.getenv('ODOO_TEST_PASSWORD') or os.getenv('odoo_password_dataV18')
 else:
@@ -172,6 +198,55 @@ def notify_slack(text):
 def get_db_connection():
     return mysql.connector.connect(
         host=DB_HOST, user=DB_USER, password=DB_PASS, database='finance')
+
+
+# =============================================================================
+# SP-API (SOLO LECTURA)
+# =============================================================================
+# El access_token lo renueva el ETL de Amazon y lo deja en amz_tokens; aqui
+# solo se lee. Mismo patron que amz_transactions.py, con urllib en vez de
+# requests para no sumar dependencias a este modulo.
+
+SP_API_ENDPOINT = 'https://sellingpartnerapi-na.amazon.com'
+
+
+def sp_api_token(db_conn):
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT access_token FROM somos_reyes.amz_tokens LIMIT 1")
+    fila = cursor.fetchone()
+    cursor.close()
+    if not fila or not fila[0]:
+        raise Exception("amz_tokens no tiene access_token.")
+    return fila[0]
+
+
+def sp_api_get(token, path, timeout=30):
+    """GET a SP-API. Devuelve el JSON decodificado; lanza en cualquier error."""
+    req = urllib.request.Request(
+        SP_API_ENDPOINT + path,
+        headers={'x-amz-access-token': token, 'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8'))
+
+
+def get_order_items(token, order_id):
+    """Lineas de la orden (Orders API v0 getOrderItems), con paginacion.
+
+    De aqui sale PromotionDiscount, el unico dato por linea que dice cuanto
+    descuento de promocion recibio el cliente. Ni amazon_orders ni
+    amz_transaction_items lo traen.
+    """
+    items, token_pag = [], None
+    while True:
+        path = f"/orders/v0/orders/{order_id}/orderItems"
+        if token_pag:
+            path += '?NextToken=' + urllib.parse.quote(token_pag)
+        payload = sp_api_get(token, path).get('payload') or {}
+        items += payload.get('OrderItems') or []
+        token_pag = payload.get('NextToken')
+        if not token_pag:
+            return items
+        tm.sleep(2.1)   # getOrderItems: 0.5 req/s
 
 
 # =============================================================================
@@ -273,6 +348,25 @@ def get_account_id(odoo, code):
     if not acc:
         raise Exception(f"No existe la cuenta contable {code} en {ODOO_DB}.")
     return acc[0]
+
+
+def ejecutar_sin_retorno(odoo, model, method, ids):
+    """Llama un metodo de Odoo que no devuelve nada (reconcile,
+    remove_move_reconcile...).
+
+    Por XML-RPC esos metodos YA HICIERON SU TRABAJO y luego fallan al armar la
+    respuesta: "cannot marshal None unless allow_none is enabled". Odoo hace
+    commit antes de serializar. Verificado el 28-oct-2026 en el espejo: la
+    conciliacion de SO10307197 quedo hecha aunque la llamada devolvio Fault.
+    Ese Fault concreto se toma como exito; cualquier otro sube. Quien llama
+    debe confirmar el resultado leyendo.
+    """
+    try:
+        odoo.execute_kw(model, method, [ids])
+    except xmlrpc.client.Fault as e:
+        if 'cannot marshal None' not in (e.faultString or ''):
+            raise
+    return True
 
 
 def get_amazon_team_ids(odoo):
