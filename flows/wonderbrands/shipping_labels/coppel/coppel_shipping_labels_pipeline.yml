@@ -14,6 +14,7 @@ variables:
   db_user: "kestra_bot"
   db_name: "tools"
   db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  spreadsheet_reprocess_id: "1bnymFhXE75ejJVAF9FepTpBQrRocCcmE9NA6VO6-_ac"
 
 tasks:
   - id: working_env_coppel
@@ -33,10 +34,6 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
-        retry:
-          type: constant
-          interval: PT1M
-          maxAttempts: 3
         env:
           #Credenciales de la API de Cotización y Generación
           AUTH_USER: "{{ secret('AUTH_USER') }}"
@@ -60,6 +57,11 @@ tasks:
 
           GOOGLE_CREDS_JSON: "{{ secret('SHIPPING_INFO_COPPEL_JSON') }}"
           
+          # --- Reproceso de guías con VoBo (sheet de control de reprocesamiento) ---
+          SPREADSHEET_REPROCESS_ID: "{{ vars.spreadsheet_reprocess_id }}"
+          MAX_REPROCESS_ATTEMPTS: "3"
+          VOBO_DRY_RUN: "false"
+
           #Nivel de Logs
           LOG_LEVEL: "INFO"
         commands:
