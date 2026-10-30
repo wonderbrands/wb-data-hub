@@ -55,7 +55,8 @@ tasks:
         commands:
           - python processes/wonderbrands/financial/billing_processes/odoo/dispatchs_alerts.py
         outputFiles:
-          - "Reporte_Inconsistencias_*.csv"
+          - "Reporte_Inconsistencias.csv"
+          - "email_body.html"
 
       - id: send_finance_email
         type: io.kestra.plugin.email.MailSend
@@ -65,19 +66,15 @@ tasks:
         username: "{{ secret('SMTP_USERNAME') }}" 
         password: "{{ secret('SMTP_PASSWORD') }}" 
         from: "data@wonderbrands.co"
-        to: "sergio@wonderbrands.co, jeronimo@wonderbrands.co, carlos.hinojosa@wonderbrands.co, martin.barone@somos-reyes.com, penhos@somos-reyes.com"
+        to: "sergio@wonderbrands.co, jeronimo@wonderbrands.co, carlos.hinojosa@wonderbrands.co, martin.barone@somos-reyes.com, penhos@somos-reyes.com, eric@wonderbrands.co, jimmy@wonderbrands.co"
         subject: "Reporte diario: Inconsistencias de despacho y facturación"
         htmlTextContent: |
           <h3>Reporte Diario de Control de Despachos</h3>
           <p>Buen día, equipo:</p>
-          <p>Adjunto encontrarán el reporte automatizado de inconsistencias detectadas en Odoo correspondiente al día de hoy.</p>
-          <p>Este reporte audita los siguientes puntos de control (Roadmap - Paso 6):</p>
-          <ul>
-            <li>Órdenes confirmadas hace más de 5 días sin despacho físico.</li>
-            <li>Órdenes con mercancía facturada, pero sin salida de almacén.</li>
-            <li>Órdenes marcadas como entregadas en Mercado Libre, pero aún pendientes en Odoo.</li>
-          </ul>
+          <p>Adjunto encontrarán el reporte automatizado de inconsistencias detectadas en Odoo correspondiente al día de hoy.
+          Debajo, el resumen por concepto y el glosario con las reglas que sigue cada uno.</p>
+          {{ read(outputs.generate_csv_report.outputFiles['email_body.html']) }}
           <p>Saludos,<br><b>Data team</b></p>
         attachments:
-          - uri: "{{ outputs.generate_csv_report.outputFiles.values() | first }}"
-            name: "Dispatch_Inconsistencies_Report.csv"
+          - uri: "{{ outputs.generate_csv_report.outputFiles['Reporte_Inconsistencias.csv'] }}"
+            name: "Dispatch_Inconsistencies_Report_{{ now() | date('yyyyMMdd') }}.csv"
