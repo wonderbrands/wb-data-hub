@@ -67,7 +67,9 @@ ESTADOS EN finance.mkp_billing_{staging|prod}
   PENDING_WB_INVOICE     nos toca emitir el CFDI
   PROCESSING             tomada por una corrida (candado)
   ODOO_B2B_LINKED        factura creada con el UUID de Amazon sellado
-  ODOO_INVOICED          CFDI emitido por WB
+  ODOO_INVOICED          CFDI emitido por WB. cfdi_uuid = nuestro UUID; si el
+                         PAC lo rechazo, error_log empieza con TIMBRADO_FALLIDO.
+                         Cada factura de la orden en raw_json.facturas_odoo.
   ALREADY_ODOO_INVOICED  ya tenia factura viva en Odoo (incluye factura global)
   B2B_FACTURADA_PG       B2B con factura viva a publico general: anularla
                          antes de vincular el CFDI de Amazon. Se reevalua.
@@ -93,7 +95,7 @@ import sys
 import json
 import time as tm
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import xmlrpc.client
 
 logging.basicConfig(level=logging.INFO,
@@ -109,7 +111,7 @@ if _dir not in sys.path:
 from _amz_common import (
     ENTORNO, TBL_BILLING, MARKETPLACE,
     TAX_ID_MARKETPLACES, PARTNER_ID_PUBLICO_GENERAL, ACCOUNT_AMAZON_CXC,
-    ACCOUNT_MERC_NO_ENVIADA, IDEMPOTENCY_PREFIX, KESTRA_EXECUTION_ID,
+    ACCOUNT_MERC_NO_ENVIADA, IDEMPOTENCY_PREFIX, KESTRA_EXECUTION_ID, UTC_local,
     validar_entorno, banner, notify_slack, get_db_connection,
     OdooModelProxy, OdooWriteUncertain, get_account_id, a_float,
     ejecutar_sin_retorno, sp_api_token, get_order_items,
@@ -205,6 +207,79 @@ CON_ALCANCE = bool(AMZ_SETTLEMENT_ID or AMZ_ORDER_IDS)
 # Dias que se le dan al cliente para autofacturar con su RFC antes de que
 # emitamos a publico en general.
 GRACE_DAYS = int(os.getenv('AMZ_GRACE_DAYS', '5'))
+
+# =============================================================================
+# CIERRE DE MES -- LA VENTA SE FACTURA CON FECHA DE SU MES
+# =============================================================================
+# Regla de Sergio (2-nov-2026). Las B2C de octubre facturadas el 1 y 2 de
+# noviembre salieron con fecha de noviembre: Odoo pone la fecha de la corrida
+# si la factura no trae invoice_date. Es un error fiscal: la venta es de
+# octubre.
+#
+#   * Venta del mes en curso      -> fecha de la corrida (como siempre).
+#   * Corrida de los primeros DIAS_CIERRE_MES dias del mes y venta de un mes
+#     anterior -> ultimo dia del mes anterior. Lo que se quedo "a facturar"
+#     al cierre se factura SI O SI el dia 1 con fecha del mes que cerro.
+#   * En esos dias no hay periodo de gracia para las ventas del mes anterior,
+#     y se leen tambien las transacciones DEFERRED (Amazon cobro al comprador
+#     pero aun no libera): al 2-nov eran 802 ordenes de octubre.
+#
+# El mes de la venta es el date_order de la SO, en hora de CDMX. B2B no cambia:
+# lleva la fecha del CFDI que emitio Amazon.
+#
+# El SAT rechaza un CFDI con fecha de mas de 72 horas antes del timbrado, asi
+# que la ventana no puede pasar de 3 dias. Default 1: las dos corridas del dia 1.
+# =============================================================================
+DIAS_CIERRE_MES = int(os.getenv('AMZ_DIAS_CIERRE_MES', '1'))
+if not 0 <= DIAS_CIERRE_MES <= 3:
+    raise Exception(f"AMZ_DIAS_CIERRE_MES={DIAS_CIERRE_MES}: debe estar entre 0 y 3 "
+                    f"(el SAT no timbra con fecha de mas de 72 horas).")
+
+
+def ahora_cdmx():
+    """Hora de CDMX sin depender de la zona del servidor (Kestra corre en UTC:
+    a las 18:30 CDMX del dia 1 el contenedor ya cree que es dia 2)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=UTC_local)
+
+
+def inicio_de_mes(hoy=None):
+    return (hoy or ahora_cdmx()).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def en_cierre_de_mes(hoy=None):
+    return (hoy or ahora_cdmx()).day <= DIAS_CIERRE_MES
+
+
+def fecha_factura(so, hoy=None):
+    """invoice_date de una B2C. None = la de la corrida (Odoo la pone al publicar)."""
+    hoy = hoy or ahora_cdmx()
+    if not en_cierre_de_mes(hoy) or not so.get('date_order'):
+        return None
+    venta = (datetime.strptime(str(so['date_order'])[:19], '%Y-%m-%d %H:%M:%S')
+             + timedelta(hours=UTC_local))
+    inicio = inicio_de_mes(hoy)
+    if venta >= inicio:
+        return None
+    return (inicio - timedelta(days=1)).strftime('%Y-%m-%d')
+
+
+def filtro_deferred(fecha_venta='COALESCE(d.purchase_date, a.posted_date)'):
+    """Condicion sobre transaction_status del WHERE de QUERY_LOTE.
+
+    Fuera del cierre se excluye DEFERRED, como siempre. En el cierre se admite
+    la fila DEFERRED de las ventas (fecha de compra) anteriores al inicio del
+    mes. La subquery de
+    deduplicacion solo la deja pasar si la pieza no tiene fila liberada (en
+    18,414 piezas desde agosto las dos filas comparten posted_date: sin esa
+    regla se facturarian dos veces). Importes verificados el 2-nov-2026: 16,496
+    piezas con fila DEFERRED y liberada, todas iguales al centavo.
+    """
+    if not en_cierre_de_mes():
+        return "a.transaction_status <> 'DEFERRED'"
+    # Las fechas de Amazon estan en UTC; el inicio del mes se pasa de CDMX a UTC.
+    corte = inicio_de_mes() - timedelta(hours=UTC_local)
+    return (f"(a.transaction_status <> 'DEFERRED' "
+            f"OR {fecha_venta} < '{corte:%Y-%m-%d %H:%M:%S}')")
 
 # Margen hacia atras en la subquery de deduplicacion. Las re-publicaciones de
 # Amazon ocurren dentro de ~15-45 dias; 90 da holgura y evita que el GROUP BY
@@ -347,6 +422,9 @@ SELECT
     MAX(e.deposit_date)                           AS deposit_date,
     MAX(DATE_SUB(a.posted_date, INTERVAL 6 HOUR)) AS posted_date,
     MAX(IFNULL(d.IsBusinessOrder, 0))             AS is_business_order,
+    -- Fecha de compra en CDMX: decide el mes de la venta en el cierre de mes
+    -- (la posted_date de la fila liberada puede ser ya del mes siguiente).
+    MAX(DATE_SUB(d.purchase_date, INTERVAL 6 HOUR)) AS purchase_date,
     MAX(d.tot_min)                                AS amz_order_total_min,
     MAX(d.tot_max)                                AS amz_order_total_max,
     COUNT(*)                                      AS n_items,
@@ -427,17 +505,26 @@ JOIN somos_reyes.amz_transaction_items b
 -- 'Order Payment' no diferidas sin shipment_id. El COALESCE con
 -- transaction_id se deja como red: si algun dia llegara una sin envio, la
 -- fila se conserva sola en vez de agruparse con otras que tampoco lo tienen.
+--
+-- CIERRE DE MES (2-nov-2026): la fila DEFERRED solo gana si la pieza NO tiene
+-- fila liberada ('liberada' = 0). Con fila liberada manda la liberada, igual
+-- que antes; la DEFERRED con la misma posted_date (18,414 piezas desde agosto)
+-- no entra porque la clase de status no coincide. Fuera del cierre el WHERE
+-- de abajo sigue excluyendo DEFERRED, asi que el resultado no cambia.
 JOIN (
     SELECT COALESCE(a2.shipment_id, a2.transaction_id) AS pieza,
-           MAX(a2.posted_date) AS max_posted
+           COALESCE(MAX(CASE WHEN a2.transaction_status <> 'DEFERRED'
+                             THEN a2.posted_date END),
+                    MAX(a2.posted_date)) AS max_posted,
+           MAX(a2.transaction_status <> 'DEFERRED') AS liberada
     FROM somos_reyes.amz_transactions a2
-    WHERE a2.transaction_status <> 'DEFERRED'
-      AND a2.description = 'Order Payment'
+    WHERE a2.description = 'Order Payment'
       AND a2.posted_date >= DATE_SUB(%s, INTERVAL %s DAY)
     GROUP BY COALESCE(a2.shipment_id, a2.transaction_id)
 ) dedup
     ON dedup.pieza = COALESCE(a.shipment_id, a.transaction_id)
    AND dedup.max_posted = a.posted_date
+   AND (a.transaction_status <> 'DEFERRED') = dedup.liberada
 
 LEFT JOIN (
     SELECT marketplace_order_id, MAX(order_id) AS so
@@ -454,6 +541,7 @@ LEFT JOIN (
 -- (filas de una orden todavia pendiente) y monedas distintas de MXN.
 LEFT JOIN (
     SELECT amazonorderid, MAX(IsBusinessOrder) AS IsBusinessOrder,
+           MIN(PurchaseDate) AS purchase_date,
            MIN(CASE WHEN OrderTotalCurrency = 'MXN' AND OrderTotalAmount > 0
                     THEN CAST(OrderTotalAmount AS DECIMAL(14,2)) END) AS tot_min,
            MAX(CASE WHEN OrderTotalCurrency = 'MXN' AND OrderTotalAmount > 0
@@ -510,7 +598,7 @@ LEFT JOIN (
     GROUP BY order_id
 ) f ON a.order_id = f.order_id
 
-WHERE a.transaction_status <> 'DEFERRED'
+WHERE {FILTRO_DEFERRED}
   AND a.description = 'Order Payment'
   AND DATE(DATE_SUB(a.posted_date, INTERVAL 6 HOUR)) >= %s
   {FILTRO_FIN}
@@ -573,20 +661,21 @@ def construir_query_lote(desde=None):
     Con alcance (AMZ_SETTLEMENT_ID / AMZ_ORDER_IDS) la ventana empieza en
     'desde' (inicio_del_alcance) y no hay limite superior.
     """
+    base = QUERY_LOTE.replace('{FILTRO_DEFERRED}', filtro_deferred())
     if CON_ALCANCE:
         inicio = desde or AMZ_START_DATE
         filtro, extra = filtro_alcance()
-        sql = QUERY_LOTE.replace('{FILTRO_FIN}', filtro)
+        sql = base.replace('{FILTRO_FIN}', filtro)
         return sql, tuple([inicio, DEDUP_LOOKBACK_DAYS, inicio] + extra)
 
     params = [AMZ_START_DATE, DEDUP_LOOKBACK_DAYS, AMZ_START_DATE]
     if AMZ_END_DATE:
-        sql = QUERY_LOTE.replace(
+        sql = base.replace(
             '{FILTRO_FIN}',
             'AND DATE(DATE_SUB(a.posted_date, INTERVAL 6 HOUR)) < %s')
         params.append(AMZ_END_DATE)
     else:
-        sql = QUERY_LOTE.replace('{FILTRO_FIN}', '')
+        sql = base.replace('{FILTRO_FIN}', '')
     return sql, tuple(params)
 
 
@@ -629,18 +718,21 @@ JOIN somos_reyes.amz_transaction_items b
 -- Misma deduplicacion que QUERY_LOTE: la fila autoritativa de cada envio.
 JOIN (
     SELECT COALESCE(a2.shipment_id, a2.transaction_id) AS pieza,
-           MAX(a2.posted_date) AS max_posted
+           COALESCE(MAX(CASE WHEN a2.transaction_status <> 'DEFERRED'
+                             THEN a2.posted_date END),
+                    MAX(a2.posted_date)) AS max_posted,
+           MAX(a2.transaction_status <> 'DEFERRED') AS liberada
     FROM somos_reyes.amz_transactions a2
-    WHERE a2.transaction_status <> 'DEFERRED'
-      AND a2.description = 'Order Payment'
+    WHERE a2.description = 'Order Payment'
       AND a2.posted_date >= DATE_SUB(%s, INTERVAL %s DAY)
     GROUP BY COALESCE(a2.shipment_id, a2.transaction_id)
 ) dedup
     ON dedup.pieza = COALESCE(a.shipment_id, a.transaction_id)
    AND dedup.max_posted = a.posted_date
+   AND (a.transaction_status <> 'DEFERRED') = dedup.liberada
 
 WHERE a.order_id = %s
-  AND a.transaction_status <> 'DEFERRED'
+  AND {FILTRO_DEFERRED}
   AND a.description = 'Order Payment'
 
 GROUP BY COALESCE(a.shipment_id, a.transaction_id), b.sku
@@ -664,7 +756,10 @@ ORDER BY date, invoice
 
 def leer_envios(cursor, order_id):
     """Envios de una orden, con sus SKU y cantidades."""
-    cursor.execute(QUERY_ENVIOS,
+    # Misma fecha de venta que QUERY_LOTE, o el reparto no veria las mismas piezas.
+    venta = ("COALESCE((SELECT MIN(o.PurchaseDate) FROM somos_reyes.amazon_orders o "
+             "WHERE o.amazonorderid = a.order_id), a.posted_date)")
+    cursor.execute(QUERY_ENVIOS.replace('{FILTRO_DEFERRED}', filtro_deferred(venta)),
                    (AMZ_START_DATE, DEDUP_LOOKBACK_DAYS, order_id))
     envios = {}
     for r in cursor.fetchall():
@@ -773,6 +868,7 @@ def construir_raw_json(row, tipo, desglose=None):
         'amazon': {
             'deposit_date': str(row['deposit_date']) if row['deposit_date'] else None,
             'posted_date': str(row['posted_date']) if row['posted_date'] else None,
+            'purchase_date': str(row['purchase_date']) if row.get('purchase_date') else None,
             'is_business_order': int(row['is_business_order'] or 0),
             'fulfillment_network': row['fulfillment_network'],
             'n_items': row['n_items'],
@@ -862,7 +958,14 @@ def run_miner(db_conn):
         return {'b2b': 0, 'b2c': 0, 'ya_existian': 0, 'gracia': 0,
                 'multi_cfdi': [], 'split_fallido': [], 'refrescadas': 0}
 
-    hoy = datetime.now()
+    # posted_date viene en hora de CDMX (QUERY_LOTE resta las 6 h).
+    hoy = ahora_cdmx()
+    # Cierre de mes: la venta de un mes anterior no espera gracia.
+    corte_gracia = inicio_de_mes(hoy) if en_cierre_de_mes(hoy) else None
+    if corte_gracia:
+        log.info(f"[MINER] CIERRE DE MES: lo publicado antes del "
+                 f"{corte_gracia:%Y-%m-%d} se factura sin gracia y con fecha "
+                 f"{corte_gracia - timedelta(days=1):%Y-%m-%d} (incluye DEFERRED).")
     res = {'b2b': 0, 'b2c': 0, 'ya_existian': 0, 'gracia': 0,
            'multi_cfdi': [], 'split_fallido': [], 'refrescadas': 0}
     w = db_conn.cursor()
@@ -970,7 +1073,11 @@ def run_miner(db_conn):
             posted = row['posted_date']
             if isinstance(posted, str):
                 posted = datetime.strptime(posted[:19], '%Y-%m-%d %H:%M:%S')
-            if (hoy - posted).days < GRACE_DAYS:
+            venta = row.get('purchase_date') or posted
+            if isinstance(venta, str):
+                venta = datetime.strptime(venta[:19], '%Y-%m-%d %H:%M:%S')
+            if (hoy - posted).days < GRACE_DAYS \
+                    and not (corte_gracia and venta < corte_gracia):
                 status = 'SKIPPED_GRACE'
                 res['gracia'] += 1
 
@@ -1044,12 +1151,15 @@ def reset_stuck_processing(db_conn):
     murio. Solo lo suficientemente viejo: un registro reciente puede
     pertenecer a una corrida viva.
 
-    El estado original se recupera de cfdi_uuid: si lo tiene, era B2B.
+    El estado original se recupera del tipo que sembro el miner en raw_json.
+    Antes se deducia de cfdi_uuid (con UUID = B2B), pero desde el 2-nov-2026
+    las B2C tambien guardan ahi el UUID de nuestro timbrado.
     """
     cursor = db_conn.cursor()
     cursor.execute(f"""
         UPDATE {TBL_BILLING}
-        SET status = IF(cfdi_uuid IS NULL, 'PENDING_WB_INVOICE', 'PENDING_B2B_LINK')
+        SET status = IF(JSON_UNQUOTE(JSON_EXTRACT(raw_json, '$.log_conciliacion.tipo')) = 'B2B',
+                        'PENDING_B2B_LINK', 'PENDING_WB_INVOICE')
         WHERE marketplace = %s
           AND status = 'PROCESSING'
           AND processed_at IS NOT NULL
@@ -1139,11 +1249,20 @@ def claim(db_conn, record_id):
 
 
 def update_staging(db_conn, record_id, status, cfdi_uuid=None, error_log=None,
-                   sumar_retry=False, total_amount=None):
+                   sumar_retry=False, total_amount=None, facturas=None):
     """total_amount solo se pasa cuando lo facturado no es la referencia que
     sembro el miner (promocion financiada por Amazon): asi la tabla dice lo
-    que se facturo, igual que en B2B, y error_log explica la diferencia."""
+    que se facturo, igual que en B2B, y error_log explica la diferencia.
+
+    facturas: las facturas de Odoo de la orden (una por CFDI de Amazon en B2B
+    repartida; la principal y la de envio aparte en B2C), con su UUID y si se
+    timbro. Va a raw_json.facturas_odoo: cfdi_uuid guarda un solo valor."""
     cursor = db_conn.cursor()
+    sql_facturas, extra = '', []
+    if facturas is not None:
+        sql_facturas = (", raw_json = JSON_SET(COALESCE(raw_json, JSON_OBJECT()), "
+                        "'$.facturas_odoo', CAST(%s AS JSON))")
+        extra = [json.dumps(facturas, ensure_ascii=False, default=str)]
     cursor.execute(f"""
         UPDATE {TBL_BILLING}
         SET status = %s,
@@ -1152,9 +1271,10 @@ def update_staging(db_conn, record_id, status, cfdi_uuid=None, error_log=None,
             retry_count_loader = retry_count_loader + %s,
             total_amount = COALESCE(%s, total_amount),
             processed_at = NOW()
+            {sql_facturas}
         WHERE id = %s
-    """, (status, cfdi_uuid, error_log, 1 if sumar_retry else 0,
-          total_amount, record_id))
+    """, tuple([status, cfdi_uuid, error_log, 1 if sumar_retry else 0,
+                total_amount] + extra + [record_id]))
     db_conn.commit()
     cursor.close()
 
@@ -1448,6 +1568,11 @@ def facturar_envio_aparte(odoo, db_conn, record, so, vivas, de_envio,
         'team_id': so['team_id'][0],
         'invoice_payment_term_id': 1,
     }
+    # Cierre de mes: la venta del mes anterior lleva fecha de ese mes.
+    fecha = fecha_factura(so)
+    if fecha:
+        vals['invoice_date'] = fecha
+        vals['date'] = fecha
     try:
         inv_id = odoo.execute_kw('account.move', 'create', [vals])
     except OdooWriteUncertain:
@@ -1471,15 +1596,9 @@ def facturar_envio_aparte(odoo, db_conn, record, so, vivas, de_envio,
         log.warning(f"{so_name}: post incierto de la factura de envio: {e}")
     except xmlrpc.client.Fault as e:
         return f"ENVIO: fallo el post de la factura de envio: {e.faultString[:200]}"
+    error_timbre = None
     if DO_STAMPING:
-        try:
-            ctx = {'active_model': 'account.move', 'active_ids': [inv_id]}
-            wiz = odoo.execute_kw('account.move.send.wizard', 'create',
-                                  [{'is_download_only': False}], {'context': ctx})
-            odoo.execute_kw('account.move.send.wizard', 'action_send_and_print',
-                            [[wiz]], {'context': ctx})
-        except Exception as e:
-            log.warning(f"{so_name}: fallo el timbrado de la factura de envio: {e}")
+        _, error_timbre = timbrar(odoo, inv_id, f"{so_name} (envio aparte)")
 
     nombre = odoo.execute_kw('account.move', 'read', [[inv_id]], {'fields': ['name']})[0]['name']
     try:
@@ -1500,7 +1619,36 @@ def facturar_envio_aparte(odoo, db_conn, record, so, vivas, de_envio,
     stats['envio_aparte'].append(f"{so_name} {nombre} {envio['total']:,.2f} ({envio['fuente']})")
     log.info(f"{so_name}: factura de envio aparte {nombre} por {envio['total']:,.2f} "
              f"(complementa {', '.join(v['name'] for v in vivas)}; fuente {envio['fuente']}).")
-    return f"ENVIO_FACTURADO_APARTE {nombre} {envio['total']:.2f}"
+    nota = f"ENVIO_FACTURADO_APARTE {nombre} {envio['total']:.2f}"
+    if error_timbre:
+        stats['timbrado_fallido'].append(f"{so_name} {nombre}: {error_timbre[:200]}")
+        nota = f"TIMBRADO_FALLIDO {nombre}: {error_timbre[:300]} | {nota}"
+    return nota
+
+
+def timbrar(odoo, inv_id, etiqueta):
+    """Timbra una factura ya publicada. Devuelve (uuid, error).
+
+    Lo que decide es el UUID que queda en la factura, no si la llamada fallo:
+    el asistente puede terminar sin excepcion y sin timbre, y por XML-RPC un
+    metodo que no devuelve nada falla al responder aunque haya hecho su trabajo.
+    """
+    error = None
+    try:
+        ctx = {'active_model': 'account.move', 'active_ids': [inv_id]}
+        wiz = odoo.execute_kw('account.move.send.wizard', 'create',
+                              [{'is_download_only': False}], {'context': ctx})
+        odoo.execute_kw('account.move.send.wizard', 'action_send_and_print',
+                        [[wiz]], {'context': ctx})
+    except Exception as e:
+        if 'cannot marshal None' not in str(e):
+            error = str(e)
+    uuid = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                           {'fields': ['l10n_mx_edi_cfdi_uuid']})[0]['l10n_mx_edi_cfdi_uuid']
+    if not uuid:
+        error = error or 'el timbrado termino sin UUID'
+        log.warning(f"{etiqueta}: fallo el timbrado: {error}")
+    return uuid or None, (None if uuid else error)
 
 
 def religar_kits(odoo, inv_id, religar, so_name):
@@ -1541,16 +1689,6 @@ def es_kit(odoo, product_id, catalogos):
               '&', ('product_id', '=', False), ('product_tmpl_id', '=', tmpl),
               ('type', '=', 'phantom')]]))
     return cache[product_id]
-
-
-def pagado_por_cliente(record):
-    """OrderTotal de Amazon guardado por el miner, o None."""
-    try:
-        raw = json.loads(record['raw_json']) if record.get('raw_json') else {}
-    except (ValueError, TypeError):
-        return None
-    valor = raw.get('amazon', {}).get('order_total_cliente')
-    return a_float(valor) if valor else None
 
 
 def comando_envio(base, catalogos):
@@ -2353,6 +2491,7 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
 
     refs_ya_creadas = {e.get('ref') for e in existentes if e.get('ref')}
 
+    creadas = []
     for parte in partes:
         if parte['ref'] in refs_ya_creadas:
             # Reanudacion: una corrida anterior murio a la mitad del reparto.
@@ -2363,6 +2502,7 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
                              stats, catalogos, es_b2b, tipo, partner_b2b)
         if creada is None:
             return   # el error ya quedo registrado en la tabla de control
+        creadas.append(creada)
 
     promo = partes[0].get('promo') if len(partes) == 1 else None
     if promo:
@@ -2373,7 +2513,9 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
             f"{promo['excedente']:,.2f}")
     # error_log como bitacora de lo que paso con la orden; el reporte de
     # Finanzas lo lee (SO_CANCELADA alimenta despues el flujo de NC).
-    notas = []
+    # TIMBRADO_FALLIDO va primero: es lo que se busca con LIKE en el reporte.
+    notas = [f"TIMBRADO_FALLIDO {c['factura']}: {(c['error_timbre'] or '')[:300]}"
+             for c in creadas if c['timbre'] == 'FALLIDO']
     if promo:
         notas.append(f"PROMO_AMAZON cliente {promo['cobrado_cliente']:.2f} "
                      f"transacciones {promo['transacciones']:.2f} "
@@ -2385,12 +2527,17 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
         notas.append("SO_CONFIRMADA: estaba en borrador")
     if len(partes) == 1 and partes[0].get('envio_agregado'):
         notas.append(f"ENVIO_AGREGADO C-ENVIO {partes[0]['envio_agregado']:.2f}")
+    # cfdi_uuid: en B2B el de Amazon (ya estaba); en B2C el de nuestro timbrado,
+    # None si fallo. Todas las facturas, con su UUID, en raw_json.facturas_odoo.
+    uuid_wb = next((c['uuid'] for c in creadas if c['uuid']), None)
     update_staging(
         db_conn, record['id'],
         'ODOO_B2B_LINKED' if es_b2b else 'ODOO_INVOICED',
-        cfdi_uuid=record['cfdi_uuid'],
+        cfdi_uuid=record['cfdi_uuid'] if es_b2b else uuid_wb,
         error_log=' | '.join(notas) or None,
-        total_amount=promo['cobrado_cliente'] if promo else None)
+        total_amount=promo['cobrado_cliente'] if promo else None,
+        facturas=[{'factura': c['factura'], 'uuid': c['uuid'], 'fecha': c['fecha'],
+                   'timbre': c['timbre'], 'total': c['total_odoo']} for c in creadas])
 
 
 # =============================================================================
@@ -2728,6 +2875,14 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         'invoice_payment_term_id': 1,   # pago inmediato -> PUE, no PPD
     }
 
+    # B2C: la venta del mes anterior facturada en el cierre lleva fecha de ese
+    # mes (ver CIERRE DE MES). Sin invoice_date Odoo pone la de la corrida.
+    if not es_b2b:
+        fecha = fecha_factura(so)
+        if fecha:
+            invoice_vals['invoice_date'] = fecha
+            invoice_vals['date'] = fecha
+
     # Los valores de arriba son los de publico en general y solo aplican a
     # B2C. En B2B se sustituyen por los del comprobante real: receptor, uso de
     # CFDI, forma de pago y fecha de emision.
@@ -2831,25 +2986,13 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         ajuste_cfdi = cuadrar_con_cfdi(odoo, inv_id, cfdi,
                                        so_name + parte['etiqueta'])
 
-    # --- B2C: el total tiene que ser lo que pago el cliente ---
-    # 701-4769487-1597824 salio por 399.01 y el cliente pago 399.00 (correo
-    # de Jero del 28-oct, segundo): Odoo redondea el IVA por linea (343.97 x 16% =
-    # 55.04) y Amazon cobro 55.03. Mismo ajuste del IVA que en B2B, contra el
-    # OrderTotal, solo si es redondeo (TOLERANCIA_CUADRE_CFDI).
-    if not es_b2b:
-        objetivo = pagado_por_cliente(record)
-        if objetivo:
-            leida = odoo.execute_kw('account.move', 'read', [[inv_id]],
-                                    {'fields': ['amount_untaxed', 'amount_total']})[0]
-            dif = round(objetivo - a_float(leida['amount_total']), 2)
-            if dif and abs(dif) <= TOLERANCIA_CUADRE_CFDI:
-                base = round(a_float(leida['amount_untaxed']), 2)
-                ajuste_cfdi = cuadrar_con_cfdi(
-                    odoo, inv_id, {'total': objetivo, 'taxes': round(objetivo - base, 2),
-                                   'subtotal': base, 'discount': 0},
-                    so_name + parte['etiqueta'])
-                if ajuste_cfdi:
-                    stats['centavo_b2c'] += 1
+    # --- B2C: SIN ajuste de centavo ---
+    # Del 28-oct al 2-nov se editaba aqui la linea de IVA para que la factura
+    # diera el OrderTotal (701-4769487-1597824: 399.01 vs 399.00). El asiento
+    # cuadraba, pero el PAC rechazo el CFDI (CFDI40119, SO10362958): Odoo arma
+    # el XML recalculando el IVA de cada linea, sin el centavo editado, y el
+    # Total ya no es subtotal + impuestos. En B2B no pasa porque no timbramos.
+    # El centavo lo absorbe 03 al aplicar el cobro, contra 704.23.001.
     if ajuste_cfdi and cxc:
         # Editar el IVA rebalancea la CxC: se confirma que siga en la cuenta
         # de Amazon y no en la del partner.
@@ -2880,19 +3023,14 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         religar_kits(odoo, inv_id, parte['religar'], so_name)
 
     # --- TIMBRADO: solo B2C. En B2B el comprobante ya existe. ---
+    timbre, error_timbre = ('AMAZON' if es_b2b else 'APAGADO'), None
     if DO_STAMPING and not es_b2b:
-        try:
-            ctx = {'active_model': 'account.move', 'active_ids': [inv_id]}
-            wiz = odoo.execute_kw('account.move.send.wizard', 'create',
-                                  [{'is_download_only': False}], {'context': ctx})
-            odoo.execute_kw('account.move.send.wizard', 'action_send_and_print',
-                            [[wiz]], {'context': ctx})
-        except Exception as e:
-            log.warning(f"{so_name}: fallo el timbrado: {e}")
+        uuid_wb, error_timbre = timbrar(odoo, inv_id, so_name + parte['etiqueta'])
+        timbre = 'OK' if uuid_wb else 'FALLIDO'
 
     inv = odoo.execute_kw('account.move', 'read', [[inv_id]],
                           {'fields': ['name', 'state', 'amount_untaxed',
-                                      'amount_tax', 'amount_total',
+                                      'amount_tax', 'amount_total', 'invoice_date',
                                       'l10n_mx_edi_cfdi_uuid']})
     inv = inv[0] if inv else {}
     uuid_final = inv.get('l10n_mx_edi_cfdi_uuid') or uuid_amazon or None
@@ -2949,15 +3087,36 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         'total_amazon': total_amz, 'diferencia': dif,
         'marca': 'OK' if abs(dif) <= TOLERANCIA_TOTAL else 'DIFERENCIA',
         'uuid': uuid_final,
+        'fecha': inv.get('invoice_date'),
+        'timbre': timbre,
+        'error_timbre': error_timbre,
         'ajuste_base': ajuste_base,
         'ajuste_cfdi': ajuste_cfdi,
         'conciliacion_205': conc['estado'],
     }
     stats['facturadas'].append(resultado)
+    if timbre == 'FALLIDO':
+        stats['timbrado_fallido'].append(
+            f"{so_name}{parte['etiqueta']} {inv.get('name')}: {(error_timbre or '')[:200]}")
 
     log.info(f"{so_name}{parte['etiqueta']}: {inv.get('name')} [{tipo}] "
              f"Odoo={total_odoo:,.2f} Amazon={total_amz:,.2f} dif={dif:+,.2f}")
     return resultado
+
+
+def nuevos_stats(reclasificadas_b2b=0):
+    """Acumuladores del loader. Funcion aparte porque 12_sanear_facturas_amazon.py
+    llama a procesar() con los mismos."""
+    return {'facturadas': [], 'ya_facturadas': 0, 'adoptadas': 0,
+            'sin_so': [], 'canceladas': [], 'borrador': [],
+            'duplicados': [], 'inciertos': [], 'b2b_sin_receptor': [],
+            'total_diff': [], 'split_fallido': [], 'promo_amazon': [],
+            'confirmadas': [], 'en_global': [], 'b2b_facturada_pg': [],
+            'envio_agregado': [], 'envio_sin_confirmar': [], 'envio_aparte': [],
+            'kit_sin_costo': [], 'timbrado_fallido': [],
+            'conciliacion_205': {},
+            'reclasificadas_b2b': reclasificadas_b2b,
+            'cuota': {'B2B': 0, 'B2C_PUBLICO_GENERAL': 0}}
 
 
 def run_loader(db_conn):
@@ -2982,18 +3141,7 @@ def run_loader(db_conn):
     catalogos = cargar_catalogos(odoo)
     partner_cache = {}
 
-    stats = {'facturadas': [], 'ya_facturadas': 0, 'adoptadas': 0,
-             'sin_so': [], 'canceladas': [], 'borrador': [],
-             'duplicados': [], 'inciertos': [], 'b2b_sin_receptor': [],
-             'total_diff': [], 'split_fallido': [], 'promo_amazon': [],
-             'confirmadas': [], 'en_global': [], 'b2b_facturada_pg': [],
-             'envio_agregado': [], 'envio_sin_confirmar': [], 'envio_aparte': [],
-             'kit_sin_costo': [],
-             'centavo_b2c': 0,
-             'conciliacion_205': {},
-             'reclasificadas_b2b': stats_reclasificadas,
-             'cuota': {'B2B': 0, 'B2C_PUBLICO_GENERAL': 0}}
-
+    stats = nuevos_stats(stats_reclasificadas)
     hechas = stats['cuota']
 
     for idx, record in enumerate(records):
@@ -3084,7 +3232,7 @@ def reportar(stats):
     log.info(f"  Con envio agregado (C-ENVIO)    : {len(stats['envio_agregado'])}")
     log.info(f"  Factura de envio aparte         : {len(stats['envio_aparte'])}")
     log.info(f"  Envio sin confirmar (excepcion) : {len(stats['envio_sin_confirmar'])}")
-    log.info(f"  B2C con centavo ajustado        : {stats['centavo_b2c']}")
+    log.info(f"  B2C con timbrado fallido        : {len(stats['timbrado_fallido'])}")
     log.info(f"  205.06.003 de las facturas      : "
              f"{', '.join(f'{k} {v}' for k, v in sorted(stats['conciliacion_205'].items())) or '-'}")
     log.info(f"  Sin SO en Odoo                  : {len(stats['sin_so'])}")
@@ -3153,7 +3301,9 @@ def reportar(stats):
         log.info('  El excedente no se factura ni se aplica a la CxC; 03 lo '
                  'marca al llegar el cobro. Tratamiento contable pendiente.')
 
-    for clave, titulo in (('b2b_facturada_pg', 'B2B CON FACTURA A PUBLICO GENERAL '
+    for clave, titulo in (('timbrado_fallido', 'FACTURAS PUBLICADAS SIN TIMBRAR '
+                                               '(12_sanear_facturas_amazon.py)'),
+                          ('b2b_facturada_pg', 'B2B CON FACTURA A PUBLICO GENERAL '
                                                '(anular antes de vincular el CFDI de Amazon)'),
                           ('borrador', 'SO EN BORRADOR QUE NO SE PUDIERON CONFIRMAR'),
                           ('envio_aparte', 'FACTURAS DE ENVIO APARTE'),
@@ -3186,6 +3336,12 @@ def reportar(stats):
             f"en estado INCIERTO* (`{KESTRA_EXECUTION_ID}`).\nNo se "
             f"reintentaron para no duplicar. Verificar en Odoo antes de "
             f"reprocesar.\n{', '.join(stats['inciertos'][:15])}")
+
+    if stats['timbrado_fallido']:
+        notify_slack(
+            f":rotating_light: *{len(stats['timbrado_fallido'])} factura(s) B2C de "
+            f"Amazon publicadas SIN TIMBRAR* (`{KESTRA_EXECUTION_ID}`).\n"
+            f"{chr(10).join(stats['timbrado_fallido'][:10])}")
 
     if stats['canceladas']:
         notify_slack(
@@ -3252,6 +3408,10 @@ if __name__ == '__main__':
         _ventana = f"Ventana: {AMZ_START_DATE} .. {AMZ_END_DATE or 'hoy'}"
     log.info(f"Timbrado: {'ACTIVADO' if DO_STAMPING else 'DESACTIVADO'} | "
              f"Cuota: {_cuota} | Gracia: {GRACE_DAYS} dias | {_ventana}")
+    if en_cierre_de_mes():
+        log.info(f"CIERRE DE MES (dia {ahora_cdmx().day} <= {DIAS_CIERRE_MES}): las B2C "
+                 f"de meses anteriores se facturan con fecha "
+                 f"{inicio_de_mes() - timedelta(days=1):%Y-%m-%d}, sin gracia.")
     t0 = tm.time()
     try:
         main()

@@ -40,6 +40,10 @@ inputs:
     type: BOOLEAN
     defaults: true
     displayName: "Correr 02 y 03 (false en el saneamiento ene–sep)"
+  - id: dias_cierre_mes
+    type: STRING
+    defaults: "1"
+    displayName: "Días del mes en que la venta del mes anterior se factura con su fecha (máx. 3; 2 o 3 solo para reponer un cierre)"
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
@@ -97,6 +101,7 @@ tasks:
           AMZ_PROD_MAX_FACTURAS: "{{ inputs.max_facturas ?? '' }}"
           AMZ_PAYMENTS_BATCH: "{{ inputs.payments_batch }}"
           AMZ_PAYMENTS_DESDE: "{{ vars.payments_desde }}"
+          AMZ_DIAS_CIERRE_MES: "{{ inputs.dias_cierre_mes }}"
         commands:
           # 00 verifica configuración (solo lectura) y corta la corrida si falta algo.
           - python {{ vars.scripts }}/00_amz_precheck_prod.py

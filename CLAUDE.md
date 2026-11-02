@@ -296,6 +296,7 @@ Todos en `test/financial/billing_processes/amazon/`.
 | `09_reporte_lote_finanzas.py` | Excel del lote para Finanzas (modo settlement con `AMZ_SETTLEMENT_ID`) | ✅ |
 | `10_conciliar_205.py` | Rehace la conciliación 205.06.003 de facturas ya creadas | ✅ |
 | `11_ajuste_cogs_205.py` | Ajuste mensual al COGS por diferencia de costeo factura vs salida | ✅ |
+| `12_sanear_facturas_amazon.py` | Saneamiento único: B2C sin timbre y B2C de octubre con fecha de noviembre | 🔨 sin correr |
 | `AMZ_facturacion_corregida.sql` | Reporte BI 3.0 con los 3 fixes | ✅ |
 | `04_amz_billing_test_batch.py` | **DEPRECADO** — absorbido por `01` | ⛔ |
 | `DDL_amz_tables.sql` | **DEPRECADO** — se usan las tablas `mkp_*` | ⛔ |
@@ -344,6 +345,13 @@ ERROR                  fallo recuperable
 - **B2C:** el centavo se ajusta para que la factura sea igual a OrderTotal (mismo mecanismo que B2B).
 - **Cierre mensual de la 205.06.003** (`11_ajuste_cogs_205.py`): SO de Amazon con cada línea entregada y facturada completa (`qty_delivered`/`qty_invoiced` por línea; `delivery_status` no basta con devoluciones), factura propia y salida en la 205.06.003. Residuo → 501.01.001 con conciliación completa. Dos etiquetas: "…diferencia de costeo de producto entre facturación y salida" y "…diferencia entre kit facturado y componentes despachados" (incluye factura de kit sin costo). Reporte `reporte_kits_<mes>.csv`: diferencia de costo / de cantidad / factura sin costo. **No ajusta** (solo cuenta): devoluciones pendientes de NC, facturas globales, y SO cuya salida no está en la 205.06.003 (hueco histórico del 1a1: ~855 SO).
 - **Redondeo:** 704.23.001 confirmada para producción. **B2B ya facturada a público general:** cancelación SAT motivo 02.
+
+## Reglas del 2-nov-2026 (primeras corridas en producción)
+
+- **Sin ajuste de centavo en B2C.** Editar la línea de IVA hacía que el PAC rechazara el CFDI (CFDI40119, SO10362958): Odoo arma el XML con el IVA recalculado por línea. El centavo contra el OrderTotal lo absorbe 03 en 704.23.001. En B2B el ajuste sigue (no timbramos).
+- **La venta se factura con fecha de su mes.** En los primeros `AMZ_DIAS_CIERRE_MES` días (default 1, máximo 3 por las 72 h del SAT) la B2C cuya SO es de un mes anterior lleva fecha del último día de ese mes, sin gracia, y el miner lee también las filas `DEFERRED` (Amazon cobró y no ha liberado; al 2-nov eran 802 órdenes de octubre). La fila `DEFERRED` solo entra si la pieza no tiene fila liberada: en 18,414 piezas las dos comparten `posted_date`. Importes `DEFERRED` vs liberada: 16,496 piezas iguales al centavo. El mes de la venta es `date_order` de la SO (y `PurchaseDate` en el miner), en hora de CDMX; la hora sale de UTC, no del servidor.
+- **Registro del timbrado.** `cfdi_uuid` de una B2C es nuestro UUID; si el PAC rechaza, `error_log` empieza con `TIMBRADO_FALLIDO`. Todas las facturas de la orden van en `raw_json.facturas_odoo`.
+- **Saneamiento único** de lo facturado del 30-oct al 2-nov: `12_sanear_facturas_amazon.py` (solo en `test/`). A = publicada sin timbre (se corrige y timbra la misma). B = timbrada con fecha de noviembre siendo venta de octubre (cancelación SAT motivo 02 + factura nueva por `procesar()`). Estado temporal `SANEO_CANCELACION`.
 
 ## `payment_id` compuesto en cobros
 
