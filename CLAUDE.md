@@ -296,7 +296,8 @@ Todos en `test/financial/billing_processes/amazon/`.
 | `09_reporte_lote_finanzas.py` | Excel del lote para Finanzas (modo settlement con `AMZ_SETTLEMENT_ID`) | ✅ |
 | `10_conciliar_205.py` | Rehace la conciliación 205.06.003 de facturas ya creadas | ✅ |
 | `11_ajuste_cogs_205.py` | Ajuste mensual al COGS por diferencia de costeo factura vs salida | ✅ |
-| `12_sanear_facturas_amazon.py` | Saneamiento único: B2C sin timbre y B2C de octubre con fecha de noviembre | 🔨 sin correr |
+| `12_sanear_facturas_amazon.py` | Saneamiento único: B2C sin timbre y B2C de octubre con fecha de noviembre | 🔨 corriendo (2-nov) |
+| `13_cerrar_centavos_amazon.py` | Cierra contra 704.23.001 los ±0.01 que dejó el 12 en la 105.01.006 (factura con saldo o cobro sobrante) | 🔨 sin correr |
 | `AMZ_facturacion_corregida.sql` | Reporte BI 3.0 con los 3 fixes | ✅ |
 | `04_amz_billing_test_batch.py` | **DEPRECADO** — absorbido por `01` | ⛔ |
 | `DDL_amz_tables.sql` | **DEPRECADO** — se usan las tablas `mkp_*` | ⛔ |

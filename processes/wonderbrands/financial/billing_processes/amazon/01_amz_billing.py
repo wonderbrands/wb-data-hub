@@ -242,25 +242,54 @@ def ahora_cdmx():
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=UTC_local)
 
 
+# =============================================================================
+# EL DIA DE LA CORRIDA SE FIJA UNA SOLA VEZ, AL ARRANCAR
+# =============================================================================
+# Incidente del 3-nov-2026: el saneamiento arranco el 2-nov (ventana de cierre
+# hasta el dia 2) y paso la medianoche. Cada factura volvia a preguntar la hora:
+# desde el dia 3 ya no estaba "en cierre", la fecha quedaba vacia y Odoo puso
+# la del dia. 1,039 ventas de octubre salieron timbradas el 03-nov
+# (SO10335623: INV/2026/176936). Una corrida que empieza en cierre de mes
+# termina en cierre de mes, dure lo que dure.
+HOY_CORRIDA = ahora_cdmx()
+
+
 def inicio_de_mes(hoy=None):
-    return (hoy or ahora_cdmx()).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return (hoy or HOY_CORRIDA).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 def en_cierre_de_mes(hoy=None):
-    return (hoy or ahora_cdmx()).day <= DIAS_CIERRE_MES
+    return (hoy or HOY_CORRIDA).day <= DIAS_CIERRE_MES
+
+
+def venta_de_mes_anterior(so, hoy=None):
+    """True si la SO es de un mes anterior al de la corrida (hora de CDMX)."""
+    if not so.get('date_order'):
+        return False
+    venta = (datetime.strptime(str(so['date_order'])[:19], '%Y-%m-%d %H:%M:%S')
+             + timedelta(hours=UTC_local))
+    return venta < inicio_de_mes(hoy)
 
 
 def fecha_factura(so, hoy=None):
     """invoice_date de una B2C. None = la de la corrida (Odoo la pone al publicar)."""
-    hoy = hoy or ahora_cdmx()
-    if not en_cierre_de_mes(hoy) or not so.get('date_order'):
+    if not en_cierre_de_mes(hoy) or not venta_de_mes_anterior(so, hoy):
         return None
-    venta = (datetime.strptime(str(so['date_order'])[:19], '%Y-%m-%d %H:%M:%S')
-             + timedelta(hours=UTC_local))
-    inicio = inicio_de_mes(hoy)
-    if venta >= inicio:
-        return None
-    return (inicio - timedelta(days=1)).strftime('%Y-%m-%d')
+    return (inicio_de_mes(hoy) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+
+# Con la fecha del mes anterior, la hora del CFDI se lleva a las 23:59:59 de
+# ese dia. Odoo arma la hora del CFDI con la de publicacion: publicada el dia 3
+# a las 13:30, el CFDI diria "31-oct 13:30" y las 72 h del SAT vencerian a esa
+# hora. Solo aplica a facturas con fecha del mes anterior (bloque `if fecha:`).
+CFDI_HORA_FIN_DE_DIA = True
+
+
+def limite_72h(hoy=None):
+    """Ultimo momento para crear y timbrar una factura con fecha del ultimo dia
+    del mes anterior (23:59:59 + 72 h), con 20 min de margen. Una corrida del
+    dia 3 que pasa la medianoche ya no puede timbrar con esa fecha."""
+    return inicio_de_mes(hoy) + timedelta(days=3) - timedelta(minutes=20)
 
 
 def filtro_deferred(fecha_venta='COALESCE(d.purchase_date, a.posted_date)'):
@@ -959,7 +988,7 @@ def run_miner(db_conn):
                 'multi_cfdi': [], 'split_fallido': [], 'refrescadas': 0}
 
     # posted_date viene en hora de CDMX (QUERY_LOTE resta las 6 h).
-    hoy = ahora_cdmx()
+    hoy = HOY_CORRIDA
     # Cierre de mes: la venta de un mes anterior no espera gracia.
     corte_gracia = inicio_de_mes(hoy) if en_cierre_de_mes(hoy) else None
     if corte_gracia:
@@ -1570,6 +1599,9 @@ def facturar_envio_aparte(odoo, db_conn, record, so, vivas, de_envio,
     }
     # Cierre de mes: la venta del mes anterior lleva fecha de ese mes.
     fecha = fecha_factura(so)
+    if fecha and ahora_cdmx() >= limite_72h():
+        return (f"ENVIO: FUERA_72H, no se creo la factura de envio; ya no se puede "
+                f"timbrar con fecha {fecha}.")
     if fecha:
         vals['invoice_date'] = fecha
         vals['date'] = fecha
@@ -1590,12 +1622,27 @@ def facturar_envio_aparte(odoo, db_conn, record, so, vivas, de_envio,
         odoo.execute_kw('account.move', 'write',
                         [[inv_id], {'line_ids': [(1, l['id'], {'account_id': account_cxc}) for l in cxc]}],
                         {'context': {'tracking_disable': True}})
+    # Candado de fecha, igual que en crear_parte().
+    if fecha:
+        leida = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                                {'fields': ['invoice_date']})[0]['invoice_date']
+        if str(leida) != fecha:
+            odoo.execute_kw('account.move', 'unlink', [[inv_id]])
+            return (f"ENVIO: FECHA_INCORRECTA, la factura traia {leida} y debe ser "
+                    f"{fecha}; se borro el borrador")
     try:
         odoo.execute_kw('account.move', 'action_post', [[inv_id]])
     except OdooWriteUncertain as e:
         log.warning(f"{so_name}: post incierto de la factura de envio: {e}")
     except xmlrpc.client.Fault as e:
         return f"ENVIO: fallo el post de la factura de envio: {e.faultString[:200]}"
+    if fecha and CFDI_HORA_FIN_DE_DIA:
+        try:
+            odoo.execute_kw('account.move', 'write',
+                            [[inv_id], {'l10n_mx_edi_post_time': f"{fecha} 23:59:59"}],
+                            {'context': {'tracking_disable': True}})
+        except Exception as e:
+            log.warning(f"{so_name}: no se pudo fijar la hora del CFDI de envio: {e}")
     error_timbre = None
     if DO_STAMPING:
         _, error_timbre = timbrar(odoo, inv_id, f"{so_name} (envio aparte)")
@@ -2877,11 +2924,27 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
 
     # B2C: la venta del mes anterior facturada en el cierre lleva fecha de ese
     # mes (ver CIERRE DE MES). Sin invoice_date Odoo pone la de la corrida.
+    fecha = None
     if not es_b2b:
         fecha = fecha_factura(so)
+        if fecha and ahora_cdmx() >= limite_72h():
+            # Creada ahora ya no se timbraria con fecha del mes anterior: se
+            # deja sin factura. La siguiente corrida la emite con fecha del dia
+            # y la reporta en "Venta mes anterior fuera cierre".
+            motivo = (f"FUERA_72H: venta del mes anterior sin crear; ya no se puede "
+                      f"timbrar con fecha {fecha}.")
+            update_staging(db_conn, record['id'], 'ERROR', error_log=motivo)
+            log.error(f"{so_name}: {motivo}")
+            return None
         if fecha:
             invoice_vals['invoice_date'] = fecha
             invoice_vals['date'] = fecha
+        elif venta_de_mes_anterior(so):
+            # Fuera de la ventana ya no se puede timbrar con fecha del mes de la
+            # venta (72 h del SAT). Sale con la del dia, pero no en silencio.
+            stats['mes_anterior_fuera_cierre'].append(f"{so_name} (venta {so['date_order']})")
+            log.warning(f"{so_name}: venta de un mes anterior facturada fuera del "
+                        f"cierre de mes: sale con fecha de hoy.")
 
     # Los valores de arriba son los de publico en general y solo aplican a
     # B2C. En B2B se sustituyen por los del comprobante real: receptor, uso de
@@ -3008,6 +3071,23 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
             odoo.execute_kw('account.move', 'write', [[inv_id], {'line_ids': fuera}],
                             {'context': {'tracking_disable': True}})
 
+    # --- CANDADO DE FECHA (incidente del 3-nov-2026) ---
+    # Si la venta es del mes anterior y estamos en cierre, la factura TIENE que
+    # llevar el ultimo dia de ese mes. Se lee de Odoo antes de publicar: si no
+    # la trae, el borrador se borra y la orden queda en ERROR. Nunca se publica
+    # ni se timbra una venta del mes anterior con fecha del mes en curso.
+    if fecha:
+        leida = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                                {'fields': ['invoice_date']})[0]['invoice_date']
+        if str(leida) != fecha:
+            odoo.execute_kw('account.move', 'unlink', [[inv_id]])
+            motivo = (f"FECHA_INCORRECTA: venta del mes anterior, la factura traia "
+                      f"{leida} y debe ser {fecha}. Se borro el borrador.")
+            update_staging(db_conn, record['id'], 'ERROR', error_log=motivo,
+                           sumar_retry=True)
+            log.error(f"{so_name}: {motivo}")
+            return None
+
     # --- POST: genera el asiento contable ---
     try:
         odoo.execute_kw('account.move', 'action_post', [[inv_id]])
@@ -3022,11 +3102,30 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
     if parte.get('religar'):
         religar_kits(odoo, inv_id, parte['religar'], so_name)
 
+    # Segunda lectura ya publicada: si la fecha cambio al publicar, no se timbra.
+    fecha_ok = True
+    if fecha:
+        publicada = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                                    {'fields': ['invoice_date']})[0]['invoice_date']
+        fecha_ok = str(publicada) == fecha
+        if not fecha_ok:
+            log.error(f"{so_name}: al publicar la fecha quedo en {publicada} y debe "
+                      f"ser {fecha}. NO se timbra; corregir a mano.")
+        elif CFDI_HORA_FIN_DE_DIA:
+            try:
+                odoo.execute_kw('account.move', 'write',
+                                [[inv_id], {'l10n_mx_edi_post_time': f"{fecha} 23:59:59"}],
+                                {'context': {'tracking_disable': True}})
+            except Exception as e:
+                log.warning(f"{so_name}: no se pudo fijar la hora del CFDI: {e}")
+
     # --- TIMBRADO: solo B2C. En B2B el comprobante ya existe. ---
     timbre, error_timbre = ('AMAZON' if es_b2b else 'APAGADO'), None
-    if DO_STAMPING and not es_b2b:
+    if DO_STAMPING and not es_b2b and fecha_ok:
         uuid_wb, error_timbre = timbrar(odoo, inv_id, so_name + parte['etiqueta'])
         timbre = 'OK' if uuid_wb else 'FALLIDO'
+    elif DO_STAMPING and not es_b2b:
+        timbre, error_timbre = 'FALLIDO', f"FECHA_INCORRECTA: debe ser {fecha}; no se timbro"
 
     inv = odoo.execute_kw('account.move', 'read', [[inv_id]],
                           {'fields': ['name', 'state', 'amount_untaxed',
@@ -3113,7 +3212,7 @@ def nuevos_stats(reclasificadas_b2b=0):
             'total_diff': [], 'split_fallido': [], 'promo_amazon': [],
             'confirmadas': [], 'en_global': [], 'b2b_facturada_pg': [],
             'envio_agregado': [], 'envio_sin_confirmar': [], 'envio_aparte': [],
-            'kit_sin_costo': [], 'timbrado_fallido': [],
+            'kit_sin_costo': [], 'timbrado_fallido': [], 'mes_anterior_fuera_cierre': [],
             'conciliacion_205': {},
             'reclasificadas_b2b': reclasificadas_b2b,
             'cuota': {'B2B': 0, 'B2C_PUBLICO_GENERAL': 0}}
@@ -3233,6 +3332,7 @@ def reportar(stats):
     log.info(f"  Factura de envio aparte         : {len(stats['envio_aparte'])}")
     log.info(f"  Envio sin confirmar (excepcion) : {len(stats['envio_sin_confirmar'])}")
     log.info(f"  B2C con timbrado fallido        : {len(stats['timbrado_fallido'])}")
+    log.info(f"  Venta mes anterior fuera cierre : {len(stats['mes_anterior_fuera_cierre'])}")
     log.info(f"  205.06.003 de las facturas      : "
              f"{', '.join(f'{k} {v}' for k, v in sorted(stats['conciliacion_205'].items())) or '-'}")
     log.info(f"  Sin SO en Odoo                  : {len(stats['sin_so'])}")
@@ -3337,6 +3437,13 @@ def reportar(stats):
             f"reintentaron para no duplicar. Verificar en Odoo antes de "
             f"reprocesar.\n{', '.join(stats['inciertos'][:15])}")
 
+    if stats['mes_anterior_fuera_cierre']:
+        notify_slack(
+            f":warning: *{len(stats['mes_anterior_fuera_cierre'])} venta(s) de Amazon de un "
+            f"mes anterior facturadas FUERA del cierre de mes* (`{KESTRA_EXECUTION_ID}`): "
+            f"salieron con fecha de hoy.\n"
+            f"{', '.join(stats['mes_anterior_fuera_cierre'][:15])}")
+
     if stats['timbrado_fallido']:
         notify_slack(
             f":rotating_light: *{len(stats['timbrado_fallido'])} factura(s) B2C de "
@@ -3409,7 +3516,7 @@ if __name__ == '__main__':
     log.info(f"Timbrado: {'ACTIVADO' if DO_STAMPING else 'DESACTIVADO'} | "
              f"Cuota: {_cuota} | Gracia: {GRACE_DAYS} dias | {_ventana}")
     if en_cierre_de_mes():
-        log.info(f"CIERRE DE MES (dia {ahora_cdmx().day} <= {DIAS_CIERRE_MES}): las B2C "
+        log.info(f"CIERRE DE MES (dia {HOY_CORRIDA.day} <= {DIAS_CIERRE_MES}): las B2C "
                  f"de meses anteriores se facturan con fecha "
                  f"{inicio_de_mes() - timedelta(days=1):%Y-%m-%d}, sin gracia.")
     t0 = tm.time()

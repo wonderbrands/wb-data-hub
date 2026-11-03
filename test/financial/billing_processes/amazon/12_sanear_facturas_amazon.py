@@ -247,6 +247,14 @@ def sanear_sin_timbre(odoo, m, db, f, so, cuenta_cxc, cuenta_205):
         return f'ERROR: el IVA quedo en {actual:.2f} y debe ser {esperado:.2f}. Queda en borrador.'
 
     odoo.execute_kw('account.move', 'action_post', [[f['id']]])
+    publicada = odoo.execute_kw('account.move', 'read', [[f['id']]],
+                                {'fields': ['invoice_date']})[0]['invoice_date']
+    if objetivo and str(publicada) != objetivo:
+        return f'ERROR: publicada con fecha {publicada} y debe ser {objetivo}. NO se timbro.'
+    if objetivo:
+        odoo.execute_kw('account.move', 'write',
+                        [[f['id']], {'l10n_mx_edi_post_time': f"{objetivo} 23:59:59"}],
+                        {'context': {'tracking_disable': True}})
     uuid, error = m.timbrar(odoo, f['id'], etiqueta)
     nueva = odoo.execute_kw('account.move', 'read', [[f['id']]],
                             {'fields': ['invoice_date', 'amount_tax', 'amount_total']})[0]
@@ -311,6 +319,23 @@ def solicitar_cancelacion(odoo, inv_id):
     raise Exception(f"{modelo}: no se encontro el metodo para confirmar la cancelacion")
 
 
+def solicitar_y_confirmar(odoo, inv_id):
+    """Solicita la cancelacion y CONFIRMA leyendo que Odoo la registro.
+
+    3-nov-2026: 257 filas quedaron en EN_CANCELACION con el CFDI vigente en
+    Odoo (cfdi_state 'sent', SAT 'valid') y sin solicitud abierta. Se daba por
+    hecha la solicitud sin leerla. Ahora, si despues de pedirla el CFDI sigue
+    'sent', es un error y la fila no se marca."""
+    solicitar_cancelacion(odoo, inv_id)
+    estado = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                             {'fields': ['state', 'l10n_mx_edi_cfdi_state']})[0]
+    if estado['state'] != 'cancel' and estado['l10n_mx_edi_cfdi_state'] not in (
+            'cancel_requested', 'cancel'):
+        raise Exception(f"la solicitud no quedo registrada en Odoo "
+                        f"(cfdi_state={estado['l10n_mx_edi_cfdi_state']})")
+    return estado['l10n_mx_edi_cfdi_state'] or estado['state']
+
+
 def estado_cancelacion(odoo, inv_id, extra):
     ejecutar_sin_retorno(odoo, 'account.move', 'l10n_mx_edi_cfdi_try_sat', [inv_id])
     return odoo.execute_kw('account.move', 'read', [[inv_id]],
@@ -331,9 +356,11 @@ def cancelar(odoo, db, f, fila, extra):
     ganada = cur.rowcount > 0
     cur.close()
     if not ganada:
+        if fila['status'] == EN_CANCELACION:
+            return None, 'ya estaba en cancelacion; se revisa en la pasada 2'
         return None, f"la fila esta en {fila['status']}; no se toca"
     try:
-        solicitar_cancelacion(odoo, f['id'])
+        solicitar_y_confirmar(odoo, f['id'])
     except Exception as e:
         # Nada se cancelo: la fila vuelve a su estado.
         cur = db.cursor()
@@ -346,8 +373,35 @@ def cancelar(odoo, db, f, fila, extra):
 
 
 def refacturar(odoo, m, db, fila_id, pendiente, contexto, extra):
-    """Paso 2 del caso B: solo si Odoo ya tiene la factura cancelada."""
-    estado = estado_cancelacion(odoo, pendiente['inv_id'], extra)
+    """Paso 2 del caso B: solo si Odoo ya tiene la factura cancelada.
+
+    Se lee el estado ANTES de consultar al SAT:
+      cancel            -> se refactura.
+      sent (sin solicitud abierta) -> la solicitud nunca quedo o se deshizo:
+                           se vuelve a pedir y queda pendiente.
+      cancel_requested  -> se consulta al SAT (try_sat). Si con eso Odoo la
+                           regresa a 'sent' (el SAT aun la ve vigente), se
+                           vuelve a pedir en el momento para que no se pierda.
+    """
+    campos = ['state', 'name'] + extra
+    estado = odoo.execute_kw('account.move', 'read', [[pendiente['inv_id']]],
+                             {'fields': campos})[0]
+    if estado['state'] != 'cancel' and estado.get('l10n_mx_edi_cfdi_state') == 'sent':
+        try:
+            nuevo = solicitar_y_confirmar(odoo, pendiente['inv_id'])
+        except Exception as e:
+            return False, f"ERROR al volver a solicitar la cancelacion: {str(e)[:300]}"
+        return False, f"solicitud repetida (no estaba registrada en Odoo) -> {nuevo}"
+    if estado['state'] != 'cancel':
+        estado = estado_cancelacion(odoo, pendiente['inv_id'], extra)
+        if estado['state'] != 'cancel' and estado.get('l10n_mx_edi_cfdi_state') == 'sent':
+            try:
+                nuevo = solicitar_y_confirmar(odoo, pendiente['inv_id'])
+            except Exception as e:
+                return False, (f"el SAT aun la ve vigente y Odoo deshizo la solicitud; "
+                               f"ERROR al pedirla de nuevo: {str(e)[:250]}")
+            return False, (f"el SAT aun la ve vigente; Odoo deshizo la solicitud y se "
+                           f"volvio a pedir -> {nuevo}")
     if estado['state'] != 'cancel':
         return False, (f"pendiente del SAT: state={estado['state']} "
                        f"{ {k: estado.get(k) for k in extra} }")
@@ -383,6 +437,12 @@ def refacturar(odoo, m, db, fila_id, pendiente, contexto, extra):
     nueva = odoo.execute_kw('account.move', 'read', [[nuevas[0]['id']]],
                             {'fields': ['name', 'invoice_date', 'amount_total',
                                         'l10n_mx_edi_cfdi_uuid']})[0]
+    # Incidente del 3-nov: la refactura de una venta del mes anterior TIENE que
+    # salir con el ultimo dia de ese mes. Si no, se detiene todo el caso B.
+    esperada = m.fecha_factura(m.buscar_so(odoo, record['odoo_so_name']) or {})
+    if esperada and str(nueva['invoice_date']) != esperada:
+        raise Exception(f"{nueva['name']} salio con fecha {nueva['invoice_date']} y "
+                        f"debe ser {esperada}. Se detiene el caso B.")
     conc = reconciliar(odoo, nueva['id'], pendiente['contrapartidas'], nueva['name'])
     timbrada = bool(nueva['l10n_mx_edi_cfdi_uuid'])
     fila = fila_control(db, record['odoo_so_name'])
@@ -412,13 +472,19 @@ def filas_en_cancelacion(db):
 
 def run():
     m = cargar_01()
-    hoy = m.ahora_cdmx()
+    hoy = m.HOY_CORRIDA
     # La ventana de cierre se abre hasta hoy para que fecha_factura() de el mes
     # de la venta. Tope de 3 dias por las 72 horas del SAT.
     if hoy.day > 3:
         log.warning(f"Hoy es dia {hoy.day}: pasaron las 72 horas para timbrar con "
                     f"fecha del mes anterior. El caso B no se aplica.")
     m.DIAS_CIERRE_MES = min(max(m.DIAS_CIERRE_MES, hoy.day), 3)
+    # La hora del CFDI a las 23:59:59 del ultimo dia del mes: timbrar el dia 3
+    # queda dentro de las 72 h del SAT. hoy = HOY_CORRIDA de 01, fijo para toda
+    # la corrida aunque pase la medianoche.
+    m.CFDI_HORA_FIN_DE_DIA = True
+    log.info(f"Corrida del {hoy:%Y-%m-%d %H:%M} CDMX. Ventas del mes anterior -> "
+             f"{m.fecha_factura({'date_order': '2000-01-01 00:00:00'}, hoy) or 'SIN VENTANA'}.")
 
     db = get_db_connection()
     odoo = OdooModelProxy(timeout=300)
