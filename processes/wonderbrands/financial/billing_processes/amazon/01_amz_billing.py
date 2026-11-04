@@ -1208,6 +1208,26 @@ def reset_stuck_processing(db_conn):
     cursor.close()
 
 
+def reabrir_b2b_pg(db_conn):
+    """B2B_FACTURADA_PG -> PENDING_B2B_LINK, sin importar la ventana del miner.
+
+    El miner solo reevalua las filas que vuelve a leer (desde el dia 1 del mes
+    anterior). Una B2B de septiembre cuya factura a publico general Finanzas
+    cancelo en noviembre nunca se vinculaba (correo de Jero, 3-nov). procesar()
+    la regresa a B2B_FACTURADA_PG si la factura sigue viva.
+    """
+    cursor = db_conn.cursor()
+    cursor.execute(f"""
+        UPDATE {TBL_BILLING} SET status = 'PENDING_B2B_LINK'
+        WHERE marketplace = %s AND status = 'B2B_FACTURADA_PG'
+    """, (MARKETPLACE,))
+    db_conn.commit()
+    if cursor.rowcount:
+        log.info(f"[LOADER] {cursor.rowcount} B2B con factura a publico general se "
+                 f"reevaluan (se vinculan si ya se cancelo la factura).")
+    cursor.close()
+
+
 def _fetch_por_status(cursor, status, limite, orden):
     sql = f"""
         SELECT id, mkp_order_id, odoo_so_name, cfdi_uuid, total_amount,
@@ -3230,6 +3250,7 @@ def nuevos_stats(reclasificadas_b2b=0):
 
 def run_loader(db_conn):
     reset_stuck_processing(db_conn)
+    reabrir_b2b_pg(db_conn)
     records = fetch_pendientes(db_conn)
     if not records:
         log.info("[LOADER] Sin registros pendientes.")

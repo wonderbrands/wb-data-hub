@@ -2,6 +2,8 @@
 
 Contexto mínimo para operar el flujo y para construir el siguiente (notas de crédito).
 
+**Estado (3-nov-2026):** en producción en Kestra. Facturación desde el 1-oct-2026 (Amazon salió del 1a1 ese día); octubre cerrado. Lo anterior a octubre no lo factura este flujo: ver *Fuera de alcance*.
+
 ## Scripts (`processes/.../amazon/`)
 
 | Script | Qué hace |
@@ -22,7 +24,9 @@ Las copias de trabajo y los scripts de un solo uso (saneamiento 12, centavos 13,
 | `amz_billing_payments_flow` | 00 → 01 → 02 → 03 | 02:30 y 15:00 diario |
 | `amz_cierre_mercFacNoEnv_flow` | 11 + correo de kits | día 2, 09:00 |
 
-`concurrency: FAIL` y sin retry: nunca dos corridas a la vez (incidente del 26-jul-2026, 549 dobles CFDI). Los horarios esquivan ML (00/06/12/18 h), el 1a1 (04:30 y 19:30) y el housekeeping (03:15). Una corrida manual larga (saneamiento) que se traslape hace fallar la del cron.
+`concurrency: FAIL` y sin retry: nunca dos corridas a la vez (incidente del 26-jul-2026, 549 dobles CFDI). Los horarios esquivan ML (00/06/12/18 h), el 1a1 (04:30 y 19:30) y el housekeeping (03:15). Una corrida manual larga que se traslape hace fallar la del cron.
+
+El flujo clona la rama de `vars.branch` (`main`): lo que no esté en `main` no corre en producción.
 
 ## Fuentes (MySQL `somos_reyes`)
 
@@ -48,7 +52,7 @@ Las copias de trabajo y los scripts de un solo uso (saneamiento 12, centavos 13,
 
 Una corrida que arranca en cierre termina en cierre, aunque pase la medianoche (`HOY_CORRIDA`). Si ya no alcanza a timbrar dentro de las 72 h del SAT, no crea la factura (`FUERA_72H`) y la deja pendiente; la siguiente corrida la emite con fecha del día y avisa por Slack.
 
-**Loader.** Por orden, con candado `PROCESSING`:
+**Loader.** Al arrancar regresa todas las `B2B_FACTURADA_PG` (de cualquier mes) a `PENDING_B2B_LINK`: si Finanzas ya canceló la factura a público general, se vincula el CFDI de Amazon; si sigue viva, vuelve a `B2B_FACTURADA_PG`. Luego, por orden, con candado `PROCESSING`:
 1. Toda venta que Amazon cobró se factura: la SO en borrador se confirma y la SO cancelada se factura igual (su NC sale por devoluciones).
 2. Revalida en Odoo justo antes de crear (fail-closed). Una SO con factura viva, incluida una global, no se refactura.
 3. Valida contra Amazon (±$1.00) antes de crear. Si no cuadra → `TOTAL_DIFF`.
@@ -72,6 +76,8 @@ Una corrida que arranca en cierre termina en cierre, aunque pase la medianoche (
   - **±0.01** contra la factura: se salda en el mismo pago contra 704.23.001.
   - **Excedente:** si es promoción confirmada, va a un asiento `AUTOPROMO:<settlement>:<orden>` (403.01.002 + 208.01.001). Nunca se aplica a la factura más que su saldo.
 - 03 busca la SO en `mkp_billing_prod`. Un cobro de una orden que 01 nunca leyó queda en `NO_INVOICE`.
+- **B2B sin vincular** (`PENDING_B2B_LINK` o `B2B_FACTURADA_PG`): el cobro espera en `NO_INVOICE`. Así nunca se aplica a una factura a público general que se va a cancelar.
+- **Solo contra 105.01.006.** El asistente de pago usa la CxC de la factura; una factura del autofacturador trae 105.01.001. Si alguna factura abierta de la SO no está en 105.01.006, el cobro no se aplica: queda en `CXC_INCORRECTA` y avisa por Slack.
 
 ## Estados
 
@@ -85,7 +91,7 @@ Una corrida que arranca en cierre termina en cierre, aunque pase la medianoche (
 | `ODOO_B2B_LINKED` | Factura B2B con el UUID de Amazon | final |
 | `ODOO_INVOICED` | B2C emitida y timbrada por WB. `cfdi_uuid` = nuestro UUID; si el PAC falló, `error_log` empieza con `TIMBRADO_FALLIDO` | final |
 | `ALREADY_ODOO_INVOICED` | Ya tenía factura (1a1, global o ambas) | final |
-| `B2B_FACTURADA_PG` | Amazon emitió el CFDI B2B pero la orden tiene una factura viva a público general. Cancelarla (SAT motivo 02) y se vincula sola | sí |
+| `B2B_FACTURADA_PG` | Amazon emitió el CFDI B2B pero la orden tiene una factura viva a público general. Finanzas la cancela (SAT motivo 02) y se vincula sola | sí, cada corrida, de cualquier mes |
 | `B2B_NO_RECEPTOR` / `SO_DRAFT` / `ENVIO_SIN_CONFIRMAR` | Excepción temporal | sí |
 | `B2B_SPLIT_MISMATCH` | Varios CFDI de Amazon que no se pudieron repartir | a mano |
 | `TOTAL_DIFF` | Odoo ≠ Amazon por más de $1; no se facturó | a mano |
@@ -99,7 +105,30 @@ En `raw_json`:
 - `cfdi_amazon_business`.
 - `facturas_odoo`: cada factura con UUID, fecha y timbre.
 
-**`finance.mkp_payments_prod`**: `PENDING` (minado) → `ODOO_PAID` (aplicado; puede ser parcial). `NO_INVOICE` se reintenta cada 6 h durante 60 días. También `ALREADY_PAID` y `ERROR`. `HISTORICO_CONTABILIDAD`: el depósito del 23-sep-2026 (settlement 27581522881, 1,586 cobros de ventas de septiembre), que cierra Contabilidad; 03 no lo toca.
+**`finance.mkp_payments_prod`** (una fila por orden y settlement)
+
+| Estado | Significado | ¿Se reevalúa? |
+|---|---|---|
+| `PENDING` | Minado, por aplicar | lo toma 03 |
+| `ODOO_PAID` | Aplicado (puede ser parcial) | final |
+| `ALREADY_PAID` | La factura ya estaba pagada | final |
+| `NO_INVOICE` | Sin factura todavía, o B2B esperando su CFDI | cada 6 h durante 60 días |
+| `CXC_INCORRECTA` | La factura no está en 105.01.006; no se aplicó | a mano: Contabilidad corrige la cuenta y TI la regresa a `PENDING` |
+| `ERROR` | Fallo de Odoo | a mano |
+| `HISTORICO_CONTABILIDAD` | Depósito del 23-sep-2026 (settlement 27581522881, 1,586 cobros de septiembre) que cierra Contabilidad | 03 no lo toca |
+
+## Qué atender a mano
+
+Lo avisa Slack o el reporte de la corrida:
+
+| Caso | Quién | Acción |
+|---|---|---|
+| `B2B_FACTURADA_PG` | Finanzas | Cancelar la factura a público general (motivo 02). La vinculación y el cobro salen solos. |
+| `CXC_INCORRECTA` | Contabilidad → TI | Contabilidad corrige la CxC de la factura a 105.01.006; TI regresa el cobro a `PENDING`. |
+| `TOTAL_DIFF`, `B2B_SPLIT_MISMATCH`, `ERROR` | TI + Finanzas | Revisar la orden; regresarla a `PENDING_*` cuando esté corregida. |
+| `NO_SO_IN_ODOO` | Yuju | Crear la SO; el miner la toma en la siguiente corrida mientras esté en la ventana. |
+| `TIMBRADO_FALLIDO` en `error_log` | TI | La factura quedó publicada sin timbre; timbrar desde Odoo. |
+| Cobro aplicado a una factura que después se canceló | Contabilidad → TI | Contabilidad cancela el pago; TI regresa el cobro a `PENDING` (03 no lo detecta solo; caso PAMZ/2026/00710). |
 
 ## Cuentas
 
@@ -138,6 +167,9 @@ Impuesto 38 (IVA 16 %). Partner público general 13436.
 
 - Una SO "a facturar" sin transacción de Amazon (pedida y no enviada al cierre) no se factura hasta que Amazon cobre. El 1a1 sí la facturaba.
 - Un cobro de una orden sin fila en facturación (sin SO en Odoo, o venta fuera de la ventana de 01) queda en `NO_INVOICE` y deja de reintentarse a los 60 días.
-- Saneamiento ene–sep (fecha de hoy, sin cobros, un mes por corrida con `start_date`/`end_date` y `cobros=false`): pendiente. Antes hay que decidir la fecha contable de las B2B (el CFDI de Amazon cae en meses cerrados). No correrlo los días de cierre.
-- Anular automáticamente las `B2B_FACTURADA_PG` (cancelación motivo 02 o NC): en espera.
-- IVA no cobrado 209.01.001 → 208.01.001: pospuesto por Finanzas.
+
+## Fuera de alcance de este flujo
+
+- **Ventas anteriores a octubre de 2026 sin facturar.** Finanzas pidió reabrir periodos y asentar cada factura en su mes. 01 no lo hace: factura con fecha del día (o del cierre) y el SAT no permite un CFDI B2C con más de 72 h de antigüedad. Lo anterior a la migración a Odoo 18 tiene la SO en Odoo 15, donde este flujo no opera. Se define con Finanzas sobre la base de `test/.../amazon/14_base_historico_amazon.py`.
+- **Doble CFDI histórico de Amazon Business** (240 órdenes abr–nov, `000_historical_billing_back_analysis.py`): la cancelación es de Finanzas; al cancelar, 01 vincula el CFDI de Amazon solo.
+- **Anular automáticamente las `B2B_FACTURADA_PG`**, **IVA no cobrado 209.01.001 → 208.01.001** y **notas de crédito**: fuera de este flujo.

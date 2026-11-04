@@ -79,10 +79,8 @@ OUT_CSV = f"amz_doble_facturacion_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 # Ambiente. Por defecto PRUEBAS: este analisis se corre primero contra el
 # espejo para medir el universo sin tocar produccion.
 # Para correrlo contra produccion, exportar ODOO_URL / ODOO_DB / etc.
-ODOO_URL = os.getenv('ODOO_URL') or os.getenv('ODOO_TEST_URL',
-                     'https://somosreyes-test26ago26-37337608.dev.odoo.com')
-ODOO_DB = os.getenv('ODOO_DB') or os.getenv('ODOO_TEST_DB',
-                    'somosreyes-test26ago26-37337608')
+ODOO_URL = 'https://somosreyes.odoo.com'
+ODOO_DB = 'wonderbrands2026-main-28990431'
 ODOO_USER = (os.getenv('ODOO_USER') or os.getenv('ODOO_TEST_USER')
              or os.getenv('odoo_user_dataV18'))
 ODOO_PWD = (os.getenv('ODOO_PASSWORD') or os.getenv('ODOO_TEST_PASSWORD')

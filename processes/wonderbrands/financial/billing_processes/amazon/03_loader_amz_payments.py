@@ -84,7 +84,7 @@ if _dir not in sys.path:
     sys.path.append(_dir)
 
 from _amz_common import (
-    ENTORNO, TBL_PAYMENTS, TBL_BILLING, MARKETPLACE,
+    ENTORNO, TBL_PAYMENTS, TBL_BILLING, MARKETPLACE, ACCOUNT_AMAZON_CXC,
     ACCOUNT_LIBERACIONES, AMZ_JOURNAL_CODE, PAYMENT_METHOD_TRANSFERENCIA,
     ACCOUNT_CUPONES_AMAZON, ACCOUNT_IVA_TRASLADADO, ACCOUNT_REDONDEO,
     KESTRA_EXECUTION_ID, ODOO_URL,
@@ -242,7 +242,7 @@ def fetch_pendientes(db_conn):
     cursor.execute(f"""
         SELECT p.id, p.mkp_order_id, p.payment_id,
                p.amount, p.date_released, p.status,
-               b.odoo_so_name, b.raw_json
+               b.odoo_so_name, b.raw_json, b.status AS billing_status
         FROM {TBL_PAYMENTS} p
         LEFT JOIN {TBL_BILLING} b
                ON b.marketplace = p.marketplace
@@ -310,6 +310,20 @@ def buscar_factura(odoo, so_name):
         {'fields': ['id', 'name', 'amount_total', 'amount_residual',
                     'payment_state', 'ref', 'l10n_mx_edi_cfdi_uuid'],
          'order': 'id asc'})
+
+
+def cxc_fuera_de_amazon(odoo, facturas, cuenta_cxc):
+    """[(factura, cuenta)] de las facturas cuya CxC no es la de Amazon."""
+    if not facturas:
+        return []
+    lineas = odoo.execute_kw(
+        'account.move.line', 'search_read',
+        [[('move_id', 'in', [f['id'] for f in facturas]),
+          ('account_type', '=', 'asset_receivable')]],
+        {'fields': ['move_id', 'account_id']})
+    nombres = {f['id']: f['name'] for f in facturas}
+    return sorted({(nombres[l['move_id'][0]], l['account_id'][1])
+                   for l in lineas if l['account_id'][0] != cuenta_cxc})
 
 
 def quitar_neutralizadas(odoo, so_name, facturas):
@@ -849,6 +863,7 @@ def preparar_contexto(odoo):
                         "facturas con 1 centavo de diferencia quedan en pago "
                         "parcial. Definirla antes de correr.")
     ctx = {'cuenta_redondeo': get_account_id(odoo, ACCOUNT_REDONDEO),
+           'cuenta_cxc': get_account_id(odoo, ACCOUNT_AMAZON_CXC),
            'cuentas': None}
     log.info(f"Ajuste de centavo contra la cuenta {ACCOUNT_REDONDEO}.")
 
@@ -889,6 +904,20 @@ def procesar(odoo, db_conn, journal_id, record, stats, ctx):
         update_payment(db_conn, record['id'], 'NO_INVOICE',
                        error_log='Sin SO en la tabla de facturacion para esta orden')
         stats['sin_so'].append(order_id)
+        return
+
+    # B2B con factura viva a publico general: esa factura se va a cancelar
+    # (motivo 02) y la que vale es la del CFDI de Amazon, que 01 crea despues.
+    # Aplicar el cobro ahora lo dejaria en la factura cancelada (correo de
+    # Jero, 3-nov: PAMZ/2026/00710). Se espera como NO_INVOICE (se reintenta).
+    # PENDING_B2B_LINK igual: la B2B aun no tiene su factura, y la que hubiera
+    # en Odoo no es la del CFDI de Amazon.
+    if record.get('billing_status') in ('B2B_FACTURADA_PG', 'PENDING_B2B_LINK'):
+        update_payment(db_conn, record['id'], 'NO_INVOICE',
+                       error_log=(f'{so_name}: {record["billing_status"]}. Se aplica '
+                                  f'cuando se vincule el CFDI de Amazon (antes, '
+                                  f'cancelar la factura a publico general si existe).'))
+        stats['espera_b2b'].append(so_name)
         return
 
     facturas = buscar_factura(odoo, so_name)
@@ -940,6 +969,22 @@ def procesar(odoo, db_conn, journal_id, record, stats, ctx):
         update_payment(db_conn, record['id'], 'ALREADY_PAID',
                        error_log='amount_residual = 0 al momento de cobrar')
         stats['ya_pagadas'] += 1
+        return
+
+    # --- CONTROL DE CUENTA POR COBRAR (correo de Jero, 3-nov-2026) ---
+    # El asistente de pago usa la CxC de la factura. Una factura del
+    # autofacturador de Odoo trae 105.01.001 CLIENTES NACIONALES (181 cobros,
+    # $878K): el cobro de Amazon terminaba ahi. Solo se cobra contra 105.01.006;
+    # si no, se aparta y se avisa. CXC_INCORRECTA no se reintenta: Contabilidad
+    # corrige la cuenta de la factura y regresa la fila a PENDING.
+    fuera = cxc_fuera_de_amazon(odoo, abiertas, ctx['cuenta_cxc'])
+    if fuera:
+        detalle = ', '.join(f"{n} ({c})" for n, c in fuera)
+        log.warning(f"{so_name}: CxC distinta de {ACCOUNT_AMAZON_CXC}: {detalle}. "
+                    f"No se aplica el cobro.")
+        update_payment(db_conn, record['id'], 'CXC_INCORRECTA',
+                       error_log=f'Factura con CxC distinta de {ACCOUNT_AMAZON_CXC}: {detalle}')
+        stats['cxc_incorrecta'].append(f"{so_name}: {detalle}")
         return
 
     # --- Orden repartida: el cobro va a las facturas de SUS envios ---
@@ -1191,7 +1236,8 @@ def run():
              'sin_so': [], 'sin_factura': [], 'multi_factura': [],
              'inciertos': [], 'ajustados': [], 'parciales': [],
              'por_settlement': {}, 'sin_envio': [],
-             'promos': [], 'redondeos': []}
+             'promos': [], 'redondeos': [],
+             'cxc_incorrecta': [], 'espera_b2b': []}
 
     for record in records:
         if not claim(db_conn, record['id']):
@@ -1227,6 +1273,8 @@ def reportar(stats):
     log.info(f"  Promociones asentadas   : {len(stats['promos'])}")
     log.info(f"  Ajustes de centavo      : {len(stats['redondeos'])}")
     log.info(f"  Reparto sin envio       : {len(stats['sin_envio'])}")
+    log.info(f"  CxC incorrecta (aparte) : {len(stats['cxc_incorrecta'])}")
+    log.info(f"  B2B esperando su CFDI   : {len(stats['espera_b2b'])}")
     log.info(f"  QUEDAN EN COLA          : {stats.get('quedan', 0)}"
              + (f"  <- volver a correr (BATCH_LIMIT={BATCH_LIMIT})"
                 if stats.get('quedan') else ''))
@@ -1288,6 +1336,18 @@ def reportar(stats):
             f"INCIERTOS* (`{KESTRA_EXECUTION_ID}`).\nNo se reintentaron para "
             f"no duplicar el pago. Verificar en Odoo si el pago existe antes "
             f"de reprocesar.\n{', '.join(stats['inciertos'][:15])}")
+
+    if stats['cxc_incorrecta']:
+        log.info('')
+        log.info(f"CXC INCORRECTA -- cobros NO aplicados (factura fuera de {ACCOUNT_AMAZON_CXC}):")
+        for c in stats['cxc_incorrecta'][:20]:
+            log.info(f"  {c}")
+        notify_slack(
+            f":warning: *{len(stats['cxc_incorrecta'])} cobro(s) de Amazon NO "
+            f"aplicados: la factura tiene una CxC distinta de {ACCOUNT_AMAZON_CXC}* "
+            f"(`{KESTRA_EXECUTION_ID}`). Corregir la cuenta de la factura y "
+            f"regresar el cobro a PENDING.\n"
+            + '\n'.join(stats['cxc_incorrecta'][:15]))
 
     if stats['multi_factura']:
         notify_slack(
