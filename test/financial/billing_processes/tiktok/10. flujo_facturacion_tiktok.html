@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flujo de Facturación — TikTok Shop</title>
+<style>
+  :root {
+    --black: #1A1A1A; --yellow: #FFE600; --white: #FFFFFF; --gray-bg: #F7F7F5;
+    --gray-border: #E0E0DC; --gray-text: #6B6B65; --red-light: #FFF0ED;
+    --red-border: #F5A898; --red-text: #C0392B; --green-light: #EAF5EA;
+    --green-border: #90D090; --green-text: #2E7D32; --blue-light: #EBF3FB;
+    --blue-border: #90BBE0; --blue-text: #1565C0; --amber-light: #FFF8E6;
+    --amber-border: #F0D080; --amber-text: #956300; --lila-light: #F0EFFC;
+    --lila-border: #C4C0EC; --lila-text: #4A46A0;
+    --tiktok-light: #FFF0F5; --tiktok-border: #F0A0C0; --tiktok-text: #8B0040;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; background: var(--white); color: var(--black); line-height: 1.5; max-width: 860px; margin: 0 auto; padding: 32px 24px 60px; }
+  .doc-header { margin-bottom: 32px; padding-bottom: 16px; border-bottom: 3px solid var(--yellow); }
+  .doc-header-tags { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .doc-header-tag { background: var(--black); color: var(--yellow); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px; }
+  .doc-header h1 { font-size: 20px; font-weight: 600; }
+  .doc-header-meta { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+  .section { margin-bottom: 32px; }
+  .section-label { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .step-badge { width: 26px; height: 26px; border-radius: 50%; background: var(--black); color: var(--yellow); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .section-label h2 { font-size: 14px; font-weight: 600; }
+  .connector { display: flex; flex-direction: column; align-items: center; padding: 4px 0; }
+  .connector .arrow-line { width: 2px; background: var(--gray-border); min-height: 20px; }
+  .arrow-head { font-size: 14px; line-height: 1; color: var(--gray-text); }
+  .card { border-radius: 8px; padding: 12px 14px; border: 1.5px solid var(--gray-border); background: var(--white); }
+  .card-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .card-sub { font-size: 11px; color: var(--gray-text); }
+  .card.trigger { background: var(--black); border-color: var(--black); color: var(--white); text-align: center; }
+  .card.trigger .card-title { color: var(--yellow); font-size: 14px; }
+  .card.ok { background: var(--green-light); border-color: var(--green-border); }
+  .card.ok .card-title { color: var(--green-text); }
+  .card.alert { background: var(--red-light); border-color: var(--red-border); }
+  .card.alert .card-title { color: var(--red-text); }
+  .card.process { background: var(--lila-light); border-color: var(--lila-border); text-align: center; width: 100%; }
+  .card.process .card-title { color: var(--lila-text); font-size: 14px; }
+  .card.process .card-sub { color: #3D39A0; }
+  .card.blue { background: var(--blue-light); border-color: var(--blue-border); }
+  .card.blue .card-title { color: var(--blue-text); }
+  .split-container { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }
+  .split-col { display: flex; flex-direction: column; align-items: center; }
+  .split-col .card { width: 100%; }
+  .branch-label { text-align: center; font-size: 11px; font-weight: 600; padding-bottom: 4px; }
+  .criteria-box { background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 6px; padding: 10px 14px; margin-top: 8px; }
+  .criteria-title { font-weight: 600; font-size: 11px; color: var(--black); margin-bottom: 6px; }
+  .criteria-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .criteria-row:last-child { margin-bottom: 0; }
+  .criteria-key { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--white); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--blue-text); white-space: nowrap; flex-shrink: 0; }
+  .criteria-val { font-size: 11px; color: var(--gray-text); }
+  code { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--black); }
+  .note { font-size: 11px; color: var(--gray-text); padding: 8px 12px; background: var(--amber-light); border-left: 3px solid var(--amber-border); border-radius: 0 6px 6px 0; margin-top: 6px; }
+  .note strong { color: var(--amber-text); }
+  .note.info { background: var(--blue-light); border-left-color: var(--blue-border); }
+  .note.info strong { color: var(--blue-text); }
+  .note.ok { background: var(--green-light); border-left-color: var(--green-border); }
+  .note.ok strong { color: var(--green-text); }
+  .asiento-box { border: 1.5px solid var(--lila-border); border-radius: 8px; overflow: hidden; width: 100%; margin-top: 10px; }
+  .asiento-header { background: var(--lila-light); padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--lila-text); border-bottom: 1px solid var(--lila-border); }
+  .asiento-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .asiento-table th { background: var(--gray-bg); padding: 5px 10px; font-size: 10px; font-weight: 600; color: var(--gray-text); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table td { padding: 6px 10px; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table tr:last-child td { border-bottom: none; }
+  .asiento-table tr:hover td { background: var(--gray-bg); }
+  .acc-name { font-weight: 500; color: var(--black); }
+  .acc-code { font-size: 10px; color: var(--gray-text); font-family: 'SF Mono','Fira Code',monospace; margin-top: 1px; }
+  .acc-sub { font-size: 10px; color: var(--gray-text); font-style: italic; margin-top: 1px; }
+  .db { font-weight: 500; color: var(--blue-text); text-align: right; }
+  .cr { font-weight: 500; color: var(--green-text); text-align: right; }
+  .dash { color: var(--gray-border); text-align: right; }
+  .sep-row td { background: var(--gray-bg); padding: 3px 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray-text); }
+  .log-box { background: var(--gray-bg); border: 1.5px solid var(--gray-border); border-radius: 8px; padding: 12px 14px; width: 100%; }
+  .settlement-box { border: 1.5px solid var(--blue-border); border-radius: 8px; overflow: hidden; width: 100%; }
+  .settlement-header { background: var(--blue-light); padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--blue-text); border-bottom: 1px solid var(--blue-border); }
+  .settlement-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .settlement-row { display: flex; gap: 10px; align-items: flex-start; }
+  .settlement-num { width: 20px; height: 20px; border-radius: 50%; background: var(--blue-border); color: var(--blue-text); font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
+  .settlement-content { flex: 1; }
+  .settlement-content strong { font-size: 12px; color: var(--blue-text); display: block; margin-bottom: 2px; }
+  .settlement-content p { font-size: 11px; color: var(--gray-text); }
+</style>
+</head>
+<body>
+
+<div class="doc-header">
+  <div class="doc-header-tags">
+    <span class="doc-header-tag">Proyecto IVA</span>
+    <span class="doc-header-tag" style="background:var(--tiktok-light);color:var(--tiktok-text);border:1px solid var(--tiktok-border);">TikTok Shop</span>
+  </div>
+  <h1>Flujo de Facturación y Reconocimiento Contable</h1>
+  <p class="doc-header-meta">Requerimientos de Finanzas → equipo de Data · Proceso propuesto · Junio 2026</p>
+</div>
+
+<!-- SECCIÓN 1 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">1</div><div><h2>Identificar ventas del mes en el reporte TikTok Shop</h2></div></div>
+  <div style="display:flex;justify-content:center;">
+    <div class="card trigger" style="width:320px;"><div class="card-title">Venta confirmada en TikTok Shop</div></div>
+  </div>
+  <div class="note info" style="margin-bottom:10px;">
+    <strong>Alcance del barrido:</strong> debido a potenciales errores y modificaciones en los reportes de los marketplaces, este proceso no se limitará a órdenes generadas exclusivamente en el período de análisis. Sugerimos correr el script haciendo un barrido desde el 1 de enero de 2026 hasta la fecha de cierre del período de análisis (con un cap en 12 meses). Dependiendo de la demanda que dicho ejercicio genere, podríamos (i) separar el flujo de control hacia atrás del ejercicio de facturación mensual, o (ii) limitar el período de revisión a menos meses. A definir a partir del feedback de Data.
+  </div>
+
+  <div class="criteria-box">
+    <div class="criteria-title">Cómo identificar una venta en el reporte TikTok Shop</div>
+    <div class="criteria-row"><span class="criteria-key">refund_subtotal</span><span class="criteria-val">= <code>0</code> · identifica filas de venta (vs. devolución)</span></div>
+    <div class="criteria-row"><span class="criteria-key">create_time</span><span class="criteria-val">campo con fecha completa de la orden</span></div>
+    <div class="note info" style="margin-top:8px;"><strong>Criterio de corte:</strong> <code>create_time</code> es la fecha de creación de la orden en TikTok Shop. El <code>order_status</code> y <code>payment_status</code> son irrelevantes como criterio de corte.</div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--gray-border);">
+      <div class="criteria-title">Campos clave por fila de venta</div>
+      <div class="criteria-row"><span class="criteria-key">order_id</span><span class="criteria-val">ID de la orden en TikTok Shop</span></div>
+      <div class="criteria-row"><span class="criteria-key">order_line_id</span><span class="criteria-val">ID de línea de orden — identifica el producto específico dentro de la orden</span></div>
+      <div class="criteria-row"><span class="criteria-key">so</span><span class="criteria-val">SO en Odoo — viene pre-cruzado en el reporte</span></div>
+      <div class="criteria-row"><span class="criteria-key">statement_id</span><span class="criteria-val">ID del statement de liquidación — agrupa órdenes por período de pago</span></div>
+      <div class="criteria-row"><span class="criteria-key">revenue_amount_transaction</span><span class="criteria-val">Precio de venta al público — base para calcular el importe de la factura CFDI</span></div>
+      <div class="criteria-row"><span class="criteria-key">Base CFDI</span><span class="criteria-val"><code>revenue_amount_transaction</code> / 1.16 = base sin IVA</span></div>
+      <div class="criteria-row"><span class="criteria-key">IVA CFDI</span><span class="criteria-val"><code>revenue_amount_transaction</code> − base sin IVA</span></div>
+      <div class="criteria-row"><span class="criteria-key">settlement_amount_transaction</span><span class="criteria-val">Monto neto liquidado a WB por la orden</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+<!-- SECCIÓN 2 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">2</div><div><h2>Validación cruzada con Odoo</h2></div></div>
+  <div style="display:flex;justify-content:center;">
+    <div class="card process" style="width:380px;"><div class="card-title">Script de validación cruzada</div><div class="card-sub">¿La SO del reporte existe en Odoo?</div></div>
+  </div>
+  <div style="margin-top:12px;">
+    <div class="split-container">
+      <div class="split-col">
+        <div class="branch-label" style="color:var(--green-text);">✓ SO existe</div>
+        <div class="card ok"><div class="card-title">SO vinculada</div><div class="card-sub">Continúa al Paso 3 para emitir factura</div></div>
+      </div>
+      <div class="split-col">
+        <div class="branch-label" style="color:var(--red-text);">✗ SO faltante</div>
+        <div class="card alert"><div class="card-title">Alerta + Crear SO</div><div class="card-sub">La SO debe existir antes de emitir el CFDI</div></div>
+      </div>
+    </div>
+  </div>
+
+
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+<!-- SECCIÓN 3 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">3</div><div><h2>Generación de factura CFDI</h2></div></div>
+  <div style="display:flex;justify-content:center;">
+    <div class="card process" style="width:380px;"><div class="card-title">Script de facturación WB</div><div class="card-sub">WB emite el CFDI · todo B2C · TikTok Shop no emite facturas</div></div>
+  </div>
+  <div class="criteria-box" style="margin-top:10px;">
+    <div class="criteria-title">Proceso de emisión</div>
+    <div class="criteria-row"><span class="criteria-key">Emisor</span><span class="criteria-val">Wonder Brands (WB) emite el CFDI en todos los casos</span></div>
+    <div class="criteria-row"><span class="criteria-key">RFC receptor</span><span class="criteria-val">XAXX010101000 (público en general)</span></div>
+    <div class="criteria-row"><span class="criteria-key">Base imponible</span><span class="criteria-val"><code>revenue_amount_transaction</code> / 1.16</span></div>
+    <div class="criteria-row"><span class="criteria-key">IVA trasladado</span><span class="criteria-val"><code>revenue_amount_transaction</code> − base sin IVA</span></div>
+    <div class="criteria-row"><span class="criteria-key">Total CFDI</span><span class="criteria-val"><code>revenue_amount_transaction</code></span></div>
+    <div class="criteria-row"><span class="criteria-key">Cambio clave</span><span class="criteria-val">Factura individual por operación — se abandona el esquema de facturas globales. Cada orden genera su propio CFDI.</span></div>
+    <div class="criteria-row"><span class="criteria-key">Verificación previa</span><span class="criteria-val">Confirmar que la SO no tenga ya un CFDI asociado antes de emitir</span></div>
+  </div>
+  <div class="note info" style="margin-top:8px;">
+    <strong>Facturación por SO:</strong> si bien el reporte de ventas de TikTok Shop tiene una fila por producto, la facturación deberá generarse por SO.
+  </div>
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+<!-- SECCIÓN 4 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">4</div><div><h2>Generación de asiento contable</h2></div></div>
+  <div style="display:flex;justify-content:center;">
+    <div class="card blue" style="width:360px;text-align:center;"><div class="card-title">Automático al confirmar CFDI en Odoo</div></div>
+  </div>
+  <div class="asiento-box">
+    <div class="asiento-header">Asiento — Venta</div>
+    <table class="asiento-table">
+      <thead><tr><th style="width:40%">Cuenta</th><th></th><th style="text-align:right">Db</th><th style="text-align:right">Cr</th></tr></thead>
+      <tbody>
+        <tr class="sep-row"><td colspan="4">Ingresos</td></tr>
+        <tr>
+          <td><div class="acc-name">TikTok Shop</div><div class="acc-code">105.01.011</div><div class="acc-sub">Cuenta por cobrar al marketplace</div></td>
+          <td></td><td class="db">$ Venta + IVA</td><td class="dash">—</td>
+        </tr>
+        <tr>
+          <td><div class="acc-name">Ventas y/o Servicios Gravados</div><div class="acc-code">401-001-001</div></td>
+          <td></td><td class="dash">—</td><td class="cr">$ Venta</td>
+        </tr>
+        <tr>
+          <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+          <td></td><td class="dash">—</td><td class="cr">$ IVA</td>
+        </tr>
+        <tr class="sep-row"><td colspan="4">Costo</td></tr>
+        <tr>
+          <td><div class="acc-name">Costo de Venta</div></td>
+          <td></td><td class="db">$ Costo</td><td class="dash">—</td>
+        </tr>
+        <tr>
+          <td><div class="acc-name">Mercancías Facturadas No Enviadas</div><div class="acc-code">205.06.003</div><div class="acc-sub">Transitoria · se libera con el OUT</div></td>
+          <td></td><td class="dash">—</td><td class="cr">$ Costo</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+<!-- SECCIÓN 5 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">5</div><div><h2>Log de conciliación</h2></div></div>
+  <div class="log-box">
+    <div class="card-title" style="margin-bottom:8px;">Información registrada en la SO e Invoice de Odoo</div>
+    <div class="criteria-box" style="margin-top:0;">
+      <div class="criteria-title">Datos a registrar</div>
+      <div class="criteria-row"><span class="criteria-key">order_id</span><span class="criteria-val">ID de la orden TikTok Shop</span></div>
+      <div class="criteria-row"><span class="criteria-key">order_line_id</span><span class="criteria-val">ID de línea de orden</span></div>
+      <div class="criteria-row"><span class="criteria-key">so</span><span class="criteria-val">SO en Odoo</span></div>
+      <div class="criteria-row"><span class="criteria-key">statement_id</span><span class="criteria-val">ID del statement de liquidación</span></div>
+      <div class="criteria-row"><span class="criteria-key">CFDI UUID</span><span class="criteria-val">UUID del CFDI emitido por WB</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+<!-- SECCIÓN 6 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">6</div><div><h2>Aplicación de cobros</h2></div></div>
+  <div class="settlement-box">
+    <div class="settlement-header">Proceso de aplicación de pagos — por statement_id</div>
+    <div class="settlement-body">
+      <div class="settlement-row">
+        <div class="settlement-num">1</div>
+        <div class="settlement-content">
+          <strong>Identificar órdenes por statement_id del período</strong>
+          <p>El <code>statement_id</code> agrupa las órdenes de un período de liquidación. Todas las órdenes del statement liberado en el período son las facturas a las que se aplicará cobro.</p>
+        </div>
+      </div>
+      <div class="settlement-row">
+        <div class="settlement-num">2</div>
+        <div class="settlement-content">
+          <strong>Aplicar cobro factura a factura en Odoo</strong>
+          <p>Para cada factura, registrar en Odoo un pago vinculado a esa factura específica por el total con IVA (<code>revenue_amount_transaction</code>), saldando la CxC por completo.</p>
+        </div>
+      </div>
+      <div class="settlement-row">
+        <div class="settlement-num">3</div>
+        <div class="settlement-content">
+          <strong>Asiento contable de cobro</strong>
+          <p>La aplicación del cobro en Odoo genera automáticamente el asiento pertinente, afectando la CxC TikTok Shop a través de la cuenta puente antes de impactar bancos.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="asiento-box" style="margin-top:10px;">
+    <div class="asiento-header">Asiento — Cobro (por factura)</div>
+    <table class="asiento-table">
+      <thead><tr><th style="width:40%">Cuenta</th><th></th><th style="text-align:right">Db</th><th style="text-align:right">Cr</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><div class="acc-name">Liberaciones TikTok Shop Pendientes de Procesar</div><div class="acc-code">⚠ pendiente confirmar código</div><div class="acc-sub">Cuenta puente · permite control previo a afectar bancos</div></td>
+          <td></td><td class="db">$ Venta + IVA</td><td class="dash">—</td>
+        </tr>
+        <tr>
+          <td><div class="acc-name">TikTok Shop — CxC</div><div class="acc-code">105.01.011</div><div class="acc-sub">CxC — se salda en su totalidad</div></td>
+          <td></td><td class="dash">—</td><td class="cr">$ Venta + IVA</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note" style="margin-top:8px;"><strong>Cuenta puente:</strong> mismo criterio que Amazon y Walmart — el cobro se registra primero en esta cuenta transitoria para mantener trazabilidad antes de afectar bancos.</div>
+  <div class="note" style="margin-top:6px;"><strong>Pendiente Fase 2:</strong> el tratamiento contable de <code>iva_transaction</code> e <code>isr_transaction</code> en el asiento de cobro se define en una etapa posterior, consistente con el criterio que se adopte para los demás canales.</div>
+</div>
+
+</body>
+</html>
