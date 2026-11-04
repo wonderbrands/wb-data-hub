@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Amazon — Acuerdos y lote 4</title>
+<style>
+  :root {
+    --black: #1A1A1A; --yellow: #FFE600; --white: #FFFFFF;
+    --gray-bg: #F7F7F5; --gray-border: #E0E0DC; --gray-text: #6B6B65;
+    --red-light: #FFF0ED; --red-border: #F5A898; --red-text: #C0392B;
+    --green-light: #EAF5EA; --green-border: #90D090; --green-text: #2E7D32;
+    --blue-light: #EBF3FB; --blue-border: #90BBE0; --blue-text: #1565C0;
+    --amber-light: #FFF8E6; --amber-border: #F0D080; --amber-text: #956300;
+    --lila-light: #F0EFFC; --lila-border: #C4C0EC; --lila-text: #4A46A0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         font-size: 14px; background: var(--white); color: var(--black);
+         line-height: 1.55; max-width: 900px; margin: 0 auto; padding: 32px 16px 64px; }
+  .doc-header { margin-bottom: 28px; padding-bottom: 16px; border-bottom: 3px solid var(--yellow); }
+  .tags { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .tag { background: var(--black); color: var(--yellow); font-size: 10px; font-weight: 700;
+         letter-spacing: .08em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px; }
+  .tag.alt { background: var(--amber-light); color: var(--amber-text); border: 1px solid var(--amber-border); }
+  h1 { font-size: 22px; font-weight: 650; }
+  .meta { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+  h2 { font-size: 16px; font-weight: 650; margin: 34px 0 12px; display: flex; align-items: center; gap: 10px; }
+  h2 .n { width: 26px; height: 26px; border-radius: 50%; background: var(--black); color: var(--yellow);
+          font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  h3 { font-size: 13.5px; font-weight: 650; margin: 18px 0 8px; }
+  p { margin: 6px 0; }
+  ul, ol { margin: 6px 0 6px 20px; }
+  li { margin: 3px 0; }
+  code { font-family: 'SF Mono', Consolas, monospace; font-size: 11.5px; background: var(--gray-bg);
+         border: 1px solid var(--gray-border); border-radius: 3px; padding: 0 4px; }
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0; }
+  .kpi { border: 1.5px solid var(--gray-border); border-radius: 8px; padding: 10px 12px; }
+  .kpi b { display: block; font-size: 22px; line-height: 1.1; }
+  .kpi span { font-size: 11px; color: var(--gray-text); }
+  .card { border-radius: 8px; padding: 12px 14px; border: 1.5px solid var(--gray-border); margin: 10px 0; }
+  .card.ok { background: var(--green-light); border-color: var(--green-border); }
+  .card.warn { background: var(--amber-light); border-color: var(--amber-border); }
+  .card.alert { background: var(--red-light); border-color: var(--red-border); }
+  .card.info { background: var(--blue-light); border-color: var(--blue-border); }
+  .card.lila { background: var(--lila-light); border-color: var(--lila-border); }
+  .card .t { font-weight: 650; font-size: 13px; margin-bottom: 4px; }
+  .card.ok .t { color: var(--green-text); } .card.warn .t { color: var(--amber-text); }
+  .card.alert .t { color: var(--red-text); } .card.info .t { color: var(--blue-text); }
+  .card.lila .t { color: var(--lila-text); }
+  .tbl-wrap { overflow-x: auto; margin: 10px 0; border: 1.5px solid var(--gray-border); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { background: var(--gray-bg); text-align: left; padding: 7px 10px; font-size: 10.5px; font-weight: 650;
+       color: var(--gray-text); text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--gray-border); }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--gray-border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.r, th.r { text-align: right; white-space: nowrap; }
+  .pill { display: inline-block; font-size: 10.5px; font-weight: 650; padding: 1px 7px; border-radius: 10px; white-space: nowrap; }
+  .p-ok { background: var(--green-light); color: var(--green-text); border: 1px solid var(--green-border); }
+  .p-wip { background: var(--blue-light); color: var(--blue-text); border: 1px solid var(--blue-border); }
+  .p-pend { background: var(--amber-light); color: var(--amber-text); border: 1px solid var(--amber-border); }
+  .p-dec { background: var(--red-light); color: var(--red-text); border: 1px solid var(--red-border); }
+  .muted { color: var(--gray-text); font-size: 12px; }
+  .check li { list-style: none; margin-left: -18px; }
+  .check li::before { content: "☐  "; color: var(--gray-text); }
+  @media (max-width: 640px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+  @media print { body { padding: 0; } h2 { break-after: avoid; } .card, .tbl-wrap { break-inside: avoid; } }
+</style>
+</head>
+<body>
+
+<div class="doc-header">
+  <div class="tags"><span class="tag">Proyecto IVA 2026</span><span class="tag alt">Amazon</span></div>
+  <h1>Facturación y cobros Amazon — acuerdos de la reunión y lote 4</h1>
+  <p class="meta">Data → Finanzas · 5 de octubre de 2026 · Seguimiento de la reunión del 2-oct</p>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="n">0</span>Resumen</h2>
+
+<div class="kpis">
+  <div class="kpi"><b>4</b><span>lotes de prueba; el 4 es el último antes de producción</span></div>
+  <div class="kpi"><b>62</b><span>facturas en el lote 4: 32 B2B + 30 B2C</span></div>
+  <div class="kpi"><b>7 de 10</b><span>decisiones resueltas o con camino definido</span></div>
+  <div class="kpi"><b>31-oct</b><span>meta: octubre completo con el proceso nuevo</span></div>
+</div>
+
+<ul>
+  <li><b>El lote 4 está listo para su revisión</b> en un Odoo de pruebas nuevo (copia de producción del 5-oct), con el diario de Amazon y la CxC configurados.</li>
+  <li><b>Les pedimos validar dos cosas:</b> los cobros, orden por orden, y el expediente de casos con diferencia, que es la base para decidir D3/D4 y D6.</li>
+  <li><b>Con su validación</b> se programa la primera corrida en producción. El barrido histórico (D1/D2) va después, en unos días.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2><span class="n">1</span>Acuerdos de la reunión del 2-oct</h2>
+
+<div class="tbl-wrap"><table>
+  <tr><th style="width:5%">#</th><th style="width:20%">Tema</th><th>Qué se acordó</th><th>Qué sigue</th><th style="width:11%">Estado</th></tr>
+
+  <tr><td><b>D1</b></td><td><b>Barrido histórico</b> de lo no facturado desde abril<br><span class="muted">1,088 SO pendientes (abr–sep)</span></td>
+      <td>No es inmediato; puede esperar unos días.
+        <ol>
+          <li><b>B2C:</b> se facturan todas en octubre, con fecha actual y con los criterios actuales. Las devoluciones se atienden con el flujo de notas de crédito (fuera del alcance de facturación).</li>
+          <li><b>B2B:</b> se trae el UUID del CFDI de Amazon y se crean las facturas y notas de crédito en Odoo 18, con periodos abiertos. Se cancelan todas las facturas y NC duplicadas.</li>
+          <li><b>Odoo 15:</b> la migración de saldos de las cuentas afectadas de Odoo 15 a Odoo 18 la lleva Finanzas. Lo de Odoo 15 se puede resolver directo en el SAT, sin afectar Odoo ni los asientos.</li>
+        </ol></td>
+      <td>Data prepara el barrido después de la primera corrida en producción. Se corre por tramos, con revisión entre tramos.</td>
+      <td><span class="pill p-ok">Acordado</span></td></tr>
+
+  <tr><td><b>D2</b></td><td><b>Doble CFDI B2B</b> (Amazon Business + Somos Reyes)</td>
+      <td>Barrido B2B <b>desde el 1-abr-2026</b>, siguiendo la propuesta: se toman las facturas y NC emitidas por Amazon, se cancelan las duplicadas en Odoo 18 y se crean las correctas.</td>
+      <td>Data construye el script de corrección y lo prueba primero en el Odoo de pruebas. Para el tramo del 1 al 16 de abril (Odoo 15), ver D1.3.</td>
+      <td><span class="pill p-ok">Acordado</span></td></tr>
+
+  <tr><td><b>D3 / D4</b></td><td><b>Excedente de promociones de Amazon</b> y regla B2C con promoción</td>
+      <td>Antes de decidir, Finanzas revisa un conjunto de casos reales. <b>Propuesta previa:</b> una cuenta por cobrar específica para estos montos, asumiendo que el IVA ya está trasladado.</td>
+      <td><b>Entregado con el lote 4:</b> expediente de casos con la diferencia partida en base e IVA (sección 2). Mientras Finanzas decide, el excedente se sigue marcando sin asiento.</td>
+      <td><span class="pill p-pend">Revisión Finanzas</span></td></tr>
+
+  <tr><td><b>D5</b></td><td>Refacturación a clientes después del corte</td>
+      <td>Misma lógica que hoy en día.</td>
+      <td>Propuesta vigente: NC + factura nueva, conservando la SO como origen. Autofacturador</td>
+      <td><span class="pill p-ok">Listo</span></td></tr>
+
+  <tr><td><b>D6</b></td><td>Casos especiales</td>
+      <td>No deberían existir "casos especiales". Cada diferencia debe tener su propia regla, sabiendo exactamente qué es (por ejemplo, una diferencia por marketing) y cómo se trata.</td>
+      <td>El expediente del lote 4 trae una <b>pista</b> por orden (sección 2). Cada tipo que Finanzas confirme se vuelve una regla del proceso. El reporte periódico se define después, con las reglas ya fijadas.</td>
+      <td><span class="pill p-pend">Revisión Finanzas</span></td></tr>
+
+  <tr><td><b>D7</b></td><td>Mercancía Facturada No Enviada</td>
+      <td>Ya configurada en Odoo.</td><td>—</td>
+      <td><span class="pill p-ok">Resuelto</span></td></tr>
+
+  <tr><td><b>D8</b></td><td>Diario de Amazon</td>
+      <td>Ya configurado.</td><td>—</td>
+      <td><span class="pill p-ok">Resuelto</span></td></tr>
+
+  <tr><td><b>D9</b></td><td>Validación bancaria</td>
+      <td>La pregunta no quedó clara. Replanteada abajo.</td>
+      <td>Ver recuadro.</td>
+      <td><span class="pill p-pend">Replanteada</span></td></tr>
+
+  <tr><td><b>D10</b></td><td>XML de los CFDI B2B</td>
+      <td>Flujo por crear y probar. Por ahora, los XML se toman del ZIP que comparte Finanzas.</td>
+      <td>Data construye la carga desde el ZIP y la adjunta a las facturas B2B.</td>
+      <td><span class="pill p-wip">Por construir</span></td></tr>
+</table></div>
+
+<div class="card info">
+  <div class="t">D9 replanteada</div>
+  <p><b>¿El depósito en banco de cada settlement es igual a lo que aplicamos para ese settlement, sumando lo aplicado y el excedente?</b></p>
+  <p>Amazon a veces publica la misma venta dos veces y nosotros contamos solo una. Si el depósito real coincide con nuestra suma, esa regla queda validada. En el lote 2 los cuatro settlements cuadraron; si esa revisión fue contra el banco, la regla ya está validada en la práctica.</p>
+  <p class="muted">En pruebas no se puede hacer contra el banco, porque solo se cargan los cobros de las órdenes del lote. Se hará en la primera corrida de producción, donde se carga el settlement completo.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="n">2</span>Lote 4: qué les pedimos revisar</h2>
+
+<p>Odoo de pruebas: <code>somosreyes-test-05-10-2026-39264934</code> (copia de producción del 5-oct).</p>
+
+<div class="tbl-wrap"><table>
+  <tr><th style="width:38%">Archivo</th><th>Qué es</th></tr>
+  <tr><td><code>lote_amazon_test_20261005_v4.csv</code></td>
+      <td><b>Cobros.</b> Por orden: settlement, lo liberado por Amazon, lo aplicado en Odoo y las notas (<code>EXCEDENTE_NO_APLICADO</code>, <code>POR_ENVIO</code>, <code>REPARTIDO</code>).</td></tr>
+  <tr><td><code>casos_diferencia_20261005_184629_resumen.csv</code></td>
+      <td><b>Casos con diferencia.</b> Órdenes donde no coinciden lo que pagó el cliente, las transacciones de Amazon y lo liberado. Incluye casos de este lote y casos conocidos de lotes anteriores.</td></tr>
+</table></div>
+
+<h3>Qué verificar</h3>
+<ul class="check">
+  <li><b>Cobros orden por orden:</b> lo liberado por Amazon coincide con el pago en Odoo, más el excedente cuando lo hay.</li>
+  <li>Las facturas cobradas quedan en estado "Pagado".</li>
+  <li>En órdenes con varias facturas (<code>POR_ENVIO</code>), cada cobro está en la factura de su envío.</li>
+  <li>Ninguna orden B2B facturada a público en general. Las B2B llevan el UUID, el receptor y la fecha del CFDI de Amazon.</li>
+  <li>Las B2C llevan fecha de octubre.</li>
+  <li><b>Casos con diferencia:</b> confirmar o corregir la pista de cada orden.</li>
+</ul>
+
+<div class="card warn">
+  <div class="t">El total por settlement es menor que el depósito, a propósito</div>
+  En pruebas solo se cargan los cobros de las órdenes que se facturaron en el lote. Por eso el cuadre es orden por orden y no contra el depósito completo. En producción se carga el settlement entero.
+</div>
+
+<h3>Cómo leer el expediente de casos con diferencia</h3>
+<div class="tbl-wrap"><table>
+  <tr><th style="width:34%">Columna</th><th>Qué dice</th></tr>
+  <tr><td><code>cliente_pago</code></td><td>Lo que Amazon le cobró al cliente.</td></tr>
+  <tr><td><code>transacciones_total</code></td><td>Lo que dicen las transacciones de Amazon (base + IVA).</td></tr>
+  <tr><td><code>diferencia</code></td><td>Transacciones menos lo que pagó el cliente.</td></tr>
+  <tr><td><code>diferencia_base_si_incluye_iva</code> / <code>_iva_</code></td><td>La diferencia partida en base e IVA, suponiendo que el IVA ya viene incluido. Es el escenario de la propuesta D3/D4.</td></tr>
+  <tr><td><code>liberado / aplicado / excedente</code></td><td>Lo que Amazon depositó, lo que se aplicó a la factura y lo que sobró.</td></tr>
+  <tr><td><code>conceptos_transacciones</code></td><td>Cada concepto de Amazon distinto de cero, para ver de dónde sale cada peso.</td></tr>
+  <tr><td><code>pista</code></td><td>Nuestra primera lectura del tipo de diferencia (tabla siguiente). <b>No es una conclusión.</b></td></tr>
+</table></div>
+
+<div class="tbl-wrap"><table>
+  <tr><th style="width:38%">Pista</th><th>Qué significa</th></tr>
+  <tr><td><code>PROMO_FINANCIADA_AMAZON</code></td><td>Amazon liquidó más de lo que pagó el cliente: absorbió parte del precio.</td></tr>
+  <tr><td><code>… (MONTO_FIJO)</code></td><td>La diferencia es múltiplo de $50; típico de un cupón (por ejemplo, $100).</td></tr>
+  <tr><td><code>+ PROMO_REBATES</code></td><td>Las transacciones traen un descuento pagado por nosotros como vendedor.</td></tr>
+  <tr><td><code>CLIENTE_PAGO_MAS</code></td><td>El cliente pagó más que lo que dicen las transacciones.</td></tr>
+  <tr><td><code>SIN_DIFERENCIA_AMAZON</code></td><td>Cliente y transacciones coinciden: la diferencia está en la SO de Odoo.</td></tr>
+  <tr><td><code>SIN_DATO_CLIENTE</code></td><td>Amazon no reporta un total claro de lo que pagó el cliente.</td></tr>
+</table></div>
+<p class="muted">El detalle completo de transacciones por orden y los datos crudos de Amazon están disponibles si los necesitan para un caso puntual.</p>
+
+<!-- ============================================================ -->
+<h2><span class="n">3</span>Historial de pruebas</h2>
+
+<div class="tbl-wrap"><table>
+  <tr><th>Lote</th><th>Odoo de pruebas</th><th class="r">Facturas</th><th>Resultado</th></tr>
+  <tr><td><b>1 · 18-sep</b></td><td>Copia del 26-ago</td><td class="r">100</td>
+      <td>Validado por Finanzas. Un settlement difería por 3 promociones de Amazon (explicado). Se corrigió un error en cobros de órdenes de 2 piezas.</td></tr>
+  <tr><td><b>2 · 26-sep</b></td><td>Copia del 26-ago</td><td class="r">57</td>
+      <td>Validado por Finanzas: 154 pagos, los 4 settlements cierran.</td></tr>
+  <tr><td><b>3 · 30-sep</b></td><td>Copia del 29-sep</td><td class="r">28</td>
+      <td>B2B correctas; pocas B2C por un defecto del script de preparación de pruebas (ya corregido). Sustituido por el lote 4.</td></tr>
+  <tr><td><b>4 · 5-oct</b></td><td>Copia del 5-oct</td><td class="r">62<br><span class="muted">32 B2B + 30 B2C</span></td>
+      <td><b>En revisión de Finanzas.</b> Incluye órdenes con varias facturas y cobro por envío, refacturaciones y promociones.</td></tr>
+</table></div>
+
+<!-- ============================================================ -->
+<h2><span class="n">4</span>Salida a producción</h2>
+
+<div class="tbl-wrap"><table>
+  <tr><th style="width:6%">Regla</th><th>Qué dice</th></tr>
+  <tr><td><b>R1 / Hecho</b></td><td>El proceso general 1 a 1 deja de facturar <b>todo</b> Amazon, de cualquier fecha. Así ninguna orden queda visible para los dos procesos a la vez.</td></tr>
+  <tr><td><b>R2</b></td><td>El proceso nuevo factura octubre y, después, el barrido histórico: B2C desde el 17-abr (arranque de Odoo 18) y B2B desde el 1-abr (D1, D2).</td></tr>
+  <tr><td><b>R3</b></td><td>Lo que el 1 a 1 ya facturó correctamente no se toca. Las B2B con doble CFDI se corrigen con el barrido de D2.</td></tr>
+  <tr><td><b>R4</b></td><td>Primera corrida con tope de facturas y revisión manual antes de liberar el volumen completo.</td></tr>
+</table></div>
+
+<div class="card ok">
+  <div class="t">Controles después de cada corrida</div>
+  <ul>
+    <li>Ninguna orden con CFDI de Amazon Business facturada a público en general.</li>
+    <li>Ninguna SO con más de una factura viva, salvo las B2B que Amazon facturó en varios CFDI.</li>
+    <li>Cuadro por settlement: liberado, aplicado y excedente, contra el depósito en banco (D9).</li>
+  </ul>
+</div>
+
+<div class="card warn">
+  <div class="t">Reversa</div>
+  Si algo sale mal, se pausa el flujo de Amazon y Amazon vuelve al 1 a 1. Los dos procesos comparten la clave anti-duplicado, así que volver atrás no duplica facturas.
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="n">5</span>Siguientes pasos</h2>
+
+<div class="tbl-wrap"><table>
+  <tr><th style="width:20%">Cuándo</th><th>Qué</th><th style="width:16%">Responsable</th></tr>
+  <tr><td><b>5-oct</b></td><td>Entrega del lote 4 y del expediente de casos con diferencia.</td><td>Data</td></tr>
+  <tr><td>Al recibir el lote</td><td>Validación de cobros. Decisiones D3/D4 y D6 sobre el expediente. Respuesta a D9.</td><td>Finanzas</td></tr>
+  <tr><td>En paralelo</td><td>Flujos en Kestra (facturación y cobros) e índices en la base de datos. Carga de XML desde el ZIP (D10).</td><td>Data</td></tr>
+  <tr><td>Con la validación</td><td><b>Primera corrida en producción</b> (octubre), con tope y revisión manual.</td><td>Data + Finanzas</td></tr>
+  <tr><td>Después</td><td>Barrido histórico por tramos: B2C (D1) y corrección del doble CFDI B2B desde el 1-abr (D2).</td><td>Data + Finanzas</td></tr>
+  <tr><td><b>31-oct</b></td><td>Octubre completo, facturado y con cobros aplicados.</td><td>—</td></tr>
+</table></div>
+
+<div class="card alert">
+  <div class="t">Riesgo de calendario</div>
+  Mientras el proceso nuevo no corra en producción, nadie factura Amazon. Si la salida pasa de octubre, las ventas de octubre se facturarían en otro mes.
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="n">6</span>Frente paralelo: notas de crédito de Amazon</h2>
+<p>En desarrollo; el primer lote de pruebas está previsto para la semana del 5 al 9 de octubre. Cubre los tres tipos de su documento:</p>
+<div class="tbl-wrap"><table>
+  <tr><th>Tipo</th><th>Situación</th><th>Costo</th></tr>
+  <tr><td><b>A</b></td><td>Cancelación antes del despacho</td><td>Revierte Mercancía Facturada No Enviada</td></tr>
+  <tr><td><b>B</b></td><td>Devolución después del despacho, el producto regresa</td><td>Devoluciones en Tránsito 107.06.001</td></tr>
+  <tr><td><b>C</b></td><td>Bonificación sin retorno</td><td>Sin movimiento</td></tr>
+</table></div>
+<p>Quedan por definir con Finanzas: los reembolsos de guía (<code>LabmanLabelRefund</code>), las comisiones por devolución, las devoluciones de mes cerrado y la regla A/B en órdenes FBA.</p>
+
+<!-- ============================================================ -->
+<h2><span class="n">7</span>Anexo — qué significa cada estado</h2>
+<div class="tbl-wrap"><table>
+  <tr><th style="width:30%">Estado</th><th>Significado</th></tr>
+  <tr><td><code>ODOO_INVOICED</code></td><td>B2C facturada por Somos Reyes.</td></tr>
+  <tr><td><code>ODOO_B2B_LINKED</code></td><td>B2B: factura en Odoo con el UUID del CFDI de Amazon.</td></tr>
+  <tr><td><code>ALREADY_ODOO_INVOICED</code></td><td>Ya tenía factura viva; no se duplica.</td></tr>
+  <tr><td><code>SKIPPED_GRACE</code></td><td>B2C dentro de los 5 días de gracia; se reevalúa en cada corrida.</td></tr>
+  <tr><td><code>TOTAL_DIFF</code></td><td>Lo que factura Odoo no cuadra con Amazon; no se factura y va al expediente.</td></tr>
+  <tr><td><code>SO_CANCELLED</code></td><td>SO cancelada con pago de Amazon: requiere NC Tipo A.</td></tr>
+  <tr><td><code>NO_SO_IN_ODOO</code></td><td>La orden no tiene SO: solo alerta (las crea Yuju).</td></tr>
+  <tr><td><code>ODOO_PAID</code> + notas</td><td>Cobro aplicado. Notas: <code>EXCEDENTE_NO_APLICADO</code>, <code>REPARTIDO</code>, <code>POR_ENVIO</code>, <code>REPARTO_SIN_ENVIO</code>.</td></tr>
+  <tr><td><code>PROMO_AMAZON</code> (nota en facturación)</td><td>B2C facturada por lo que pagó el cliente; el excedente de Amazon queda registrado.</td></tr>
+</table></div>
+
+</body>
+</html>
