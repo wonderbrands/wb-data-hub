@@ -404,7 +404,7 @@ if __name__ == '__main__':
     validar_entorno()
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     mes = args[0] if args else date.today().strftime('%Y-%m')
-    # 'anterior': el mes que acaba de cerrar (lo usa el flujo de Kestra el dia 1).
+    # 'anterior': el mes que acaba de cerrar (lo usa el flujo de Kestra el dia 2).
     if mes == 'anterior':
         hoy = date.today()
         mes = (date(hoy.year - 1, 12, 1) if hoy.month == 1

@@ -126,10 +126,13 @@ RUN_LOADER = True
 
 # Ventana de arranque. Blindaje contra facturacion masiva retroactiva: al
 # quitar la restriccion de OUT, todo el rezago se vuelve elegible de golpe.
-# >>> DEFINIR CON FINANZAS ANTES DE PASAR A PRODUCCION <<<
 # Valor de PRUEBAS: inicio del settlement 27044880571 (depositado el 30-jul).
 # Ver la nota de AMZ_END_DATE para por que se eligio esta ventana.
-AMZ_START_DATE = os.getenv('AMZ_START_DATE', '2026-08-27')
+# PRODUCCION: vacio = dia 1 del mes anterior (se resuelve abajo, junto a
+# HOY_CORRIDA). Cada corrida relee el mes anterior completo y el mes en curso:
+# el dia 1 eso es el barrido de cierre. Un rezago mas viejo (saneamiento) se
+# corre a mano con start_date / end_date.
+AMZ_START_DATE = os.getenv('AMZ_START_DATE', '' if ENTORNO == 'prod' else '2026-08-27').strip()
 
 # =============================================================================
 # LIMITE SUPERIOR DE VENTANA -- HERRAMIENTA DE PRUEBAS
@@ -256,6 +259,11 @@ HOY_CORRIDA = ahora_cdmx()
 
 def inicio_de_mes(hoy=None):
     return (hoy or HOY_CORRIDA).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+# Ventana automatica de produccion: desde el dia 1 del mes anterior.
+if not AMZ_START_DATE:
+    AMZ_START_DATE = f"{inicio_de_mes() - timedelta(days=1):%Y-%m}-01"
 
 
 def en_cierre_de_mes(hoy=None):
@@ -2930,10 +2938,12 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         if fecha and ahora_cdmx() >= limite_72h():
             # Creada ahora ya no se timbraria con fecha del mes anterior: se
             # deja sin factura. La siguiente corrida la emite con fecha del dia
-            # y la reporta en "Venta mes anterior fuera cierre".
+            # y la reporta en "Venta mes anterior fuera cierre". Vuelve a
+            # PENDIENTE, no a ERROR: ni el miner reabre un ERROR ni el loader lo
+            # toma, y la venta se quedaria sin factura para siempre.
             motivo = (f"FUERA_72H: venta del mes anterior sin crear; ya no se puede "
-                      f"timbrar con fecha {fecha}.")
-            update_staging(db_conn, record['id'], 'ERROR', error_log=motivo)
+                      f"timbrar con fecha {fecha}. La siguiente corrida la factura.")
+            update_staging(db_conn, record['id'], 'PENDING_WB_INVOICE', error_log=motivo)
             log.error(f"{so_name}: {motivo}")
             return None
         if fecha:

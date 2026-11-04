@@ -1,11 +1,16 @@
 id: amz_billing_payments_flow
 namespace: wonderbrands.financial.amazon
 description: |
-  Amazon: facturación (01), cobros (02 → 03). Ver
-  processes/wonderbrands/financial/billing_processes/amazon/ACTIVAR_AMAZON_PRODUCCION.md
+  Amazon: facturación (01) y cobros (02 → 03). Ver
+  processes/wonderbrands/financial/billing_processes/amazon/README_AMAZON.md
 
-  Un solo flujo para la corrida diaria, el barrido de octubre por settlement y el
-  saneamiento ene–sep: así la exclusión mutua cubre todas las corridas.
+  Corrida diaria 02:30 y 15:00 CDMX. El día 1 las dos corridas son el cierre de
+  mes: las B2C del mes anterior se facturan con fecha del último día de ese mes,
+  sin periodo de gracia y aunque Amazon no haya liberado el pago (DEFERRED).
+  Lo decide 01 por la fecha; no hay que mover ningún input.
+
+  Un solo flujo para la corrida diaria y las manuales (settlement, saneamiento),
+  para que la exclusión mutua las cubra a todas.
 
 # =====================================================================
 # EXCLUSION MUTUA (incidente del 26-jul-2026: 549 dobles CFDI).
@@ -15,23 +20,24 @@ concurrency:
   limit: 1
   behavior: FAIL
 
+# El cron usa los valores por defecto. Solo se llenan en una corrida manual.
 inputs:
-  - id: settlement_id
-    type: STRING
-    required: false
-    displayName: "Settlement completo (barrido). Vacío = ventana por fechas"
   - id: start_date
     type: STRING
-    defaults: "2026-10-01"
-    displayName: "Desde (AAAA-MM-DD). Se ignora si hay settlement"
+    required: false
+    displayName: "Desde (AAAA-MM-DD). Vacío = día 1 del mes anterior (automático)"
   - id: end_date
     type: STRING
     required: false
     displayName: "Hasta, exclusivo (AAAA-MM-DD). Solo saneamiento"
+  - id: settlement_id
+    type: STRING
+    required: false
+    displayName: "Settlement completo. Vacío = ventana por fechas"
   - id: max_facturas
     type: STRING
     required: false
-    displayName: "Tope de facturas creadas en la corrida (vacío = sin tope)"
+    displayName: "Tope de facturas creadas (vacío = sin tope)"
   - id: payments_batch
     type: STRING
     defaults: "2000"
@@ -39,14 +45,15 @@ inputs:
   - id: cobros
     type: BOOLEAN
     defaults: true
-    displayName: "Correr 02 y 03 (false en el saneamiento ene–sep)"
+    displayName: "Correr 02 y 03 (false = solo facturación)"
   - id: dias_cierre_mes
     type: STRING
     defaults: "1"
-    displayName: "Días del mes en que la venta del mes anterior se factura con su fecha (máx. 3; 2 o 3 solo para reponer un cierre)"
+    displayName: "Días del mes con fecha del mes anterior (1 = solo el día 1; 2 o 3 solo para reponer un cierre fallido)"
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  # Mientras cld_conector no esté en main, en Kestra va "cld_conector".
   branch: "main"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
@@ -54,9 +61,7 @@ variables:
   db_name: "finance"
   db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
   scripts: "processes/wonderbrands/financial/billing_processes/amazon"
-  # Marca de agua inicial de 02 (solo si la tabla de cobros esta vacia). 02 le
-  # resta 15 dias: 16-oct -> lee depositos desde el 1-oct. Nada de septiembre:
-  # Finanzas cierra la historia en contabilidad.
+  # Solo aplica si finance.mkp_payments_prod no tiene cobros de Amazon.
   payments_desde: "2026-10-16 00:00:00"
 
 tasks:
@@ -71,10 +76,11 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
-      # Sin retry automático en ninguna tarea: reintentar a ciegas un script que
-      # timbra puede relanzar trabajo que ya se hizo. Un fallo se revisa a mano.
+      # Sin retry automático: reintentar a ciegas un script que timbra puede
+      # relanzar trabajo que ya se hizo. Un fallo se revisa a mano.
       - id: amazon
         type: io.kestra.plugin.scripts.shell.Commands
+        # El cierre de mes (día 1) puede llevar 2,000+ facturas timbradas.
         timeout: PT8H
         containerImage: wonderbrands-python:v1
         taskRunner:
@@ -85,6 +91,7 @@ tasks:
             memorySwap: "2048MB"
         env:
           AMZ_ENTORNO: "prod"
+          PYTHONUNBUFFERED: "1"   # el log se ve en vivo en Kestra
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"
           ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
@@ -95,15 +102,15 @@ tasks:
           DB_NAME: "{{ vars.db_name }}"
           SLACK_WEBHOOK: "{{ secret('SLACK_WEBHOOK') }}"
           KESTRA_EXECUTION_ID: "{{ execution.id }}"
-          AMZ_SETTLEMENT_ID: "{{ inputs.settlement_id ?? '' }}"
-          AMZ_START_DATE: "{{ inputs.start_date }}"
+          AMZ_START_DATE: "{{ inputs.start_date ?? '' }}"
           AMZ_END_DATE: "{{ inputs.end_date ?? '' }}"
+          AMZ_SETTLEMENT_ID: "{{ inputs.settlement_id ?? '' }}"
           AMZ_PROD_MAX_FACTURAS: "{{ inputs.max_facturas ?? '' }}"
           AMZ_PAYMENTS_BATCH: "{{ inputs.payments_batch }}"
           AMZ_PAYMENTS_DESDE: "{{ vars.payments_desde }}"
           AMZ_DIAS_CIERRE_MES: "{{ inputs.dias_cierre_mes }}"
         commands:
-          # 00 verifica configuración (solo lectura) y corta la corrida si falta algo.
+          # 00 verifica configuración (solo lectura) y corta si falta algo.
           - python {{ vars.scripts }}/00_amz_precheck_prod.py
           - python {{ vars.scripts }}/01_amz_billing.py
           - |
@@ -111,18 +118,27 @@ tasks:
               python {{ vars.scripts }}/02_miner_amz_payments.py &&
               python {{ vars.scripts }}/03_loader_amz_payments.py
             else
-              echo "cobros=false: 02 y 03 no se corren (saneamiento)."
+              echo "cobros=false: 02 y 03 no se corren."
             fi
 
 triggers:
-  # APAGADO hasta terminar el barrido de octubre (ver el .md). Para encender:
-  # disabled: false. 06:30 y 18:30 CDMX.
+  # HORARIO (CDMX). Odoo es el recurso compartido; se corre en los huecos:
+  #   ML facturación 00:00 06:00 12:00 18:00 (+ cobros ML encadenados y 23:00)
+  #   1a1 04:30 y 19:30 · housekeeping 03:15 · cierre 205.06.003 día 2 09:00
+  # 02:30: Amazon ya publicó lo de la tarde-noche (pico 16-18 h) y hay hueco
+  #        hasta las 06:00; el día 1 es la corrida larga del cierre.
+  # 15:00: tres horas después de ML 12:00 y tres antes de ML 18:00.
+  # El día 1 se cubre dos veces (02:30 y 15:00), dentro de las 72 h del SAT.
   - id: corrida_diaria
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 6,18 * * *"
+    cron: "30 2 * * *"
     timezone: America/Mexico_City
     recoverMissedSchedules: LAST
-    disabled: true
+  - id: corrida_tarde
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 15 * * *"
+    timezone: America/Mexico_City
+    recoverMissedSchedules: LAST
 
 errors:
   - id: slack_alert

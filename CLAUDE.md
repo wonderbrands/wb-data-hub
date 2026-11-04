@@ -282,7 +282,7 @@ Amazon **no expone el XML** del CFDI de Amazon Business. `amz_b2b_invoices` solo
 
 Todos en `test/financial/billing_processes/amazon/`.
 
-**Producción (29-oct-2026):** `_amz_common`, `00_amz_precheck_prod` (solo lectura), `01`, `02`, `03` y `11` están copiados **idénticos** en `processes/wonderbrands/financial/billing_processes/amazon/`, con `ACTIVAR_AMAZON_PRODUCCION.md`. Flujos: `flows/wonderbrands/financial/amazon/amz_billing_payments_flow.yml` (00→01→02→03, inputs `settlement_id`, `max_facturas`, `payments_batch`, `cobros`) y `amz_cierre_205_flow.yml` (11 + correo). Cron de los dos **apagado** hasta el barrido. Todo cambio a un script va en las dos copias.
+**Producción (3-nov-2026):** en `processes/wonderbrands/financial/billing_processes/amazon/` solo van `_amz_common`, `00_amz_precheck_prod` (solo lectura), `01`, `02`, `03`, `11` (copias **idénticas** de `test/`) y `README_AMAZON.md` (el flujo completo, estados y contexto para notas de crédito). Flujos: `amz_billing_payments_flow.yml` (00→01→02→03, **02:30 y 15:00 CDMX**, encendido; `start_date` vacío = día 1 del mes anterior, así cada corrida relee el mes anterior y la del día 1 es el cierre) y `amz_cierre_mercFacNoEnv_flow.yml` (11 + correo, **día 2 09:00**, encendido). Cobros `HISTORICO_CONTABILIDAD` en `mkp_payments_prod`: depósito del 23-sep (settlement 27581522881, 1,586 cobros de septiembre) que cierra Contabilidad; marcados el 3-nov-2026. Horarios elegidos en los huecos de ML (00/06/12/18), 1a1 (04:30/19:30) y housekeeping (03:15). Todo cambio a un script va en las dos copias.
 
 | Script | Función | Estado |
 |---|---|---|

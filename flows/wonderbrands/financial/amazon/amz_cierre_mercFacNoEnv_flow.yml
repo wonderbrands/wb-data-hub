@@ -1,4 +1,4 @@
-id: amz_cierre_205_flow
+id: amz_cierre_mercFacNoEnv_flow
 namespace: wonderbrands.financial.amazon
 description: |
   Amazon: cierre mensual de la 205.06.003 (Mercancías facturadas - no enviadas).
@@ -94,14 +94,14 @@ tasks:
             uri: "{{ outputs.cierre_205.outputFiles.values() | first }}"
 
 triggers:
-  # Día 1 de cada mes, 09:00 CDMX (lejos de la corrida diaria de 06:30/18:30).
-  # APAGADO hasta revisar el primer cierre a mano con seco=true.
+  # Día 2 de cada mes, 09:00 CDMX: después de las dos corridas de cierre del
+  # día 1 (02:30 y 15:00), que facturan lo que faltaba del mes anterior.
+  # 'anterior' el día 2 sigue siendo el mes que cerró.
   - id: cierre_mensual
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 9 1 * *"
+    cron: "0 9 2 * *"
     timezone: America/Mexico_City
     recoverMissedSchedules: LAST
-    disabled: true
 
 errors:
   - id: slack_alert
