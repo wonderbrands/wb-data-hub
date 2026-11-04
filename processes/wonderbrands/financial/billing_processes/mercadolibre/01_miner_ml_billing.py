@@ -38,6 +38,11 @@ REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "15"))
 # Pausa entre llamadas a la API de ML para respetar rate limits
 SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "0.1"))
 
+INVOICE_XML_URL = "https://api.mercadolibre.com/invoices/io/documents/stream/order/{order_id}/xml"
+# Órdenes de reventa (static_tags meli_resale: ML nos compra y revende al cliente). Se facturan a
+# DeRemate y ML solo las expone con transaction_type=resale; sin el parámetro responde 404 para siempre.
+RESALE_PARAMS = {'transaction_type': 'resale'}
+
 
 def xml_to_dict(element):
     """Convierte un elemento XML a dict recursivamente."""
@@ -52,6 +57,20 @@ def xml_to_dict(element):
     if element.text and element.text.strip():
         result['_text'] = element.text.strip()
     return result
+
+
+def fetch_invoice_xml(order_id, is_resale, headers):
+    """Pide el XML con el tipo que indica el tag y, si da 404, prueba el otro.
+    El cruce cubre órdenes de reventa a las que les falte static_tags en ml_order_update."""
+    attempts = [RESALE_PARAMS, None] if is_resale else [None, RESALE_PARAMS]
+    r = None
+    for params in attempts:
+        r = requests.get(INVOICE_XML_URL.format(order_id=order_id), headers=headers,
+                         params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 404:
+            break
+        time.sleep(SLEEP_BETWEEN_CALLS)  # También en 404: el reproceso masivo no debe disparar un 429
+    return r
 
 
 def extract_ml_invoices():
@@ -90,7 +109,8 @@ def extract_ml_invoices():
     # El filtro por seller_id es obligatorio: ml_order_update trae las órdenes de
     # TODAS las tiendas, y sin él cada tienda consultaría órdenes ajenas con su token.
     cursor.execute("""
-        SELECT o.order_id, o.date_closed, s.status as invoice_status, o.status as order_status_ml, IFNULL(s.retry_count, 0)
+        SELECT o.order_id, MAX(o.date_closed), s.status as invoice_status, MAX(o.status) as order_status_ml,
+               IFNULL(s.retry_count, 0), MAX(o.static_tags LIKE '%%meli_resale%%') AS is_resale
         FROM somos_reyes.ml_order_update o
         LEFT JOIN finance.mkp_billing_prod s
             ON s.marketplace = %s AND o.order_id = s.mkp_order_id
@@ -98,7 +118,8 @@ def extract_ml_invoices():
           AND o.date_created >= %s
           AND o.status IN ('paid', 'closed') -- Solo aseguramos órdenes que ya procesaron pago
           AND (s.status IS NULL OR s.status = 'NO_INVOICE_IN_ML')
-        ORDER BY o.date_closed ASC;
+        GROUP BY o.order_id, s.status, s.retry_count  -- ml_order_update puede repetir order_id
+        ORDER BY MAX(o.date_closed) ASC;
     """, (MKP_MARKETPLACE, ML_SELLER_ID, ML_BILLING_START))
     orders = cursor.fetchall()
     log.info(f"[{MKP_MARKETPLACE}] Órdenes candidatas encontradas: {len(orders)}")
@@ -110,6 +131,7 @@ def extract_ml_invoices():
 
     # ── Contadores (los detalles por orden NO se loguean: solo el resumen final) ──
     inserts_ok    = 0
+    resale_ok     = 0
     waiting_404   = 0
     never_billed  = 0
     net_errors    = 0
@@ -122,11 +144,10 @@ def extract_ml_invoices():
         order_id = o[0]
         date_closed = o[1]  # datetime object o string (UTC 0)
         retry_count = o[4]
-
-        url = f"https://api.mercadolibre.com/invoices/io/documents/stream/order/{order_id}/xml"
+        is_resale = bool(o[5])
 
         try:
-            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            r = fetch_invoice_xml(order_id, is_resale, headers)
         except requests.exceptions.RequestException:
             net_errors += 1
             continue
@@ -213,6 +234,7 @@ def extract_ml_invoices():
             """, (MKP_MARKETPLACE, order_id, uuid, total, xml_base64, raw_json_str, retry_count))
             db.commit()
             inserts_ok += 1
+            resale_ok += is_resale
 
         except Exception:
             xml_errors += 1
@@ -222,7 +244,7 @@ def extract_ml_invoices():
     # ── Resumen único de la corrida ────────────────────────────
     total_errors = net_errors + http_errors + xml_errors
     log.info(
-        f"[{MKP_MARKETPLACE}] Resumen -> Candidatas: {len(orders)} | XMLs extraídos: {inserts_ok} | "
+        f"[{MKP_MARKETPLACE}] Resumen -> Candidatas: {len(orders)} | XMLs extraídos: {inserts_ok} (reventa: {resale_ok}) | "
         f"En espera (404): {waiting_404} | Nunca facturadas por ML: {never_billed} | "
         f"Errores: {total_errors} (red={net_errors}, http={http_errors} {http_by_code}, xml={xml_errors})"
     )
