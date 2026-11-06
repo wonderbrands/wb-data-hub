@@ -6,12 +6,14 @@ description: |
   1. Respaldo: empuja el estado ACTUAL de Kestra a la rama `kestra-drift` (solo commitea
      si hubo cambios). Si alguien editó un flujo en la UI, la edición queda guardada ahí
      antes de que el paso 2 la sobrescriba.
-  2. Sync: aplica flows/wonderbrands/** de main a Kestra.
+  2. Sync: aplica flows/wonderbrands/<namespace>/** de main a Kestra, un namespace por tarea.
+     Crea, actualiza y ELIMINA: si un flujo se borra del repo, se borra de Kestra.
 
   Alcance: solo los namespaces de este repo (financial, shipping_labels, system).
-  Los flujos de otros repos (coffee, masters) no se tocan: delete = false en el sync.
+  Los flujos de otros repos (coffee, masters) no se tocan porque no hay tarea para su namespace.
+  Namespace nuevo en el repo => agregar su par backup_<ns> / sync_<ns> aquí.
 
-  Regla: los cambios a flujos se hacen por PR a main, NO en la UI.
+  Regla: los cambios a flujos se hacen por PR a main, NO en la UI. Ver flows/README.md.
 
 inputs:
   - id: dry_run
@@ -71,16 +73,42 @@ tasks:
     dryRun: "{{ inputs.dry_run }}"
 
   # ---------- 2. main -> Kestra ----------
-  - id: sync_from_main
+  # Una tarea por namespace. delete: true -> un flujo borrado del repo se borra de Kestra.
+  # NO sincronizar desde la raíz `wonderbrands` con delete: true: borraría coffee/masters.
+  - id: sync_financial
     type: io.kestra.plugin.git.SyncFlows
     url: "{{ vars.repo_url }}"
     username: "{{ secret('GIT_USER') }}"
     password: "{{ secret('GIT_TOKEN_WB_ORG') }}"
     branch: "{{ vars.branch }}"
-    targetNamespace: wonderbrands
-    gitDirectory: flows/wonderbrands
+    targetNamespace: wonderbrands.financial
+    gitDirectory: flows/wonderbrands/financial
     includeChildNamespaces: true
-    delete: false   # nunca borrar flujos de Kestra que no estén en el repo (coffee, masters)
+    delete: true
+    dryRun: "{{ inputs.dry_run }}"
+
+  - id: sync_shipping_labels
+    type: io.kestra.plugin.git.SyncFlows
+    url: "{{ vars.repo_url }}"
+    username: "{{ secret('GIT_USER') }}"
+    password: "{{ secret('GIT_TOKEN_WB_ORG') }}"
+    branch: "{{ vars.branch }}"
+    targetNamespace: wonderbrands.shipping_labels
+    gitDirectory: flows/wonderbrands/shipping_labels
+    includeChildNamespaces: true
+    delete: true
+    dryRun: "{{ inputs.dry_run }}"
+
+  - id: sync_system
+    type: io.kestra.plugin.git.SyncFlows
+    url: "{{ vars.repo_url }}"
+    username: "{{ secret('GIT_USER') }}"
+    password: "{{ secret('GIT_TOKEN_WB_ORG') }}"
+    branch: "{{ vars.branch }}"
+    targetNamespace: wonderbrands.system
+    gitDirectory: flows/wonderbrands/system
+    includeChildNamespaces: true
+    delete: true
     dryRun: "{{ inputs.dry_run }}"
 
 triggers:
