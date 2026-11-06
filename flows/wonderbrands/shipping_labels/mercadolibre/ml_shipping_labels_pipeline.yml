@@ -83,6 +83,17 @@ triggers:
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "15 20 * * *"
 
+  # =========================================
+  #CRON AUXILIAR MANUAL
+  # - id: auxiliar_manual
+  #   type: io.kestra.plugin.core.trigger.Schedule
+  #   cron: "*/10 * * * *"
+  # =========================================
+
+
+
+
+
 errors:
   - id: slack_alert
     type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook

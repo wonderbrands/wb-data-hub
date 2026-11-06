@@ -43,7 +43,7 @@ inputs:
     defaults: "2000"
     displayName: "Máximo de cobros que aplica 03 en la corrida"
   - id: cobros
-    type: BOOLEAN
+    type: BOOL
     defaults: true
     displayName: "Correr 02 y 03 (false = solo facturación)"
   - id: dias_cierre_mes

@@ -35,9 +35,18 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
+      # Nuevo: sube el Dockerfile clonado al almacenamiento interno de ESTA ejecución,
+      # para que read() pueda encontrarlo (read() no puede leer del disco del clone directamente).
+      - id: load_dockerfile
+        type: io.kestra.plugin.scripts.shell.Commands
+        outputFiles:
+          - dockerfile_content
+        commands:
+          - cp "{{ inputs.dockerfile_path }}" dockerfile_content
+
       - id: build_image
         type: io.kestra.plugin.docker.Build
-        dockerfile: "{{ read(inputs.dockerfile_path) }}"
+        dockerfile: "{{ read(outputs.load_dockerfile.outputFiles['dockerfile_content']) }}"
         tags:
           - "{{ inputs.image_name }}:{{ inputs.semantic_tag }}"
         push: false
