@@ -16,7 +16,7 @@ description: |
 inputs:
   - id: dry_run
     type: BOOL
-    defaults: true
+    defaults: false
     displayName: "Dry run: solo mostrar qué cambiaría, sin commitear ni aplicar"
 
 variables:
@@ -87,7 +87,6 @@ triggers:
   - id: every_15_min
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "*/15 * * * *"
-    disabled: true   # habilitar (por PR) después de validar el dry run manual
 
 errors:
   - id: slack_alert
