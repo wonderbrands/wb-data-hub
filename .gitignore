@@ -34,3 +34,5 @@ pip-delete-this-directory.txt
 
 #Carpetas
 ml_traza/
+
+*.zip
