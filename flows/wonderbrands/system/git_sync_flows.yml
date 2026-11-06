@@ -16,7 +16,7 @@ description: |
 inputs:
   - id: dry_run
     type: BOOL
-    defaults: true
+    defaults: false
     displayName: "Dry run: solo mostrar qué cambiaría, sin commitear ni aplicar"
 
 variables:
@@ -35,7 +35,7 @@ tasks:
     type: io.kestra.plugin.git.PushFlows
     url: "{{ vars.repo_url }}"
     username: "{{ secret('GIT_USER') }}"
-    password: "{{ secret('GIT_TOKEN_WB') }}"
+    password: "{{ secret('GIT_TOKEN_WB_ORG') }}"
     branch: "{{ vars.drift_branch }}"
     sourceNamespace: wonderbrands.financial
     includeChildNamespaces: true
@@ -48,7 +48,7 @@ tasks:
     type: io.kestra.plugin.git.PushFlows
     url: "{{ vars.repo_url }}"
     username: "{{ secret('GIT_USER') }}"
-    password: "{{ secret('GIT_TOKEN_WB') }}"
+    password: "{{ secret('GIT_TOKEN_WB_ORG') }}"
     branch: "{{ vars.drift_branch }}"
     sourceNamespace: wonderbrands.shipping_labels
     includeChildNamespaces: true
@@ -61,7 +61,7 @@ tasks:
     type: io.kestra.plugin.git.PushFlows
     url: "{{ vars.repo_url }}"
     username: "{{ secret('GIT_USER') }}"
-    password: "{{ secret('GIT_TOKEN_WB') }}"
+    password: "{{ secret('GIT_TOKEN_WB_ORG') }}"
     branch: "{{ vars.drift_branch }}"
     sourceNamespace: wonderbrands.system
     includeChildNamespaces: true
@@ -75,7 +75,7 @@ tasks:
     type: io.kestra.plugin.git.SyncFlows
     url: "{{ vars.repo_url }}"
     username: "{{ secret('GIT_USER') }}"
-    password: "{{ secret('GIT_TOKEN_WB') }}"
+    password: "{{ secret('GIT_TOKEN_WB_ORG') }}"
     branch: "{{ vars.branch }}"
     targetNamespace: wonderbrands
     gitDirectory: flows/wonderbrands
@@ -87,7 +87,6 @@ triggers:
   - id: every_15_min
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "*/15 * * * *"
-    disabled: true   # habilitar (por PR) después de validar el dry run manual
 
 errors:
   - id: slack_alert
