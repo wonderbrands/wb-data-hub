@@ -29,23 +29,46 @@ concurrency:
 
 tasks:
   # ---------- 1. Respaldo del estado actual de Kestra -> rama kestra-drift ----------
-  - id: backup_drift
-    type: io.kestra.plugin.core.flow.ForEach
-    values: ["financial", "shipping_labels", "system"]
-    concurrencyLimit: 1
-    tasks:
-      - id: push_namespace
-        type: io.kestra.plugin.git.PushFlows
-        url: "{{ vars.repo_url }}"
-        username: "{{ secret('GIT_USER') }}"
-        password: "{{ secret('GIT_TOKEN_WB') }}"
-        branch: "{{ vars.drift_branch }}"
-        sourceNamespace: "wonderbrands.{{ taskrun.value }}"
-        includeChildNamespaces: true
-        gitDirectory: "flows/wonderbrands/{{ taskrun.value }}"
-        delete: true   # la rama refleja exactamente lo que hay en Kestra
-        commitMessage: "[DRIFT] Estado de Kestra wonderbrands.{{ taskrun.value }} ({{ execution.id }})"
-        dryRun: "{{ inputs.dry_run }}"
+  # Una tarea por namespace (en secuencia, cada una commitea en la rama).
+  # delete: true -> la rama refleja exactamente lo que hay en Kestra.
+  - id: backup_financial
+    type: io.kestra.plugin.git.PushFlows
+    url: "{{ vars.repo_url }}"
+    username: "{{ secret('GIT_USER') }}"
+    password: "{{ secret('GIT_TOKEN_WB') }}"
+    branch: "{{ vars.drift_branch }}"
+    sourceNamespace: wonderbrands.financial
+    includeChildNamespaces: true
+    gitDirectory: flows/wonderbrands/financial
+    delete: true
+    commitMessage: "[DRIFT] Estado de Kestra wonderbrands.financial ({{ execution.id }})"
+    dryRun: "{{ inputs.dry_run }}"
+
+  - id: backup_shipping_labels
+    type: io.kestra.plugin.git.PushFlows
+    url: "{{ vars.repo_url }}"
+    username: "{{ secret('GIT_USER') }}"
+    password: "{{ secret('GIT_TOKEN_WB') }}"
+    branch: "{{ vars.drift_branch }}"
+    sourceNamespace: wonderbrands.shipping_labels
+    includeChildNamespaces: true
+    gitDirectory: flows/wonderbrands/shipping_labels
+    delete: true
+    commitMessage: "[DRIFT] Estado de Kestra wonderbrands.shipping_labels ({{ execution.id }})"
+    dryRun: "{{ inputs.dry_run }}"
+
+  - id: backup_system
+    type: io.kestra.plugin.git.PushFlows
+    url: "{{ vars.repo_url }}"
+    username: "{{ secret('GIT_USER') }}"
+    password: "{{ secret('GIT_TOKEN_WB') }}"
+    branch: "{{ vars.drift_branch }}"
+    sourceNamespace: wonderbrands.system
+    includeChildNamespaces: true
+    gitDirectory: flows/wonderbrands/system
+    delete: true
+    commitMessage: "[DRIFT] Estado de Kestra wonderbrands.system ({{ execution.id }})"
+    dryRun: "{{ inputs.dry_run }}"
 
   # ---------- 2. main -> Kestra ----------
   - id: sync_from_main
