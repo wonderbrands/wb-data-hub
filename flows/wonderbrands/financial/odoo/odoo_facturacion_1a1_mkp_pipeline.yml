@@ -55,7 +55,6 @@ tasks:
           memory:
             memory: "512MB"
             memorySwap: "2048MB"
-          #cpus: 1.5
         env:
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"

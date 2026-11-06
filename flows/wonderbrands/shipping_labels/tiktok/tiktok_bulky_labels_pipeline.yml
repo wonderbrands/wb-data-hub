@@ -114,7 +114,7 @@ tasks:
           TIKTOK_NEOND_ENABLED: "true"
           TIKTOK_NEOND_SELLER_NAME: "Neon Deportes"
 
-          TIKTOK_NEON_ENABLED: "false"
+          TIKTOK_NEON_ENABLED: "true"
           TIKTOK_NEON_SELLER_NAME: "Neon"
 
           # --- Tienda FULL: TikTok entrega la guía, no aplica a este flujo ---
@@ -135,7 +135,7 @@ triggers:
   # Desfasado de Coppel (6,10,14,18,22) para no competir por la API de guías.
   - id: cron_tiktok_bulky_labels
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 7,9,12,15,17,20,23 * * *"
+    cron: "45 * * * *"
     timezone: "America/Mexico_City"
 
 errors:

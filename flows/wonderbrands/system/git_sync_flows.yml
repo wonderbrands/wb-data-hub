@@ -1,0 +1,76 @@
+id: git_sync_flows
+namespace: wonderbrands.system
+description: |
+  Sincroniza los flujos de Kestra con el repo wb-data-hub (rama main = fuente de verdad).
+
+  1. Respaldo: empuja el estado ACTUAL de Kestra a la rama `kestra-drift` (solo commitea
+     si hubo cambios). Si alguien editó un flujo en la UI, la edición queda guardada ahí
+     antes de que el paso 2 la sobrescriba.
+  2. Sync: aplica flows/wonderbrands/** de main a Kestra.
+
+  Alcance: solo los namespaces de este repo (financial, shipping_labels, system).
+  Los flujos de otros repos (coffee, masters) no se tocan: delete = false en el sync.
+
+  Regla: los cambios a flujos se hacen por PR a main, NO en la UI.
+
+inputs:
+  - id: dry_run
+    type: BOOL
+    defaults: true
+    displayName: "Dry run: solo mostrar qué cambiaría, sin commitear ni aplicar"
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  drift_branch: "kestra-drift"
+
+concurrency:
+  limit: 1
+
+tasks:
+  # ---------- 1. Respaldo del estado actual de Kestra -> rama kestra-drift ----------
+  - id: backup_drift
+    type: io.kestra.plugin.core.flow.ForEach
+    values: ["financial", "shipping_labels", "system"]
+    concurrencyLimit: 1
+    tasks:
+      - id: push_namespace
+        type: io.kestra.plugin.git.PushFlows
+        url: "{{ vars.repo_url }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+        branch: "{{ vars.drift_branch }}"
+        sourceNamespace: "wonderbrands.{{ taskrun.value }}"
+        includeChildNamespaces: true
+        gitDirectory: "flows/wonderbrands/{{ taskrun.value }}"
+        delete: true   # la rama refleja exactamente lo que hay en Kestra
+        commitMessage: "[DRIFT] Estado de Kestra wonderbrands.{{ taskrun.value }} ({{ execution.id }})"
+        dryRun: "{{ inputs.dry_run }}"
+
+  # ---------- 2. main -> Kestra ----------
+  - id: sync_from_main
+    type: io.kestra.plugin.git.SyncFlows
+    url: "{{ vars.repo_url }}"
+    username: "{{ secret('GIT_USER') }}"
+    password: "{{ secret('GIT_TOKEN_WB') }}"
+    branch: "{{ vars.branch }}"
+    targetNamespace: wonderbrands
+    gitDirectory: flows/wonderbrands
+    includeChildNamespaces: true
+    delete: false   # nunca borrar flujos de Kestra que no estén en el repo (coffee, masters)
+    dryRun: "{{ inputs.dry_run }}"
+
+triggers:
+  - id: every_15_min
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+    disabled: true   # habilitar (por PR) después de validar el dry run manual
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "⚠️ *Falló la sincronización Git ↔ Kestra* ⚠️\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+      }
