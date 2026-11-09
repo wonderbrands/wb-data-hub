@@ -5,7 +5,7 @@
 
 Automatizamos la **facturación (CFDI)**, la **aplicación de cobros** y las **notas de crédito** de las ventas en marketplaces, conectando MySQL, las APIs de los marketplaces y la API de Odoo 18, orquestado con **Kestra**.
 
-Trabajamos en una **rama de desarrollo**, nunca en `main`.
+**Estado al 9-nov-2026:** Mercado Libre y Amazon (facturación y cobros) en producción. Siguientes frentes: **notas de crédito de Amazon** y **facturación del resto de marketplaces** (Walmart, TikTok, Coppel, Piso, etc.).
 
 ---
 
@@ -21,9 +21,13 @@ Trabajamos en una **rama de desarrollo**, nunca en `main`.
 
 4. **INTERPRETACIÓN DE NEGOCIO PRIMERO.** Antes de tirar código: lee el documento de Finanzas, analízalo, **reporta lagunas lógicas** y propón la arquitectura (queries SQL, endpoints, mapeo a Odoo). Traducir requerimientos financieros a Python es la tarea principal, no escribir código.
 
-5. **ASISTENCIA PROACTIVA.** Si un flujo requiere un endpoint específico de Amazon/Walmart/etc., dilo y propón el bloque de conexión. Ayuda con queries MySQL y mapeo de estados.
+5. **ASISTENCIA PROACTIVA.** Si un flujo requiere un endpoint específico de un marketplace, dilo y propón el bloque de conexión. Ayuda con queries MySQL y mapeo de estados.
 
-6. **VALIDAR LOS DATOS ANTES DE CONFIAR EN ELLOS.** Regla ganada a golpes: el reporte del que iba a colgar toda la facturación de Amazon traía **49 de 94 ventas con el importe al doble**. Antes de automatizar sobre una fuente, cruza sus totales contra un dato independiente. Con emisión de CFDI un error no se corrige con un `UPDATE`.
+6. **VALIDAR LOS DATOS ANTES DE CONFIAR EN ELLOS.** El reporte del que iba a colgar la facturación de Amazon traía **49 de 94 ventas al doble**; la réplica `odoo_master_txns_c` dejó **~11,400 ventas de Odoo 15 "sin SO"** que sí estaban facturadas. Antes de automatizar o entregar un número, cruza contra una fuente independiente. Con emisión de CFDI un error no se corrige con un `UPDATE`.
+
+7. **UNA RAMA POR REQUERIMIENTO**, cortada de `origin/main`, nunca trabajar en `main`. Nombres `feat/…`, `fix/…`, `upd/…`; merge por PR. `cld_conector` fue la rama de Amazon (ya fusionada, PR #9). Las NC de Amazon y cada marketplace nuevo van en su propia rama.
+
+8. **COMMIT / PUSH / PR solo cuando yo lo pida.**
 
 ---
 
@@ -31,23 +35,24 @@ Trabajamos en una **rama de desarrollo**, nunca en `main`.
 
 ```
 wb-data-hub/
-├── processes/wonderbrands/          ← SOLO LECTURA. Producción.
+├── processes/wonderbrands/                ← PRODUCCIÓN. Solo se escribe al pasar a producción.
 │   ├── financial/billing_processes/
-│   │   ├── mercadolibre/            01_miner, 02_loader, 03_miner_pagos, 04_loader_pagos
-│   │   └── odoo/                    facturacion_automatica_1a1.py, dispatchs_alerts.py
-│   └── shipping_labels/             guías (otro proyecto; útil por sus patrones)
-│       ├── amazon/                  _01_amz_selfship_labels.py
-│       └── _shared/                 patrón de módulo compartido
-├── test/financial/                  ← ENTORNO DE TRABAJO
-│   ├── billing_processes/[marketplace]/
-│   └── credit_note_refund_processes/[marketplace]/
-├── flows/wonderbrands/              YAML de Kestra
-└── docker/, requirements.txt
+│   │   ├── amazon/          _amz_common, 00_precheck, 01, 02, 03, 11, README_AMAZON.md
+│   │   ├── mercadolibre/    01–04, ml_stores.py (dos tiendas)
+│   │   └── odoo/            facturacion_automatica_1a1.py, dispatchs_alerts.py
+│   └── shipping_labels/     guías (otro proyecto; útil por sus patrones)
+├── test/financial/                        ← ENTORNO DE TRABAJO
+│   ├── billing_processes/[marketplace]/            scripts + .html de Finanzas
+│   └── credit_note_refund_processes/[marketplace]/ .html de Finanzas (devoluciones)
+├── flows/wonderbrands/                    ← YAML de Kestra. main = producción (ver §5)
+│   ├── financial/{amazon,mercadolibre,odoo}/
+│   ├── shipping_labels/, system/, reports/
+│   └── README.md            reglas de sincronización
+└── docker/, requirements.txt, .venv/
 ```
 
-`/processes/` es **base de conocimiento, no destino de escritura**. Se consulta para entender cómo se conecta a las BD, cómo se maneja XML-RPC contra Odoo y cuál es el estilo de código.
-
-Dentro de `/test/` cada marketplace tiene archivos `.html`/`.md` elaborados por **Finanzas** con flujos lógicos, reglas de negocio y asientos contables. Esos documentos son el requerimiento, y **tienen huecos**: detectarlos es parte del trabajo.
+- `/processes/` es la **copia de producción**. Un script pasa ahí solo cuando está probado, y desde ese momento **todo cambio va en las dos copias** (`test/` y `processes/`, idénticas).
+- Dentro de `/test/` cada marketplace tiene los `.html` de **Finanzas** con flujos, reglas y asientos. Son el requerimiento y **tienen huecos**: detectarlos es parte del trabajo.
 
 ---
 
@@ -57,39 +62,27 @@ Dentro de `/test/` cada marketplace tiene archivos `.html`/`.md` elaborados por 
 
 | Schema | Contenido |
 |---|---|
-| `somos_reyes` | Datos crudos de marketplaces y espejos de Odoo |
+| `somos_reyes` | Datos crudos de marketplaces (ETL) y réplicas de Odoo |
 | `finance` | Tablas de control de nuestros procesos |
-| `bi` | Feeds de BI (`amz_bf` = órdenes SP-API) |
-| `crawl` | Datos de scraping |
+| `bi` | Feeds de BI |
 
 ## Tablas de control (`finance`) — genéricas, multi-marketplace
 
-Nacieron para Mercado Libre y **se reutilizan para todos los marketplaces** vía la columna `marketplace`. No crear tablas por marketplace.
+Se reutilizan para **todos** los marketplaces vía la columna `marketplace` (`MERCADO_LIBRE`, `MERCADO_LIBRE_OFICIALES`, `AMAZON`, …). **No crear tablas por marketplace.**
 
-**`mkp_billing_staging` / `mkp_billing_prod`**
-`UNIQUE KEY uk_mkp_order (marketplace, mkp_order_id)`
+| Tabla | Clave | Uso |
+|---|---|---|
+| `mkp_billing_{staging,prod}` | `uk_mkp_order (marketplace, mkp_order_id)` | Una fila por orden. `status varchar(40)`, `raw_json`, `cfdi_uuid`, `odoo_so_name` |
+| `mkp_payments_{staging,prod}` | `uk_payment (marketplace, payment_id)` — **sin `mkp_order_id`** | Una fila por cobro |
+| `mkp_refunds_staging`, `mkp_credit_notes_staging`, `mkp_credit_notes_scan_staging` | | NC (trabajo de ML, en pausa) |
+| `mkp_sync_watermarks` | | Existe, vacía. Sin uso todavía |
+| `billing_audit_log` | | Auditoría del 1a1 |
 
-```
-id, marketplace, mkp_order_id, odoo_so_name, cfdi_uuid, total_amount,
-xml_data, raw_json, status, retry_count, retry_count_loader,
-error_log, created_at, processed_at
-```
+**`payment_id` cuando el depósito agrupa órdenes** (Amazon): `f"{settlement_id}:{order_id}"`. Separador `:` porque el `order_id` trae guiones.
 
-**`mkp_payments_staging` / `mkp_payments_prod`**
-`UNIQUE KEY uk_payment (marketplace, payment_id)` — **ojo: sin `mkp_order_id`**
+## Conmutador `_staging` → `_prod`
 
-```
-id, marketplace, mkp_order_id, payment_id, amount, date_released,
-odoo_so_name, status, error_log, created_at, processed_at
-```
-
-**`mkp_refunds_staging`** — notas de crédito (tiene `classification_reason`)
-**`billing_audit_log`** — auditoría de `facturacion_automatica_1a1.py`
-**`mkp_sync_watermarks`** — ⚠️ **todavía no existe**; nace con el proceso de NC de ML. No dependas de ella: deriva la marca de agua de la propia tabla de control (`MAX(date_released)`).
-
-## Convención `_staging` → `_prod`
-
-Los scripts nuevos conmutan con **una sola constante** (`_amz_common.py`):
+Una sola variable cambia tablas, base de Odoo, límites de lote y timbrado a la vez, con candado cruzado (si `ENTORNO='staging'` y la URL de Odoo no parece de pruebas, aborta; y al revés). Patrón en `_amz_common.py`:
 
 ```python
 ENTORNO = os.getenv('AMZ_ENTORNO', 'staging')   # 'staging' | 'prod'
@@ -97,349 +90,289 @@ TBL_BILLING  = f'finance.mkp_billing_{ENTORNO}'
 TBL_PAYMENTS = f'finance.mkp_payments_{ENTORNO}'
 ```
 
-Cambia tablas **y** base de Odoo **y** límites de lote **y** timbrado a la vez, con candado cruzado: si `ENTORNO='staging'` y la URL de Odoo no parece de pruebas, aborta; y al revés. Evita el escenario de un despliegue a medias con un script en staging y otro en prod.
+## Odoo
 
-## Odoo 18
+- **Odoo 18 producción:** `odoo_urlV18` / `odoo_dbV18` (env). Todo por XML-RPC.
+- **Odoo 18 pruebas:** cada lote usa una copia nueva de producción en `.dev.odoo.com` que después se borra; la URL fija se vuelve obsoleta. Usar `ODOO_TEST_URL` / `ODOO_TEST_DB`.
+- **Odoo 15 (histórico):** operó hasta el **16-abr-2026**. No tenemos credenciales ni código contra él.
+- **Nombres de SO:** Odoo 15 = `SO3xxxxxx` / `SO4xxxxxx`. Odoo 18 = `SO10xxxxxx` y unos con número bajo (`S00…`).
 
-Dos ambientes:
+## Réplicas de Odoo en MySQL (`somos_reyes`)
 
-- **Producción:** `odoo_urlV18` / `odoo_dbV18` (env)
-- **Pruebas:** `somosreyes-test26ago26-37337608` en `.dev.odoo.com` (espejo de producción del 26-ago)
-
-Todo por **XML-RPC** (`/xmlrpc/2/common` y `/xmlrpc/2/object`).
-
-## Catálogo contable
-
-| Código | Nombre | Uso |
+| Tabla | Para qué | Ojo |
 |---|---|---|
-| `105.01.006` | Amazon | CxC Amazon |
-| `105.01.007` | Walmart | CxC |
-| `105.01.008` | Walmart 1P | CxC |
-| `105.01.009` | Coppel | CxC |
-| `105.01.010` | Elektra | CxC |
-| `105.01.011` | TikTok | CxC |
-| `105.01.012` | Mayoreo | CxC |
-| `102.02.008` | LIBERACIONES AMAZON PENDIENTES DE PROCESAR | Transitoria de cobros Amazon |
-| `107.06.001` | DEVOLUCIONES EN TRÁNSITO | NC Tipo B |
-| — | Mercancía Facturada No Enviada | Puente de facturación (ya en uso) |
-| `402-001-001` | Dev., Descuentos o Bonificaciones | NC |
-| `208-001-001` | IVA Trasladado Cobrado | |
-| `401-001-001` / `401-001-002` | Ventas Gravadas / Ventas por Envío | |
+| `odoo_new_sale_order_live` | SO de **Odoo 15 y 18** con `state`, `invoice_status`, `team_name`. **`channel_order_reference` = orden del marketplace (indexada)** | Las de Odoo 15 están congeladas al 16-abr |
+| `odoo_master_txns_c` | Una fila por línea de SO (`marketplace_order_id` → `order_id`) | **Incompleta para Odoo 15.** No usarla sola para decir "sin SO" |
+| `odoo_new_account_invoice`, `odoo_new_account_move(_line)` | Facturas y asientos | Validar frescura antes de usar |
 
-Otras constantes: `TAX_ID_MARKETPLACES = 38` (IVA 16%), `PARTNER_ID_PUBLICO_GENERAL = 13436` (XAXX010101000).
-
-**Nota:** el diario de cobros de Amazon existe pero **no tiene código corto evidente**. Se localiza por su cuenta por defecto (`find_journal_by_account`), no por código.
-
-## Campos pendientes en `account.move`
-
-Finanzas pide registrar `order_id`, `settlement_id` y `tipo` (B2B / B2C RFC / B2C público general). **No existen campos personalizados todavía**, así que van al **chatter** (`message_post`) como solución temporal: auditable pero no filtrable ni exportable. Cuando se creen (`x_amz_order_id`, `x_amz_settlement_id`, `x_amz_tipo` vía `ir.model.fields`), se migran desde el `raw_json` de la tabla de control.
+Para consultar MySQL desde aquí: el `python` del sistema no tiene `mysql.connector`; usar `.venv\Scripts\python.exe`. Las lecturas de Odoo de **producción** desde esta máquina las bloquea el clasificador: los scripts que leen Odoo prod los corro yo.
 
 ---
 
-# 4. Lógica en producción
+# 4. Catálogo contable
 
-## Mercado Libre — patrón *pull*
+| Cuenta | Uso |
+|---|---|
+| 105.01.004 / 105.01.005 | CxC Mercado Libre / ML Oficiales |
+| 105.01.006 | CxC Amazon |
+| 105.01.007 / 105.01.008 | CxC Walmart / Walmart 1P |
+| 105.01.009 | CxC Coppel |
+| 105.01.010 | CxC Elektra |
+| 105.01.011 | CxC TikTok |
+| 105.01.012 | CxC Mayoreo |
+| 105.01.001 | CLIENTES NACIONALES (la pone el autofacturador de Odoo; **no** debe recibir cobros de marketplace) |
+| 102.02.008 | Transitoria de cobros Amazon (diario AMZ) |
+| 102.02.009 | Transitoria de cobros ML Oficiales (diario MPO) |
+| 205.06.003 | Mercancías facturadas no enviadas (puente de facturación sin OUT) |
+| 501.01.001 | Costo de venta |
+| 401.01.001 / 401.01.002 | Ventas / envío (la 002 la pone el producto `C-ENVIO`) |
+| 403.01.002 + 208.01.001 | Promoción pagada por el marketplace |
+| 208.01.001 / 209.01.001 | IVA trasladado cobrado / no cobrado |
+| 704.23.001 | Redondeo de centavos |
+| 107.06.001 | Devoluciones en tránsito (NC tipo B) |
+| 402 (código exacto por confirmar en Odoo) | Devoluciones, descuentos o bonificaciones (NC) |
 
-ML timbra el CFDI; nosotros lo jalamos. **Nunca emitimos** en ML.
+Impuesto `38` (IVA 16 %). Partner público general `13436` (XAXX010101000).
 
+---
+
+# 5. Kestra
+
+## Sincronización: `main` es producción
+
+`flows/` es la fuente de verdad. `wonderbrands.system.git_sync_flows` aplica `main` a Kestra **cada 15 min** (crea, actualiza y **borra**). Una edición en la UI de Kestra se pierde en ≤ 15 min (queda respaldada en la rama `kestra-drift`). **Todo cambio de flujo va por PR a `main`.** Reglas en `flows/README.md`.
+
+## Horarios (CDMX)
+
+Los crons de ML **no tienen `timezone`**: corren en UTC. Los de Amazon y el 1a1 están en `America/Mexico_City`.
+
+| Flujo | Horario CDMX |
+|---|---|
+| `ml_billing_process_flow` | 00, 06, 12, 18 |
+| `ml_oficiales_billing_process_flow` | 03, 09, 15, 21 |
+| `ml_payments_flow` / `ml_oficiales_payments_flow` | encadenados + 23:00 / 23:30 |
+| `odoo_facturacion_1a1_mkp_pipeline` | 04:30 y 19:30 |
+| `amz_billing_payments_flow` | 02:30 y 15:00 |
+| `amz_cierre_mercFacNoEnv_flow` | día 2, 09:00 |
+| `daily_dispatch_alerts` | 08:00 L–V |
+
+⚠️ **Choques en Odoo:** Amazon 15:00 y el cierre de Amazon (día 2, 09:00) coinciden con ML Oficiales. ML Oficiales 03:00 cae dentro de la corrida larga de Amazon del día 1. No duplican CFDI (son otros equipos), pero cargan Odoo a la vez. Un flujo nuevo debe buscar hueco en esta tabla.
+
+---
+
+# 6. Blindajes obligatorios (incidente del 26-jul-2026)
+
+Dos ejecuciones concurrentes se traslaparon 1h51m: **549 órdenes con doble CFDI timbrado**. Todo script que factura lleva:
+
+1. **Exclusión mutua en Kestra:** `concurrency: limit 1, behavior: FAIL`, y sin retry automático.
+2. **Revalidación antes del `create`, FAIL-CLOSED:** se pregunta a Odoo justo antes de crear. Si la consulta falla, **no se crea**.
+3. **Idempotencia:** `account.move.ref = 'AUTOINV:<SO>'`. **Prefijo compartido entre todos los scripts a propósito**: cada uno ve las facturas de los otros. Variantes: `AUTOINV:<SO>:<uuid>` y `AUTOINV:<SO>:ENVIO`. Para NC, la propuesta es `AUTONC:<order_id>:<item>`.
+4. **Solo se reintentan lecturas.** Un 502 en una escritura no dice si Odoo hizo commit: se lanza `OdooWriteUncertain` y se reconcilia **leyendo**.
+5. **Detección real de duplicados:** `{origen: [facturas]}`, nunca `{origen: factura}`.
+
+---
+
+# 7. Estado por marketplace
+
+Volumen de SO en Odoo de sep–oct-2026 (`odoo_new_sale_order_live`, `state` en `sale`/`done`).
+
+| Equipo Odoo | Facturación hoy | Cobros | NC | SO sep–oct (facturadas / por facturar) |
+|---|---|---|---|---|
+| `Team_MercadoLibre` | ✅ pull (ML timbra) | ✅ | ⏸️ ML no expone el XML de la NC | — |
+| `Team_MercadoLibreOficiales` | ✅ pull | ✅ | ⏸️ | 98 / 23 |
+| `Team_Amazon` | ✅ propio (01) | ✅ propio (02→03) | 📋 **siguiente frente** | — |
+| `Team_TikTok` | 1a1 genérico | ❌ | 📋 `.html` sin analizar | 5,035 / 170 |
+| `Team_Coppel` | 1a1 genérico | ❌ | 📋 `.html` sin analizar | 4,599 / 158 |
+| `Team_Walmart` | Proceso manual de Sergio (fuera del 1a1, ver §12) | ❌ | 📋 `.html` sin analizar | 3,898 / 232 |
+| `Team_Walmart_1P` | 1a1 | ❌ | — | 2 / 0 |
+| `Team_Piso` | 1a1 (verificar; hay `odoo_new_pos_order`) | ❌ | — | 88 / 3 |
+| `Team_Muestras` | 1a1 (¿debe facturarse?) | — | — | 229 / 37 |
+| `Team_Sitioweb` | 1a1 | ❌ | — | 242 / 2 |
+| `Team_Mayoreo` | 1a1 | ❌ | — | 83 / 3 |
+| `Team_Salderos` | ⚠️ el 1a1 excluye `'Salderos / Facebook'`, que no es este nombre | — | — | 17 / 72 |
+
+**El 1a1** (`processes/.../odoo/facturacion_automatica_1a1.py`):
+- Recorre día por día las `sale.order` con `invoice_status='to invoice'`, agrupa por `team_id` y emite CFDI 1 a 1 a público general, con la CxC de `account_for_team()`.
+- Mantiene la **restricción de OUT** (`qty_delivered < qty_ordered` → `IGNORED_NO_STOCK`) y 1 día de gracia.
+- Excluye: `Team_Walmart`, `'Salderos / Facebook'`, ML desde el 1-jun-2026 y **todo Amazon** (desde el 1-oct-2026).
+
+---
+
+# 8. Patrones aprendidos (aplican a cualquier marketplace)
+
+- **Pull vs push.** Si el marketplace timbra (ML, Amazon Business), se **jala** su CFDI y se registra en Odoo con su UUID, sin timbrar. Si no, **emitimos** nosotros a público general. Un marketplace puede tener los dos (Amazon: B2B pull, B2C push).
+- **Sin XML no hay `ir.attachment`.** Si el marketplace no da el XML (Amazon Business, NC de ML), se sella `l10n_mx_edi_cfdi_uuid` + `narration` y nada más.
+- **Toda venta cobrada se factura**, aunque la SO esté en borrador (`action_confirm`) o cancelada (se factura y la NC sale por devoluciones). **Yuju crea las SO; nosotros nunca.** Sin SO → solo alerta.
+- **Sin restricción de OUT.** Se factura lo pedido; la contrapartida va a la 205.06.003 y se concilia con la salida (`conciliar_salida`). Cierre mensual del residuo de costeo contra 501.01.001 (`11_ajuste_cogs_205.py`).
+- **La venta se factura en su mes.** Los días de cierre (≤ 3 por las 72 h del SAT) la venta del mes anterior sale con fecha del último día, sin gracia. **El SAT no permite timbrar un CFDI con más de 72 h de antigüedad**: el histórico no se puede emitir con su fecha.
+- **Centavos.** En una factura que timbramos **nunca se edita la línea de IVA**: Odoo recalcula por línea y el PAC rechaza (CFDI40119). El ±0.01 se salda en el cobro contra 704.23.001.
+- **Cobros.** La unidad de liberación puede ser la pieza, no la orden: una factura puede quedar **parcialmente pagada** entre depósitos (no es error). La conciliación va contra la **transitoria** del marketplace.
+- **El asistente de pago usa la CxC de la factura.** Antes de aplicar, se valida que la factura esté en la CxC del marketplace (`CXC_INCORRECTA`).
+- **Un cobro aplicado a una factura que después se cancela queda colgado** y el loader lo da por aplicado. No aplicar cobros a facturas que se van a cancelar (por eso los cobros de B2B esperan a que se vincule el CFDI).
+- **XML-RPC:** `reconcile` y `remove_move_reconcile` hacen el trabajo y fallan al responder ("cannot marshal None"). Usar `ejecutar_sin_retorno()` y confirmar leyendo.
+- **Kits:** en SO cancelada la línea se crea sin `sale_line_ids` (para que tome costo) y se religa después de publicar.
+- **Zona horaria:** UTC → CDMX es −6 fijo (sin horario de verano desde 2022). Calcular la hora desde UTC, no desde el servidor (Kestra corre en UTC). Fronteras de día exclusivas (`<`).
+- **Timbrado apagado en pruebas.** Publicar ya genera el asiento, que es lo que Finanzas revisa.
+- **Campos personalizados en `account.move`** (`order_id`, `settlement_id`, tipo) no existen: van al chatter (`message_post`).
+
+---
+
+# 9. Mercado Libre — producción
+
+Patrón **pull**: ML timbra; nosotros jalamos el XML y lo registramos.
+
+| Script | Hace |
+|---|---|
+| `01_miner_ml_billing.py` | `GET /invoices/io/documents/stream/order/{id}/xml`. Sin factura y < 720 h → `NO_INVOICE_IN_ML` (reintenta); > 720 h → `NEVER_BILLED_BY_ML` |
+| `02_loader_ml_billing.py` | `account.move` con el UUID, `ir.attachment` con el XML, `account.edi.document` `sent`, valida total ±$1.00 (`TOTAL_DIFF`), `action_post` |
+| `03_miner_ml_payments.py` → `04_loader_ml_payments.py` | Pagos de Mercado Pago (`date_released`) → `account.payment.register` |
+
+**Dos tiendas** con los mismos scripts, configuradas en `ml_stores.py`. Kestra solo inyecta `ML_SELLER_ID`.
+- **25523702 (`MERCADO_LIBRE`):** CxC 105.01.004, diario MP.
+- **160190870 (`MERCADO_LIBRE_OFICIALES`):** CxC 105.01.005, diario MPO, corte 17-sep-2026.
+
+Una tienda nueva va en `ml_stores.STORES` más un par de YAML, nunca con scripts copiados. Hueco abierto: las ventas de Oficiales del 1-jun al 17-sep pueden haber quedado sin facturar.
+
+---
+
+# 10. Amazon — producción
+
+**Referencia completa: `processes/.../amazon/README_AMAZON.md`** (scripts, flujos, estados de facturación y cobros, qué atender a mano, cuentas, contexto para NC). Factura desde el 1-oct-2026; octubre cerrado.
+
+**Resumen:**
+- `amz_billing_payments_flow` corre 00 → 01 → 02 → 03 a las 02:30 y 15:00. `start_date` vacío = día 1 del mes anterior.
+- **01:** B2B = CFDI de Amazon Business vinculado (no se timbra); B2C = lo timbramos nosotros tras 5 días de gracia.
+- **02/03:** cobros por settlement; solo contra 105.01.006; los cobros de B2B esperan la vinculación.
+- `amz_cierre_mercFacNoEnv_flow` (11): cierre de la 205.06.003, día 2.
+
+**Datos de Amazon (`somos_reyes`):**
+- `amz_transactions`: cabecera. **La PK incluye `transaction_status`**: la misma venta existe como `DEFERRED` y luego liberada.
+- `amz_transaction_items`: los importes, por pieza.
+- `amz_b2b_invoices`: CFDI de Amazon Business (`receipt_type` I/E).
+- `amazon_orders`: **N filas por orden**, siempre agrupar.
+- `amz_settlement_report`: fechas de depósito.
+- **No hay índice por `order_id`** en `amz_transactions` ni en `amz_b2b_invoices`.
+
+**Fórmula (validada al centavo):**
 ```
-01_miner_ml_billing.py    GET /invoices/io/documents/stream/order/{id}/xml
-                          → parsea CFDI 4.0 + TimbreFiscalDigital
-                          → mkp_billing_prod (xml_data en base64, cfdi_uuid)
-                          404 con <720 h → NO_INVOICE_IN_ML (reintenta)
-                          404 con >720 h → NEVER_BILLED_BY_ML
-
-02_loader_ml_billing.py   crea account.move con el UUID de ML
-                          → l10n_mx_edi_cfdi_uuid + narration
-                          → ir.attachment con el XML
-                          → account.edi.document state='sent'
-                          → valida total XML vs Odoo (±$1.00) → TOTAL_DIFF
-                          → action_post()
-
-03_miner_ml_payments.py   ML /orders/{id} → payments → MP /v1/payments/{id}
-                          → date_released → mkp_payments_prod
-
-04_loader_ml_payments.py  account.payment.register, diario 'MP'
+base = product_charges + shipping + shipping_discount + our_price_discount
+iva  = our_price_tax + shipping_tax + shipping_tax_discount + our_price_tax_disc
+neto = base + iva + amazon_fees + marketplace_vat_principal + marketplace_vat_shipping = item_amount
 ```
+`amazon_fees` ya incluye `amazon_for_all_fee` y `shipping_hb`. Nunca sumar `promo_rebates` con `shipping_discount`, ni `total_amount` entre filas.
 
-## Facturación general (todos los marketplaces excepto ML) — patrón *push*
+**Deduplicación:** clave de negocio por pieza; gana la fila liberada más reciente. `DEFERRED` solo si la pieza no tiene liberada. Las devoluciones (`Refund`) tienen el mismo ciclo.
 
-`processes/.../odoo/facturacion_automatica_1a1.py` (~1,156 líneas). Fuente de verdad: **Odoo**. Recorre día por día `sale.order` con `invoice_status='to invoice'` y `locked=True`, agrupa por `team_id`, y emite CFDI 1 a 1 a público en general.
+**Scripts de un solo uso** (`test/.../amazon/`):
+- `12`: saneamiento de octubre.
+- `13`: centavos; 754 cerrados.
+- `000`: doble CFDI B2B. Resultado: 240 DOBLE_CFDI ($552K), 151 SOLO_AMAZON y 137 vinculadas (abr–nov).
+- `14`: base histórica ene–sep. Lee `odoo_new_sale_order_live`. Resultado: 4,960 ventas cobradas sin factura; 2,708 de Odoo 15, de las que 1,603 son del 1–16 de abril y requieren confirmación en Odoo 15.
 
-Hoy incluye Amazon. **Filtra manualmente por si tiene o no OUT** (línea ~800: `if not is_shipping and qty_delivered < qty_ordered` → `IGNORED_NO_STOCK`). La política de facturación en Odoo ya es *por cantidades ordenadas*.
+**Pendiente (de Finanzas, no de desarrollo):**
+- Cancelar los 240 doble CFDI.
+- Corregir la CxC de los `CXC_INCORRECTA`.
+- Cancelar los cobros colgados en facturas canceladas (como PAMZ/2026/00710).
+- Decidir el histórico ene–sep con Jero: reabrir periodos; B2B con la fecha de su CFDI; B2C con CFDI del día.
+- Confirmar si un cron de Odoo cancela el asiento tras la cancelación SAT.
 
-Ya excluye: `Team_Walmart`, `Salderos / Facebook`, y ML posterior al `cutoff_ml = 2026-06-01`.
-
-## ⚠️ Incidente del 26-jul-2026 — origen de todos los blindajes
-
-Dos ejecuciones concurrentes en Kestra se traslaparon 1h51m. Cada una tomó su propio snapshot de facturas existentes y ninguna vio a la otra: **549 órdenes con doble CFDI timbrado** (1,110 folios consecutivos).
-
-Las cinco defensas que **todo script de facturación debe llevar**:
-
-1. **Exclusión mutua en Kestra** — `concurrency: limit 1, behavior: FAIL`. Es la defensa principal y vive en el YAML.
-2. **Re-validación antes del `create`, FAIL-CLOSED** — se vuelve a preguntar a Odoo justo antes de crear. Si la consulta falla, **no se crea**.
-3. **Clave de idempotencia** — `account.move.ref = 'AUTOINV:<SO>'`. **Prefijo compartido entre todos los scripts a propósito**: así cada uno ve las facturas de los otros y ninguno puede duplicar. Cambiarlo reintroduce el bug.
-4. **Retry consciente del método** — solo se reintentan **lecturas**. Un 502 en una escritura no dice si Odoo hizo commit: se lanza `OdooWriteUncertain` y se reconcilia **leyendo**, nunca reintentando.
-5. **Detección real de duplicados** — `{origen: [facturas]}`, no `{origen: factura}`: un dict no puede guardar dos valores con la misma llave y una factura desaparecía en silencio.
+Todo eso está documentado y no se vuelve a desarrollar sin decisión.
 
 ---
 
-# 5. Estado por marketplace
+# 11. Siguiente frente A — Notas de crédito de Amazon
 
-| Marketplace | Billing | Cobros | Notas de crédito |
-|---|---|---|---|
-| **Mercado Libre** | ✅ producción (pull) | ✅ producción | ⏸️ pausa técnica: no se pueden extraer los XML de ML |
-| **Amazon** | 🔨 escrito, en pruebas | 🔨 escrito, en pruebas | 📋 analizado, sin código |
-| **Walmart / Coppel / TikTok / Elektra** | vía 1a1 genérico | ❌ | 📋 `.html` de Finanzas sin analizar |
+Ruta y análisis previo: `test/.../amazon/ESTADO_Y_RUTA_NOTAS_CREDITO.md`, `README_AMAZON.md` (§ Para notas de crédito) y `test/financial/credit_note_refund_processes/amazon/flujo_devoluciones_amazon.html` (Finanzas). Rama nueva desde `main`.
 
----
+**Tipos de Finanzas:**
 
-# 6. Amazon — el frente activo
-
-## Fuentes de datos
-
-| Tabla | Contenido | Clave |
+| Tipo | Situación | Costo |
 |---|---|---|
-| `somos_reyes.amz_transactions` | Cabecera financiera (SP-API Finances `2024-06-19/transactions`) | PK **incluye `transaction_status`** |
-| `somos_reyes.amz_transaction_items` | Detalle por SKU — **aquí viven todos los importes** | `order_adjustment_item_id` |
-| `somos_reyes.amz_b2b_invoices` | CFDI emitidos por Amazon Business | `receipt_type`, `uuid`, `related_cfdi_relation_type` |
-| `somos_reyes.amz_settlement_report` | `settlement_start/end_date`, **`deposit_date`** | `settlement_id` |
-| `somos_reyes.amazon_orders` | Órdenes SP-API. Aporta `IsBusinessOrder` | ⚠️ **N filas por orden** |
-| `somos_reyes.odoo_master_txns_c` | Puente `marketplace_order_id` → SO de Odoo | |
-| `somos_reyes.amz_tokens` | `access_token` de SP-API | |
-
-ETL: `test/.../amazon/amz_transactions.py`. **Al día** (latencia de minutos).
-
-## Los tres defectos del reporte BI 3.0
-
-El reporte de Finanzas (`AMZ_facturacion.sql`) traía:
-
-1. **Fan-out por `amazon_orders`** — el JOIN entraba sin deduplicar y todos los `SUM()` se multiplicaban. **49 de 94 ventas al doble.** Ejemplo: orden `701-8131997-1237840`, reporte `product_charges = 2782.82` / qty 2, real `1391.41` / qty 1.
-2. **Doble conteo de descuentos** — `promo_rebates` es el roll-up y `shipping_discount` el detalle del mismo descuento. Sumar ambos rompe el 16% exacto de IVA.
-3. **Duplicidad por `transaction_status`** — la PK lo incluye, así que la misma venta coexiste como `DEFERRED` y luego `RELEASED`/`DEFERRED_RELEASED`.
-
-Corregido en `AMZ_facturacion_corregida.sql`.
-
-## Fórmula de facturación — validada al centavo
-
-```
-cfdi_base  = product_charges + shipping + shipping_discount + our_price_discount
-cfdi_iva   = our_price_tax + shipping_tax + shipping_tax_discount + our_price_tax_disc
-cfdi_total = cfdi_base + cfdi_iva
-
-neto = cfdi_total + amazon_fees + marketplace_vat_principal
-                  + marketplace_vat_shipping
-     = item_amount por pieza  ·  = total_amount   (cabecera de amz_transactions)
-```
-
-**`amazon_fees` ya incluye `amazon_for_all_fee` y `shipping_hb`.** Sumarlos aparte los cuenta dos veces (24% de las piezas los traen). Con solo `amazon_fees` el 99.7% de las piezas cuadra contra `item_amount`. `marketplace_vat_*` es el IVA que retiene Amazon (50% del IVA del CFDI).
-
-Verificación (`702-6941044-9293042`, envío gratis promocional):
-`1555.21 + 50.86 − 50.86 = 1555.21` base · `248.83 + 8.14 − 8.14 = 248.83` IVA (16% exacto) · `1804.04 − 444.45 − 124.42 = 1235.17 = total_amount` ✓
-
-**Nunca** sumar `promo_rebates` junto con `shipping_discount`. **Nunca** sumar `total_amount` entre filas (es de cabecera, se repite por ítem).
-
-## La regla de deduplicación
-
-**La clave única de negocio es `order_adjustment_item_id`**, quedándose con el `posted_date` más reciente.
-
-Caso `702-2265086-8559438` (2 piezas), ya filtrando `DEFERRED`, devuelve 3 filas:
-
-```
-165346845825161  settlement 27044880571  DEFERRED_RELEASED  posted 07-24  depósito 07-30
-164910950935841  settlement 27044880571  DEFERRED_RELEASED  posted 07-27  depósito 07-30
-165346845825161  settlement 27172333181  RELEASED           posted 07-30  depósito 08-06
-^^^ misma pieza, re-publicada en otro settlement
-```
-
-Solo hay 2 piezas. Lo confirma `amz_b2b_invoices`: Amazon emitió dos CFDI de $1,379.00. Sin deduplicar, esa pieza se cobra dos veces.
-
-> ⚠️ **Sin validar contra banco.** "Gana el `posted_date` más reciente" es nuestra inferencia, Amazon no lo documenta. Se pidieron a Finanzas los estados de cuenta del **30-jul** (`27044880571`) y **06-ago** (`27172333181`). **Al 10-sep-2026 sin respuesta.**
-
-## Cobros parciales — corrige un supuesto de Finanzas
-
-El Paso 6 del flujo dice *"el cobro se aplica por el total de la factura, saldando la CxC por completo"*, asumiendo que cada factura pertenece a un solo settlement.
-
-**Falso.** La unidad que Amazon libera es la **pieza**, no la orden. En el ejemplo, las 2 piezas caen en settlements distintos: $1,379.00 el 30-jul y $1,379.00 el 06-ago sobre una factura de $2,758.00.
-
-Consecuencias que Finanzas debe aceptar: una factura puede estar **parcialmente pagada** durante semanas (no es error); un corte de mes puede mostrar saldos parciales en `105.01.006` (no es descuadre); la conciliación va contra la **transitoria**, no factura por factura.
-
-## Bloqueo abierto: sin XML en B2B
-
-Amazon **no expone el XML** del CFDI de Amazon Business. `amz_b2b_invoices` solo trae metadata. Podemos sellar `l10n_mx_edi_cfdi_uuid` y `narration`, pero **no** crear `ir.attachment` + `account.edi.document` como hace `02_loader_ml_billing.py`. Es el mismo muro que tiene ML en notas de crédito.
-
-## Requerimientos de Finanzas para Amazon
-
-1. **Excluir B2B** de nuestra emisión → en su lugar, **jalar el CFDI de Amazon a Odoo**
-2. **Eliminar la restricción de OUT** → facturar sobre cantidad pedida; la contrapartida cae en Mercancía Facturada No Enviada (si operaciones deja órdenes sin surtir, esa cuenta se infla — **es la señal que Finanzas quiere**)
-3. Factura individual por operación (ya se hacía)
-4. Verificar que la SO no esté ya facturada (Odoo **y** autofacturador de Amazon)
-5. Periodo de gracia: **5 días** para que el cliente autofacture con su RFC
-
----
-
-# 7. Amazon — scripts
-
-Todos en `test/financial/billing_processes/amazon/`.
-
-**Producción (3-nov-2026):** en `processes/wonderbrands/financial/billing_processes/amazon/` solo van `_amz_common`, `00_amz_precheck_prod` (solo lectura), `01`, `02`, `03`, `11` (copias **idénticas** de `test/`) y `README_AMAZON.md` (el flujo completo, estados y contexto para notas de crédito). Flujos: `amz_billing_payments_flow.yml` (00→01→02→03, **02:30 y 15:00 CDMX**, encendido; `start_date` vacío = día 1 del mes anterior, así cada corrida relee el mes anterior y la del día 1 es el cierre) y `amz_cierre_mercFacNoEnv_flow.yml` (11 + correo, **día 2 09:00**, encendido). Cobros `HISTORICO_CONTABILIDAD` en `mkp_payments_prod`: depósito del 23-sep (settlement 27581522881, 1,586 cobros de septiembre) que cierra Contabilidad; marcados el 3-nov-2026. Horarios elegidos en los huecos de ML (00/06/12/18), 1a1 (04:30/19:30) y housekeeping (03:15). Todo cambio a un script va en las dos copias.
-
-| Script | Función | Estado |
-|---|---|---|
-| `_amz_common.py` | Config, interruptor `ENTORNO`, `OdooModelProxy`, cuentas | ✅ |
-| `01_amz_billing.py` | **Miner + loader de facturación** (B2B y B2C) | 🔨 pruebas |
-| `02_miner_amz_payments.py` | **Miner** de cobros: settlements → `mkp_payments_*` | 🔨 pruebas |
-| `03_loader_amz_payments.py` | **Loader** de cobros: aplica pagos en Odoo | 🔨 pruebas |
-| `000_historical_billing_back_analysis.py` | Detecta doble CFDI (Amazon + nuestro). Solo lectura | ✅ |
-| `05_amz_orders_control.py` | Control cruzado Odoo ↔ Amazon ↔ facturas. Solo alerta | ✅ |
-| `06_reset_lote_test.py` | Libera órdenes en el espejo (solo staging). `RESET_ORDENES` = lista explícita | 🔨 pruebas |
-| `09_reporte_lote_finanzas.py` | Excel del lote para Finanzas (modo settlement con `AMZ_SETTLEMENT_ID`) | ✅ |
-| `10_conciliar_205.py` | Rehace la conciliación 205.06.003 de facturas ya creadas | ✅ |
-| `11_ajuste_cogs_205.py` | Ajuste mensual al COGS por diferencia de costeo factura vs salida | ✅ |
-| `12_sanear_facturas_amazon.py` | Saneamiento único: B2C sin timbre y B2C de octubre con fecha de noviembre | 🔨 corriendo (2-nov) |
-| `13_cerrar_centavos_amazon.py` | Cierra contra 704.23.001 los ±0.01 que dejó el 12 en la 105.01.006 (factura con saldo o cobro sobrante) | 🔨 sin correr |
-| `AMZ_facturacion_corregida.sql` | Reporte BI 3.0 con los 3 fixes | ✅ |
-| `04_amz_billing_test_batch.py` | **DEPRECADO** — absorbido por `01` | ⛔ |
-| `DDL_amz_tables.sql` | **DEPRECADO** — se usan las tablas `mkp_*` | ⛔ |
-| `PATCH_1a1_excluir_amazon.md` | Sacar Amazon del 1a1 general | 📋 sin aplicar |
-| `REUNION_FINANZAS_amazon.md` | Guion de presentación | ✅ |
-| `ESTADO_Y_RUTA_NOTAS_CREDITO.md` | Estado + ruta de NC | ✅ |
-
-**Ojo con la numeración:** `02` es el **miner** y `03` el **loader**, igual que en ML (`03_miner_ml_payments` → `04_loader_ml_payments`).
-
-## Estados en `mkp_billing_*` para Amazon
-
-```
-PENDING_B2B_LINK       Amazon ya facturó; falta vincular en Odoo
-PENDING_WB_INVOICE     nos toca emitir el CFDI
-PROCESSING             tomada por una corrida (candado)
-ODOO_B2B_LINKED        factura creada con el UUID de Amazon sellado
-ODOO_INVOICED          CFDI emitido por WB
-ALREADY_ODOO_INVOICED  ya tenía factura viva en Odoo (incluye factura global)
-B2B_FACTURADA_PG       B2B con factura viva a público general: anularla antes de vincular (se reevalúa)
-SKIPPED_GRACE          dentro del periodo de gracia
-SO_CANCELLED           ya no se produce: la SO cancelada SE FACTURA (NC por devoluciones)
-SO_DRAFT               SO en borrador que Odoo no dejó confirmar (la que sí, se confirma y factura)
-NO_SO_IN_ODOO          sin SO cruzada → solo alerta
-ENVIO_SIN_CONFIRMAR    OrderTotal > SO y ninguna segunda fuente confirma envío (se reevalúa)
-ERROR                  fallo recuperable
-```
-
-`status` es `varchar(40)` en staging y prod. Staging era `varchar(20)` y truncaba `ALREADY_ODOO_INVOICED` (corregido el 28-oct-2026).
-
-## Reglas del correo de Finanzas del 28-oct-2026 (flujo v2)
-
-- **Toda venta que Amazon cobró se factura.** SO en borrador → `action_confirm` y factura. SO cancelada → se factura sin reabrirla (la NC sale por devoluciones). Las excepciones viejas (`SO_DRAFT`, `SO_CANCELLED`, `B2B_NO_RECEPTOR`, `B2B_FACTURADA_PG`) se reevalúan en cada corrida.
-- **Factura global:** `facturas_existentes()` también lee `sale.order.invoice_ids`; una SO dentro de una global (invoice_origin con comas) no se refactura.
-- **Cliente B2B nuevo:** se crea con el RFC del CFDI y teléfono/correo genéricos de Yuju (`11111` / `market@somos-reyes.com`).
-- **205.06.003 (Mercancías facturadas - no enviadas):** `conciliar_salida()` en 01, después de publicar: rompe la conciliación de la salida con facturas canceladas o revertidas, concilia la factura vieja con su NC si la hubo, y concilia la vigente con la salida (por producto; kits por importe). Con OUT posterior, Odoo concilia solo al validar la salida. Si el costo promedio cambió entre factura y salida queda un residuo en la 205.06.003 (probado: +10% → 106.14).
-- **Primera corrida en producción = un settlement completo:** `AMZ_SETTLEMENT_ID` en 01, 02 y 09 (`AMZ_ORDER_IDS` agrega órdenes sueltas, solo pruebas).
-- **XML-RPC:** `reconcile` y `remove_move_reconcile` no devuelven nada; hacen el trabajo y fallan al responder ("cannot marshal None"). Usar `ejecutar_sin_retorno()` y confirmar leyendo.
-
-## Reglas del correo de Finanzas del 28-oct-2026, segundo
-
-- **Kits en SO cancelada:** la línea del kit se crea **sin** `sale_line_ids` para que Odoo tome el costo del kit (ligada, el costo sale 0 porque los movimientos están cancelados), y **después de publicar** se vuelve a ligar (`religar_kits`): el asiento no cambia y la SO ve su factura. En SO no cancelada se deja ligada (costo exacto de los componentes). La 205.06.003 de una SO cancelada se concilia con la NC, no con un OUT.
-- **Kit con lista de materiales en 0** (TOLIXKIT#4-CLA1ROJ / CLA1BLA piden 0 sillas → costo del kit 0): la factura sale sin costo; 01 lo avisa (`kit_sin_costo`) y el cierre mensual asienta el costo de lo que salió. Corregir la lista es de Catálogo.
-- **Envío:** Yuju no pone C-ENVIO en la SO. Fuente 1: campos de envío del settlement. Si no vienen, `OrderTotal − SO` es envío solo si lo confirma el **depósito** (`item_amount − venta − comisiones − IVA retenido = envío × (1 − 0.08/1.16)`) o la **API** (`getOrderItems` ShippingPrice + ShippingTax). Sin confirmación → `ENVIO_SIN_CONFIRMAR`. La cuenta 401.01.002 la pone el producto C-ENVIO (no se fuerza en el script).
-- **Factura ya emitida sin envío** (1a1): factura aparte `AUTOINV:<SO>:ENVIO` con solo C-ENVIO. 01 no la cuenta como duplicado; 03 reparte el cobro entre las dos y la regla de promoción usa la suma.
-- **Envío fuera de los campos del settlement:** 02 lo suma al cobro (3 órdenes sep-oct, todas FBA de $59).
-- **B2C:** el centavo se ajusta para que la factura sea igual a OrderTotal (mismo mecanismo que B2B).
-- **Cierre mensual de la 205.06.003** (`11_ajuste_cogs_205.py`): SO de Amazon con cada línea entregada y facturada completa (`qty_delivered`/`qty_invoiced` por línea; `delivery_status` no basta con devoluciones), factura propia y salida en la 205.06.003. Residuo → 501.01.001 con conciliación completa. Dos etiquetas: "…diferencia de costeo de producto entre facturación y salida" y "…diferencia entre kit facturado y componentes despachados" (incluye factura de kit sin costo). Reporte `reporte_kits_<mes>.csv`: diferencia de costo / de cantidad / factura sin costo. **No ajusta** (solo cuenta): devoluciones pendientes de NC, facturas globales, y SO cuya salida no está en la 205.06.003 (hueco histórico del 1a1: ~855 SO).
-- **Redondeo:** 704.23.001 confirmada para producción. **B2B ya facturada a público general:** cancelación SAT motivo 02.
-
-## Reglas del 2-nov-2026 (primeras corridas en producción)
-
-- **Sin ajuste de centavo en B2C.** Editar la línea de IVA hacía que el PAC rechazara el CFDI (CFDI40119, SO10362958): Odoo arma el XML con el IVA recalculado por línea. El centavo contra el OrderTotal lo absorbe 03 en 704.23.001. En B2B el ajuste sigue (no timbramos).
-- **La venta se factura con fecha de su mes.** En los primeros `AMZ_DIAS_CIERRE_MES` días (default 1, máximo 3 por las 72 h del SAT) la B2C cuya SO es de un mes anterior lleva fecha del último día de ese mes, sin gracia, y el miner lee también las filas `DEFERRED` (Amazon cobró y no ha liberado; al 2-nov eran 802 órdenes de octubre). La fila `DEFERRED` solo entra si la pieza no tiene fila liberada: en 18,414 piezas las dos comparten `posted_date`. Importes `DEFERRED` vs liberada: 16,496 piezas iguales al centavo. El mes de la venta es `date_order` de la SO (y `PurchaseDate` en el miner), en hora de CDMX; la hora sale de UTC, no del servidor.
-- **Registro del timbrado.** `cfdi_uuid` de una B2C es nuestro UUID; si el PAC rechaza, `error_log` empieza con `TIMBRADO_FALLIDO`. Todas las facturas de la orden van en `raw_json.facturas_odoo`.
-- **Saneamiento único** de lo facturado del 30-oct al 2-nov: `12_sanear_facturas_amazon.py` (solo en `test/`). A = publicada sin timbre (se corrige y timbra la misma). B = timbrada con fecha de noviembre siendo venta de octubre (cancelación SAT motivo 02 + factura nueva por `procesar()`). Estado temporal `SANEO_CANCELACION`.
-
-## `payment_id` compuesto en cobros
-
-`uk_payment (marketplace, payment_id)` **no incluye** `mkp_order_id`. En ML basta porque `payment_id` es el pago de Mercado Pago (uno por orden). En Amazon el identificador del depósito es el `settlement_id` y **un settlement agrupa cientos de órdenes**: guardar solo el settlement haría que únicamente la primera orden entrara.
-
-```python
-payment_id = f"{settlement_id}:{order_id}"   # '27172333181:702-2265086-8559438'
-```
-
-Separador `:` porque el `order_id` ya contiene guiones. Se recupera con `split(':', 1)[0]`.
-
----
-
-# 8. Reglas de negocio transversales
-
-- **Yuju crea las Sale Orders.** Ningún script nuestro hace `create` de `sale.order`. Si una orden de Amazon no existe en Odoo → **solo alertar**.
-- **Zona horaria:** `DATE_SUB(posted_date, INTERVAL 6 HOUR)` = UTC → CDMX. México no aplica horario de verano desde 2022, así que −6 es fijo todo el año.
-- **`AMZ_START_DATE`:** contención contra facturación masiva retroactiva. Al quitar la restricción de OUT, todo el rezago se vuelve elegible de golpe. Sin definir con Finanzas.
-- **Fronteras de día exclusivas** (`<`, no `<=`): con `<=` una orden en el límite se procesa en dos lotes.
-- **Timbrado apagado en pruebas.** Publicar la factura ya genera el asiento, que es lo que Finanzas revisa. No se timbra contra el PAC desde el espejo.
-
----
-
-# 9. Notas de crédito — ruta
-
-Tres tipos según Finanzas:
-
-| Tipo | Situación | COGS |
-|---|---|---|
-| **A** | Cancelación antes de despacho | Revierte Mercancía Facturada No Enviada |
-| **B** | Devolución post-despacho, el producto retorna | Devoluciones en Tránsito `107.06.001` |
+| **A** | Cancelada antes del envío | Revierte la 205.06.003 (se concilia con la NC) |
+| **B** | Devuelta, el producto regresa | 107.06.001 |
 | **C** | Bonificación sin retorno | Sin movimiento |
 
-Ingresos igual en los tres: `402-001-001` y `208-001-001` contra `105.01.006`.
+Ingresos igual en los tres: 402 + 208.01.001 contra 105.01.006.
 
-**Clasificación propuesta** (pendiente de confirmar con Finanzas):
+**Lo que ya sabemos:**
+- **Fuente:** `amz_transactions` con `description='Refund'`, deduplicado igual que las ventas. `DisbursementOnlyRefund` es tipo C. `LabmanLabelRefund` es reembolso de guía: tratamiento pendiente con Finanzas.
+- **B2B:** Amazon emite su CFDI de egreso (`amz_b2b_invoices.receipt_type='E'`, relación 03). Se replica sin timbrar, igual que el de ingreso.
+- **B2C:** la NC se timbra con `reversed_entry_id` y `l10n_mx_edi_cfdi_origin` relación 01. La factura se encuentra por `ref AUTOINV:<SO>`, `cfdi_uuid` o `raw_json.facturas_odoo`. Si la orden está en `ALREADY_ODOO_INVOICED`, la factura es del 1a1 o una global.
+- **Las SO canceladas que 01 facturó esperan su NC tipo A.** En el histórico hay 705 SO canceladas y devueltas (base del 14).
+- **Cobro:** el reembolso llega restado en el settlement. Hoy 02 solo mina `Order Payment`, así que la 102.02.008 no cuadra contra el depósito hasta que se apliquen las devoluciones. Propuesta: conciliar la NC contra la 102.02.008, no deshacer y rehacer pagos.
+- **Clasificación A/B propuesta:** sin salida `done` = A; con salida = B. **Riesgo FBA:** 89 de 100 filas de la muestra son AFN; validar cómo registra Odoo la salida FBA.
 
-```
-description = 'DisbursementOnlyRefund'      → Tipo C
-sin stock.picking de salida en 'done'       → Tipo A
-con salida en 'done'                        → Tipo B
-```
+**Fases:**
+1. Miner de devoluciones por pieza.
+2. Perfilado de egresos B2B.
+3. Clasificador A/B/C.
+4. Loader de NC con idempotencia `AUTONC:`.
+5. Cobro.
 
-⚠️ **Riesgo FBA:** 89 de 100 filas de la muestra son AFN (FBA). Si Odoo no registra la salida igual que en MFN, la regla A/B necesita otro discriminador.
+Las fases 1 y 2 no dependen de Finanzas.
 
-**Fases:** 1) miner de devoluciones + granularidad por pieza · 2) perfilado de NC B2B en `amz_b2b_invoices` (`receipt_type`, `related_cfdi_relation_type`) · 3) clasificador A/B/C · 4) loader de NC (`move_type='out_refund'`, `reversed_entry_id`, `l10n_mx_edi_cfdi_origin` relación `01`, idempotencia `AUTONC:<order_id>:<item_id>`) · 5) reverso de cobro.
-
-Las fases 1 y 2 **no dependen de ninguna decisión de Finanzas**.
-
-**Sobre el reverso de cobro (fase 5):** el documento pide romper la aplicación del cobro. Con cobros parciales de varios settlements eso implica deshacer y rehacer varios pagos — frágil y difícil de auditar. Propuesta alternativa: conciliar la NC directamente contra `102.02.008`, que refleja el movimiento real del dinero.
-
-**Casos no contemplados en el `.md` de Finanzas:**
-
-1. `LabmanLabelRefund` — 4 de 100 filas. Reembolso de guía, no de producto. ¿NC o ajuste de gasto?
-2. Comisiones por devolución (`refund_commission*`) — sin tratamiento definido
-3. Devolución de mes cerrado
-4. Devolución sin venta previa
+**Preguntas abiertas para Finanzas:** `LabmanLabelRefund`; comisiones por devolución (`refund_commission*`); devolución de mes cerrado; devolución sin venta previa; reglas A/B/C.
 
 ---
 
-# 10. Pendientes bloqueantes
+# 12. Siguiente frente B — Facturación del resto de marketplaces
+
+**Hoy los factura el 1a1** a público general con restricción de OUT, salvo Walmart (ver abajo). El objetivo es llevarlos al modelo de Amazon según los `.html` de Finanzas. Por marketplace, en su rama:
+
+1. **Leer el `.html` de Finanzas** y reportar huecos: B2B/autofactura, envío, promociones, OUT, gracia.
+2. **Identificar la fuente de cobro** y validarla contra el depósito antes de diseñar (regla 6).
+3. **Perfilar el estado real en Odoo:** facturadas y por facturar por equipo (`odoo_new_sale_order_live`), quién factura hoy, globales.
+4. **Proponer** estados, mapeo a Odoo y cuentas; luego reutilizar `_amz_common` como plantilla (conmutador `ENTORNO`, `OdooModelProxy`, blindajes).
+5. **Al activar un flujo propio, sacar ese equipo del 1a1 en el mismo release** (como se hizo con Amazon el 1-oct). Entre los dos pasos nadie lo factura.
+
+| Marketplace | Docs de Finanzas (`test/financial/…`) | Datos en `somos_reyes` |
+|---|---|---|
+| **Walmart** | `billing_processes/walmart/6. flujo_facturacion_walmart.html`, `credit_note_refund_processes/walmart/7. …` | La fuente real es el CSV de Finanzas (reporte interno + Fénix). En MySQL solo hay `walmart_order_line`, `walmart_full(_hist)` y `pick_out_walmart`, sin transacciones financieras |
+| **TikTok** | `tiktok/10. …facturacion…`, `tiktok/11. …devoluciones…` | `tiktok_orders`, `tiktok_order_line`, `tiktok_order_transactions`, `tiktok_statements`, `tiktok_statement_transactions`, `tiktok_financial_transactions_master`, `tiktok_returns`, `tiktok_shop_tokens` (al día) |
+| **Coppel** | `coppel/8. …facturacion…`, `coppel/9. …devoluciones…` | `coppel_orders`, `coppel_order_line`, `coppel_financial_transactions_master`, `coppel_refunds`, `coppel_shipments` (al día) |
+| **Piso / Mayoreo / Sitioweb** | sin documento | solo Odoo (`odoo_new_pos_order` para piso) |
+| **Elektra / Liverpool** | sin documento | catálogos y envíos; Liverpool con órdenes históricas |
+
+**Walmart: proceso actual, manual, desde hace meses** (se automatiza en una sesión aparte):
+- **Entrada:** CSV que entrega Finanzas. Sale de cruzar un reporte interno de Finanzas con el reporte de **Fénix**, la plataforma de Walmart. No sale de MySQL ni de una API.
+- **Facturación:** un proceso parecido al 1a1, que crea en Odoo una factura por orden. Hay dos tipos:
+  - **Las timbra WB:** se emiten y timbran normal.
+  - **Las timbra Walmart:** la factura se crea en Odoo **sin timbrar**. Finanzas descarga los XML del SAT y se cargan a esas facturas (patrón *pull*, como ML y Amazon B2B).
+- Por eso el 1a1 excluye `Team_Walmart`.
+
+**Preguntas a resolver antes de empezar:**
+- **Salderos:** ¿debe excluirse? El nombre del filtro del 1a1 no coincide.
+- **Muestras:** ¿se factura?
+- **Piso:** ¿es POS?
+- **Mayoreo y Sitioweb:** ¿siguen en el 1a1 o pasan al modelo nuevo?
+
+---
+
+# 13. Pendientes
 
 **Finanzas:**
-
-- 🔴 Estados de cuenta del 30-jul (`27044880571`) y 06-ago (`27172333181`) — sin esto la deduplicación queda sobre una suposición
-- 🔴 `AMZ_START_DATE`
-- 🟡 Aceptar cobros parciales y corregir el Paso 6 de su documento
-- 🟡 Tratamiento de `LabmanLabelRefund` y de las comisiones por devolución
-- 🟡 Reglas de clasificación A/B/C
-- 🟡 Criterio de corrección para el doble CFDI histórico (`corregir_caso()` está en `pass`)
+- 🔴 Histórico Amazon ene–sep: llamada con Jero sobre la base del script 14.
+- 🔴 Cancelar los 240 doble CFDI de Amazon Business.
+- 🟡 Reglas A/B/C, `LabmanLabelRefund` y comisiones por devolución.
+- 🟡 Estados de cuenta del 30-jul (`27044880571`) y 06-ago (`27172333181`), para validar la deduplicación contra banco.
 
 **Técnicos:**
-
-- 🔴 Aplicar `PATCH_1a1_excluir_amazon.md` y desplegar en el mismo release que activar `01_amz_billing.py` en Kestra (entre ambos pasos nadie factura Amazon)
-- 🟡 Campos personalizados en `account.move` (requiere admin de Odoo)
-- 🟡 Índices: `amz_transaction_items(order_adjustment_item_id)` y `amz_transactions(description, transaction_status, posted_date)` — sin el primero, el `GROUP BY` de deduplicación es table scan
-- 🟡 Sin resolver: XML del CFDI de Amazon Business
+- 🟡 Choques de horario con ML Oficiales (§5).
+- 🟡 Campos personalizados en `account.move` (admin de Odoo).
+- 🟡 Índices: `amz_transactions(order_id)`, `amz_transaction_items(order_adjustment_item_id)`.
+- 🟡 Acceso de lectura a Odoo 15 para el histórico.
+- ⏸️ NC de Mercado Libre (sin XML).
+- ⏸️ Anular automáticamente las `B2B_FACTURADA_PG`; IVA 209 → 208 (pospuesto por Finanzas).
 
 ---
 
-# 11. Verificación de código
-
-El sandbox Linux (`mcp__workspace__bash`) puede estar caído. Cuando lo esté, dilo y ofrece el comando para que yo lo corra en PowerShell:
+# 14. Verificación de código
 
 ```powershell
 cd "...\test\financial\billing_processes\amazon"
-python -m py_compile _amz_common.py 01_amz_billing.py 02_miner_amz_payments.py 03_loader_amz_payments.py
+..\..\..\..\.venv\Scripts\python.exe -m py_compile _amz_common.py 01_amz_billing.py 02_miner_amz_payments.py 03_loader_amz_payments.py
 ```
+
+Al pasar a producción, comparar las dos copias (`diff -q test/... processes/...`).
 
 **No afirmes que un script está verificado si no lo pudiste ejecutar.** Di qué revisaste y qué no.
