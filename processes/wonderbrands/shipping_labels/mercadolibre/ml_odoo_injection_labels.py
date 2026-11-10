@@ -192,7 +192,7 @@ def process_fase_c():
 
     #ordenes listas para procesar (se incluye zpl_data para reintentar desde BD si Odoo falló antes)
     query_pendientes = """
-        SELECT id, marketplace_reference, ml_shipping_id, odoo_carrier_ref, odoo_carrier_id, zpl_data
+        SELECT id, marketplace_reference, ml_shipping_id, odoo_carrier_ref, odoo_carrier_id, ml_tracking_method, zpl_data
         FROM tools.ml_api_etl_orders 
         WHERE seller_id = %s AND print_status = 'READY_TO_PRINT' AND processed_successfully = 0
     """
@@ -300,7 +300,9 @@ def process_fase_c():
             #Insertar mensaje en el Chatter
             cdmx_time = (datetime.now() - timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
             models.execute_kw(ODOO_DB, uid, ODOO_PWD, 'sale.order', 'message_post', [[so_id]],
-                              {'body': f'{cdmx_time}. Se insertó la guía de Mercado Libre ({SELLER_NAME}) extraída vía API / KESTRA.'})
+                              {'body': f'{cdmx_time}. Se insertó la guía de Mercado Libre ({SELLER_NAME}) '
+                                      f'Logistic type: {c_ref}, Carrier guía: {order.get("ml_tracking_method") or "N/D"} '
+                                      f'extraída vía API / KESTRA.'})
 
             #Actualizar Base de Datos como Éxito (Guardando el ZPL raw y marcando como procesado)
             cursor.execute("""
