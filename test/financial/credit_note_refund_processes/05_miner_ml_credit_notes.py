@@ -87,6 +87,7 @@ LOCAL_RUN               = "both"
 LOCAL_ORDER_IDS         = "2000018238217954,2000016723575980,2000016949680478,2000017527328146"
 # Tope de órdenes que se CONSULTAN en ML en esta corrida (llenar la cola no cuenta)
 LOCAL_MAX_CALLS_PER_RUN = 100000
+
 # En Kestra no aplica nada de este bloque: el flujo manda PREFLIGHT_ONLY, SCAN_MODE,
 # ONLY_ORDER_IDS y MAX_CALLS_PER_RUN como variables de entorno, y esas ganan.
 # ══════════════════════════════════════════════════════════════
@@ -150,7 +151,10 @@ MAX_CONSECUTIVE_429 = int(os.getenv("MAX_CONSECUTIVE_429", "5"))
 MAX_ANOMALY_LOGS    = int(os.getenv("MAX_ANOMALY_LOGS", "50"))
 
 DEVOLUTION_URL = ("https://api.mercadolibre.com/invoices/io/documents/stream/order/"
-                  "{order_id}/xml?transaction_type=devolution")
+                  "{order_id}/xml?transaction_type={transaction_type}")
+# Reventa (static_tags 'meli_resale'): ML factura a DeRemate y su NC se pide con
+# 'resale_devolution' (con 'devolution' responde 404). Confirmado por API el 9-nov.
+RESALE_TRANSACTION_TYPE = "resale_devolution"
 NS = {
     'cfdi': 'http://www.sat.gob.mx/cfd/4',
     'tfd':  'http://www.sat.gob.mx/TimbreFiscalDigital'
@@ -276,7 +280,11 @@ def classify_credit_note(nc, invoice_uuid, invoice_total, cumulative_total):
         return 'MANUAL_REVIEW', nc_scope, f"TipoRelacion={nc['tipo_relacion']} (se esperaba 01)"
     if nc['moneda'] != 'MXN':
         return 'MANUAL_REVIEW', nc_scope, f"Moneda={nc['moneda']}"
-    if not invoice_uuid or nc['related_uuids'][0] != invoice_uuid.strip().upper():
+    if not invoice_uuid:
+        # Sin factura en mkp_billing_prod (p.ej. Reventa, cargada a Odoo por otro proceso):
+        # el 06 la valida contra Odoo por el UUID que relaciona la NC.
+        return 'PENDING', None, "Sin factura en mkp_billing_prod: se valida contra Odoo en el 06"
+    if nc['related_uuids'][0] != invoice_uuid.strip().upper():
         return 'UUID_MISMATCH', nc_scope, (f"La NC relaciona {nc['related_uuids'][0]}; "
                                            f"la factura en mkp_billing_prod es {invoice_uuid}")
     if invoice_total <= 0:
@@ -308,9 +316,10 @@ def next_check_after_miss(signal_source, scan_status, reference_date, now):
     return scan_status, now + timedelta(days=interval)
 
 
-def get_devolution_xml(session, order_id, state):
+def get_devolution_xml(session, order_id, state, resale_orders=frozenset()):
     """GET al endpoint de devolución con reintentos para red/5xx y backoff para 429."""
-    url = DEVOLUTION_URL.format(order_id=order_id)
+    tt = RESALE_TRANSACTION_TYPE if str(order_id) in resale_orders else "devolution"
+    url = DEVOLUTION_URL.format(order_id=order_id, transaction_type=tt)
     r = None
     for attempt in range(1, MAX_HTTP_RETRIES + 1):
         try:
@@ -710,6 +719,12 @@ def extract_ml_credit_notes():
         seeded = seed_scan_queue(cursor, db)
         log.info(f"[{MKP_MARKETPLACE}] Órdenes encoladas/promovidas (modo {SCAN_MODE}): {seeded}")
 
+    # Órdenes de Reventa de la tienda (su NC usa otro transaction_type)
+    cursor.execute("""SELECT DISTINCT order_id FROM somos_reyes.ml_order_update
+                      WHERE seller_id = %s AND date_created >= %s AND static_tags LIKE '%%meli_resale%%'""",
+                   (ML_SELLER_ID, ML_BILLING_START))
+    resale_orders = frozenset(str(r[0]) for r in cursor.fetchall())
+
     orders = fetch_due_orders(cursor, db)
     log.info(f"[{MKP_MARKETPLACE}] Órdenes a consultar en esta corrida: {len(orders)}")
     if not orders:
@@ -746,7 +761,7 @@ def extract_ml_credit_notes():
         reference_date = reference_date or now
         invoice_total = float(invoice_total or 0)
 
-        r = get_devolution_xml(session, order_id, state)
+        r = get_devolution_xml(session, order_id, state, resale_orders)
 
         if r is None:
             counters['net_errors'] += 1

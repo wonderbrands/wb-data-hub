@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flujo de Notas de Crédito — Mercado Libre v2</title>
+<style>
+  :root {
+    --black: #1A1A1A; --yellow: #FFE600; --white: #FFFFFF;
+    --gray-bg: #F7F7F5; --gray-border: #E0E0DC; --gray-text: #6B6B65;
+    --red-light: #FFF0ED; --red-border: #F5A898; --red-text: #C0392B;
+    --green-light: #EAF5EA; --green-border: #90D090; --green-text: #2E7D32;
+    --blue-light: #EBF3FB; --blue-border: #90BBE0; --blue-text: #1565C0;
+    --amber-light: #FFF8E6; --amber-border: #F0D080; --amber-text: #956300;
+    --lila-light: #F0EFFC; --lila-border: #C4C0EC; --lila-text: #4A46A0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; background: var(--white); color: var(--black); line-height: 1.5; max-width: 900px; margin: 0 auto; padding: 32px 24px 60px; }
+  .doc-header { margin-bottom: 32px; padding-bottom: 16px; border-bottom: 3px solid var(--yellow); }
+  .doc-header-tags { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .doc-header-tag { background: var(--black); color: var(--yellow); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px; }
+  .doc-header h1 { font-size: 20px; font-weight: 600; }
+  .doc-header-meta { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+  .section { margin-bottom: 28px; }
+  .section-label { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .step-badge { width: 26px; height: 26px; border-radius: 50%; background: var(--black); color: var(--yellow); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .section-label h2 { font-size: 14px; font-weight: 600; }
+  .section-label p { font-size: 12px; color: var(--gray-text); margin-top: 1px; }
+  .connector { display: flex; flex-direction: column; align-items: center; padding: 4px 0; width: 100%; }
+  .connector .arrow-line { width: 2px; background: var(--gray-border); min-height: 20px; }
+  .arrow-head { font-size: 14px; line-height: 1; color: var(--gray-text); }
+  .card { border-radius: 8px; padding: 12px 14px; border: 1.5px solid var(--gray-border); background: var(--white); }
+  .card-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .card-sub { font-size: 11px; color: var(--gray-text); }
+  .card.ok { background: var(--green-light); border-color: var(--green-border); }
+  .card.ok .card-title { color: var(--green-text); }
+  .card.ok .card-sub { color: #1B5E20; }
+  .split-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .split-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .criteria-box { background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 6px; padding: 10px 14px; margin-top: 8px; }
+  .criteria-title { font-weight: 600; font-size: 11px; color: var(--black); margin-bottom: 6px; }
+  .criteria-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .criteria-row:last-child { margin-bottom: 0; }
+  .criteria-key { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--white); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--blue-text); white-space: nowrap; flex-shrink: 0; }
+  .criteria-val { font-size: 11px; color: var(--gray-text); }
+  code { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--black); }
+  .note { font-size: 11px; color: var(--gray-text); padding: 8px 12px; background: var(--amber-light); border-left: 3px solid var(--amber-border); border-radius: 0 6px 6px 0; margin-top: 6px; }
+  .note strong { color: var(--amber-text); }
+  .note.info { background: var(--blue-light); border-left-color: var(--blue-border); }
+  .note.info strong { color: var(--blue-text); }
+  .asiento-box { border: 1.5px solid var(--lila-border); border-radius: 8px; overflow: hidden; width: 100%; margin-top: 8px; }
+  .asiento-header { background: var(--lila-light); padding: 7px 12px; font-size: 11px; font-weight: 600; color: var(--lila-text); border-bottom: 1px solid var(--lila-border); }
+  .asiento-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .asiento-table th { background: var(--gray-bg); padding: 5px 10px; font-size: 10px; font-weight: 600; color: var(--gray-text); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--gray-border); text-align: left; }
+  .asiento-table th.r { text-align: right; }
+  .asiento-table td { padding: 6px 10px; border-bottom: 1px solid var(--gray-border); vertical-align: top; }
+  .asiento-table tr:last-child td { border-bottom: none; }
+  .acc-name { font-weight: 500; color: var(--black); }
+  .acc-code { font-size: 10px; color: var(--gray-text); font-family: 'SF Mono','Fira Code',monospace; margin-top: 1px; }
+  .acc-sub { font-size: 10px; color: var(--gray-text); font-style: italic; margin-top: 1px; }
+  .db { font-weight: 500; color: var(--blue-text); text-align: right; }
+  .cr { font-weight: 500; color: var(--green-text); text-align: right; }
+  .dash { color: var(--gray-border); text-align: right; }
+  .sep-row td { background: var(--gray-bg); padding: 3px 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray-text); }
+  .log-box { background: var(--gray-bg); border: 1.5px solid var(--gray-border); border-radius: 8px; padding: 12px 14px; width: 100%; }
+  .chg-box { border:1.5px solid var(--yellow); background:#FFFDE6; border-radius:8px; padding:12px 14px; margin-bottom:28px; font-size:12px; }
+  .chg-box h3 { font-size:13px; margin-bottom:6px; }
+  .chg-box ul { padding-left:18px; } .chg-box li { margin-bottom:3px; color:var(--black); }
+  .item { background:var(--gray-bg); border:1px solid var(--gray-border); border-radius:6px; padding:8px 10px; font-size:11px; }
+  .item b { display:block; margin-bottom:2px; }
+  .item span { color:var(--gray-text); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:640px){ .grid2,.split-2,.split-3{ grid-template-columns:1fr; } }
+  .fx { font-family:'SF Mono','Fira Code',monospace; font-size:11px; background:var(--gray-bg); border:1px solid var(--gray-border); border-radius:6px; padding:8px 10px; margin-top:6px; }
+  .legend { display:flex; gap:18px; flex-wrap:wrap; font-size:11px; color:var(--gray-text); margin:-16px 0 24px; }
+  .pend { display:inline-block; font-size:9px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; background:var(--red-light); color:var(--red-text); border:1px solid var(--red-border); border-radius:3px; padding:1px 5px; margin:0 4px 0 2px; vertical-align:middle; }
+  .disc { display:inline-block; font-size:9px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; background:var(--blue-light); color:var(--blue-text); border:1px solid var(--blue-border); border-radius:3px; padding:1px 5px; margin:0 4px 0 2px; vertical-align:middle; }
+  .pend-box { background:var(--red-light); border:1.5px solid var(--red-border); border-radius:8px; padding:10px 14px; font-size:12px; margin-bottom:12px; }
+  .pend-box ul { padding-left:18px; margin-top:6px; } .pend-box li { margin-bottom:3px; }
+</style>
+</head>
+<body>
+<div class="doc-header">
+  <div class="doc-header-tags">
+    <span class="doc-header-tag">Proyecto IVA</span>
+    <span class="doc-header-tag" style="background:var(--yellow);color:var(--black);">Mercado Libre</span>
+    <span class="doc-header-tag" style="background:var(--yellow);color:var(--black);">Versión 2</span>
+  </div>
+  <h1>Flujo de Notas de Crédito · Reembolsos y disputas · Reconocimiento contable</h1>
+  <p class="doc-header-meta">Reglas de diseño · 9-nov-2026 · No auditado: el flujo está en base de pruebas (lote de Sergio del 3-nov, revisado contra Odoo producción). Reemplaza los flujos 2 (disputas) y 3 (devoluciones) de junio. La historia de cada regla está en el Historial de Facturación.</p>
+</div>
+
+<div class="legend">
+  <span><span class="pend">Pendiente</span> regla definida que todavía no está implementada o falta completar</span>
+  <span><span class="disc">En discusión</span> propuesta abierta con Data; no es regla todavía</span>
+</div>
+
+<div class="pend-box"><b><span class="pend">Pendiente</span> Flujo en pruebas, sin visto bueno para productivo.</b> Antes del piloto de 10 NC de octubre:
+  <ul>
+    <li>Ajustes de cuentas, costo, monto y cobro marcados abajo, y un lote nuevo con los casos que el lote del 3-nov no cubre.</li>
+    <li>Cruce de cobertura: reembolsos y disputas de MeLi contra las ~3,685 NC listas para cargar (~$9M).</li>
+    <li>Reapertura de periodos desde junio para registrar cada NC en su mes.</li>
+  </ul>
+  Mientras tanto, las NC que MeLi timbra desde junio no están en Odoo.</div>
+
+<div class="chg-box">
+  <h3>Cambios respecto de los flujos 2 y 3 (jun-2026)</h3>
+  <ul>
+    <li><b>Disparador:</b> la NC que timbra el autofacturador de MeLi (XML por API), no el movimiento de refund. El refund queda como referencia para la conciliación fiscal.</li>
+    <li><b>Disputas y reembolsos en un solo flujo:</b> una disputa perdida tiene el mismo impacto que un reembolso; se clasifica igual en A/B/C.</li>
+    <li><b>Una cuenta 402 por tipo:</b> 402.01.003 Cancelaciones, 402.01.001 Devoluciones sobre venta y 402.01.002 Bonificaciones sobre venta (antes, todo a 402-001-001).</li>
+    <li><b>Costo tipo B:</b> 107.06.001 Devoluciones en tránsito, que ya existe, y el retorno al almacén la acredita. El costo revertido es el de la factura original.</li>
+    <li><b>Cuentas con código de Odoo 18:</b> 105.01.004 Mercado Libre, 102.03.001 Mercado Pago (cuenta transitoria), 208.01.001 IVA trasladado cobrado (antes, 105-001-004 y 102-002-007).</li>
+    <li><b>Casos nuevos:</b> doble egreso (NC manual de Odoo + NC de MeLi), refacturas, Reventa, tope por saldo, centavos, periodo cerrado.</li>
+  </ul>
+</div>
+
+<!-- 1 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">1</div><div><h2>Disparador: NC timbrada por Mercado Libre</h2><p>Autofacturador de MeLi con sello de Somos Reyes, desde el 1-jun-2026</p></div></div>
+  <div class="criteria-box">
+    <div class="criteria-title">Qué genera la NC en Odoo</div>
+    <div class="criteria-row"><span class="criteria-key">CFDI de egreso de MeLi</span><span class="criteria-val">Se extrae el XML por API y se registra en Odoo. <b>Un solo emisor:</b> Somos Reyes no emite NC de órdenes de MeLi; Odoo no vuelve a timbrar.</span></div>
+    <div class="criteria-row"><span class="criteria-key">Relación</span><span class="criteria-val">UUID de la factura relacionada en el XML. La NC se liga a la factura original, no a la SO.</span></div>
+    <div class="criteria-row"><span class="criteria-key">Fecha</span><span class="criteria-val">Fecha fiscal de la NC = fecha contable, en su mes. <span class="pend">Pendiente</span> reabrir los periodos desde junio para la carga histórica (el periodo está cerrado al 30-sep).</span></div>
+  </div>
+  <div class="criteria-box">
+    <div class="criteria-title">Referencia: cómo se identifica un reembolso en MeLi (<code>somos_reyes.ml_financial_transactions_master</code>)</div>
+    <div class="criteria-row"><span class="criteria-key">transaction_type = REFUND</span><span class="criteria-val">Reembolso al comprador.</span></div>
+    <div class="criteria-row"><span class="criteria-key">transaction_type = DISPUTE</span><span class="criteria-val">Disputa (reclamo) resuelta a favor del comprador. Total o parcial. Desde julio son la mayoría de los reembolsos.</span></div>
+    <div class="criteria-row"><span class="criteria-key">REFUND_SHIPPING · DISPUTE_SHIPPING</span><span class="criteria-val">Reembolso de envío.</span></div>
+    <div class="criteria-row"><span class="criteria-key">settlement_date</span><span class="criteria-val">Mes del reembolso (criterio del reporte de ventas, Playbook de Ingresos 5.2).</span></div>
+  </div>
+  <div class="note info"><strong>Disputa ganada:</strong> MeLi no emite NC; la venta sigue sin cambios. <strong>Conciliación fiscal (etapa posterior):</strong> reembolsos sin NC y NC sin reembolso, para ver cuándo factura MeLi y cuándo no (análisis de Finanzas con las bases y consultas a MeLi).</div>
+  <div class="connector" style="margin-top:12px;"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+</div>
+
+<!-- 2 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">2</div><div><h2>Validación contra Odoo</h2></div></div>
+  <div class="grid2">
+    <div class="item"><b style="color:var(--green-text)">Factura relacionada vigente en Odoo</b><span>Continúa al paso 3.</span></div>
+    <div class="item"><b style="color:var(--red-text)">La factura ya tiene una NC manual de Odoo</b><span>Doble egreso: no se registra y se alerta. Se cancela ante el SAT la NC de Odoo y queda la de MeLi (ej. RINV/2026/01731 contra MELINC-7782). <span class="pend">Pendiente</span> bloquear en Odoo 18 la emisión manual de facturas y NC de MeLi.</span></div>
+    <div class="item"><b style="color:var(--red-text)">Refactura</b><span>MeLi cancela su factura y emite otra para la misma orden (28 casos). No es un reembolso: queda fuera de este flujo, sin 402 ni costo. <span class="pend">Pendiente</span> criterio para distinguirla.</span></div>
+    <div class="item"><b style="color:var(--red-text)">Factura no está en Odoo o está cancelada</b><span>Revisión manual. <span class="pend">Pendiente</span> definir el tratamiento y probarlo en el próximo lote.</span></div>
+    <div class="item"><b style="color:var(--red-text)">Tope</b><span>La NC no puede superar el saldo facturado no acreditado (incluye varias NC sobre una factura). Si lo supera, alerta. <span class="pend">Pendiente</span> probar.</span></div>
+    <div class="item"><b style="color:var(--amber-text)">Mercado Libre Reventa</b><span>Facturas a DEREMATE.COM DE MEXICO, en Odoo desde el 4-nov. <span class="disc">En discusión</span> si sus NC entran a este flujo.</span></div>
+  </div>
+  <div class="connector" style="margin-top:12px;"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+</div>
+
+<!-- 3 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">3</div><div><h2>Monto de la nota de crédito</h2></div></div>
+  <div class="criteria-box">
+    <div class="criteria-row"><span class="criteria-key">Monto</span><span class="criteria-val">El del XML de MeLi, al centavo. <span class="pend">Pendiente</span> hoy la NC copia la factura cuando difiere del XML (ej. INV/2026/140154: NC $2,574.01, XML $2,574.00).</span></div>
+    <div class="criteria-row"><span class="criteria-key">Centavos</span><span class="criteria-val">Diferencia de ±$0.01 contra la factura: se cierra al conciliar contra 704.23.001 Otros productos, como en Amazon.</span></div>
+    <div class="criteria-row"><span class="criteria-key">Parcial</span><span class="criteria-val">MeLi emite la NC por el monto reembolsado (devolución de unidades o bonificación).</span></div>
+  </div>
+  <div class="connector" style="margin-top:12px;"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+</div>
+
+<!-- 4 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">4</div><div><h2>Tipo de NC y asiento</h2></div></div>
+  <div class="note"><strong>Clasificación (criterio del reporte de ventas, Playbook de Ingresos 5.3):</strong> <b>Cancelación</b> si el producto no salió del almacén (sin SO o sin fecha efectiva); <b>Devolución</b> si salió y el monto equivale a unidades enteras de la línea; <b>Bonificación</b> en cualquier otro caso. Reembolsos y disputas, igual. <span class="disc">En discusión</span> el criterio que usa el proceso (salida de almacén o fecha efectiva; cómo separa devolución parcial de bonificación).</div>
+  <div class="split-3" style="margin-top:10px;align-items:start;">
+    <div class="asiento-box"><div class="asiento-header">Tipo A · Cancelación (sin salida) · diario DEV</div>
+      <table class="asiento-table"><tbody>
+        <tr><td><div class="acc-name">Cancelaciones</div><div class="acc-code">402.01.003</div><div class="acc-sub"><span class="pend">Pendiente</span> hoy va a 402.01.001 Devoluciones sobre venta</div></td><td class="db">Dr</td></tr>
+        <tr><td><div class="acc-name">IVA trasladado cobrado</div><div class="acc-code">208.01.001</div></td><td class="db">Dr</td></tr>
+        <tr><td><div class="acc-name">Mercado Libre</div><div class="acc-code">105.01.004</div></td><td class="cr">Cr</td></tr>
+        <tr class="sep-row"><td colspan="2">Costo · 100%, al costo de la factura</td></tr>
+        <tr><td><div class="acc-name">Mercancías facturadas - no enviadas</div><div class="acc-code">205.06.003</div></td><td class="db">Dr</td></tr>
+        <tr><td><div class="acc-name">Costo de venta</div><div class="acc-code">501.01.001</div></td><td class="cr">Cr</td></tr>
+      </tbody></table></div>
+    <div class="asiento-box"><div class="asiento-header">Tipo B · Devolución (con salida) · diario DEV</div>
+      <table class="asiento-table"><tbody>
+        <tr><td><div class="acc-name">Devoluciones sobre venta</div><div class="acc-code">402.01.001</div></td><td class="db">Dr</td></tr>
+        <tr><td><div class="acc-name">IVA trasladado cobrado</div><div class="acc-code">208.01.001</div></td><td class="db">Dr</td></tr>
+        <tr><td><div class="acc-name">Mercado Libre</div><div class="acc-code">105.01.004</div></td><td class="cr">Cr</td></tr>
+        <tr class="sep-row"><td colspan="2">Costo · 100%, al costo de la factura</td></tr>
+        <tr><td><div class="acc-name">Devoluciones en tránsito</div><div class="acc-code">107.06.001</div><div class="acc-sub"><span class="pend">Pendiente</span> hoy Odoo usa 205.06.003 Mercancías facturadas - no enviadas</div></td><td class="db">Dr</td></tr>
+        <tr><td><div class="acc-name">Costo de venta</div><div class="acc-code">501.01.001</div></td><td class="cr">Cr</td></tr>
+      </tbody></table></div>
+    <div class="asiento-box"><div class="asiento-header">Tipo C · Bonificación (sin retorno) · diario BON</div>
+      <table class="asiento-table"><tbody>
+        <tr><td><div class="acc-name">Bonificaciones sobre venta</div><div class="acc-code">402.01.002</div><div class="acc-sub">Producto BON_SRV. <span class="pend">Pendiente</span> asignarle esta cuenta (hoy cae en 402.01.001 Devoluciones sobre venta)</div></td><td class="db">Dr</td></tr>
+        <tr><td><div class="acc-name">IVA trasladado cobrado</div><div class="acc-code">208.01.001</div></td><td class="db">Dr</td></tr>
+        <tr><td><div class="acc-name">Mercado Libre</div><div class="acc-code">105.01.004</div></td><td class="cr">Cr</td></tr>
+        <tr class="sep-row"><td colspan="2">Costo</td></tr>
+        <tr><td colspan="2"><div class="acc-sub">Sin movimiento: el producto no vuelve.</div></td></tr>
+      </tbody></table></div>
+  </div>
+
+  <div class="note"><strong>Costo revertido = costo de la factura original</strong>, no el costo promedio del día de la NC. <span class="pend">Pendiente</span> hoy Odoo revierte al costo del día. Ej. SO10277226: factura $2,467.01, NC $2,575.22; la diferencia queda colgada en la transitoria.</div>
+
+  <div class="asiento-box" style="margin-top:10px;">
+    <div class="asiento-header">Retorno del producto al almacén (WH/DEV) · cierra la devolución tipo B</div>
+    <table class="asiento-table"><thead><tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr></thead><tbody>
+      <tr><td><div class="acc-name">Inventario</div><div class="acc-code">115.01.001</div></td><td class="db">$ Costo de salida</td><td class="dash">—</td></tr>
+      <tr><td><div class="acc-name">Devoluciones en tránsito</div><div class="acc-code">107.06.001</div><div class="acc-sub"><span class="pend">Pendiente</span> hoy el retorno acredita 205.06.003 Mercancías facturadas - no enviadas</div></td><td class="dash">—</td><td class="cr">$ Costo de salida</td></tr>
+    </tbody></table>
+  </div>
+  <div class="fx">Ej. SO10277226 (juego de comedor en 2 cajas): OUT 15-sep $1,234.41 + $1,232.60. Retorno 30-oct solo de la caja 2: $1,232.60, el costo exacto con que salió.<br>La caja 1 no volvió: queda abierta en la transitoria hasta que vuelva o se dé de baja.</div>
+  <div class="note" style="margin-top:6px;"><span class="disc">En discusión</span> <strong>cómo hacer que el retorno acredite 107.06.001 Devoluciones en tránsito sin afectar a los otros canales</strong>, que todavía no tienen este flujo de NC: limitar el cambio a MeLi (por equipo o tipo de operación) o una reclasificación automática al validar el retorno. <span class="pend">Pendiente</span> (hoja de ruta) conciliación automática NC contra retorno en 107.06.001 Devoluciones en tránsito.</div>
+  <div class="note info" style="margin-top:6px;"><strong>Provisión del 50% (Proyecto Ingresos):</strong> el reporte de ventas supone que solo vuelve el 50% del producto devuelto. Es una provisión del cierre mensual; acá cada devolución se registra al 100% y queda abierta hasta el retorno.</div>
+  <div class="connector" style="margin-top:12px;"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+</div>
+
+<!-- 5 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">5</div><div><h2>Efecto en el cobro</h2><p>Montos brutos; comisiones y deducciones van en una etapa posterior</p></div></div>
+  <div class="grid2">
+    <div class="item"><b>Factura aún no cobrada</b><span>La NC se concilia contra la factura y disminuye 105.01.004 Mercado Libre.</span></div>
+    <div class="item"><b>Factura ya cobrada</b><span>La NC desarma el cobro donde quedó: disminuye 102.03.001 Mercado Pago (cuenta transitoria) por el total de la NC, porque MeLi ya le devolvió el dinero al comprador. <span class="pend">Pendiente</span> hoy queda como saldo a favor en 105.01.004 Mercado Libre. <span class="disc">En discusión</span> la mecánica (romper la conciliación del cobro o asiento de reverso).</span></div>
+  </div>
+  <div class="asiento-box" style="margin-top:10px;">
+    <div class="asiento-header">Factura ya cobrada · efecto neto buscado</div>
+    <table class="asiento-table"><thead><tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr></thead><tbody>
+      <tr><td><div class="acc-name">Mercado Libre</div><div class="acc-code">105.01.004</div><div class="acc-sub">Cierra el crédito de la NC</div></td><td class="db">$ Total NC</td><td class="dash">—</td></tr>
+      <tr><td><div class="acc-name">Mercado Pago (cuenta transitoria)</div><div class="acc-code">102.03.001</div></td><td class="dash">—</td><td class="cr">$ Total NC</td></tr>
+    </tbody></table>
+  </div>
+  <div class="fx">Ej. INV/2026/94795: factura y cobro por $2,369 (15-ago); disputa el 27-ago.<br>Sin este paso quedan $2,369 acreedores en 105.01.004 Mercado Libre y $2,369 de más en 102.03.001 Mercado Pago (cuenta transitoria).</div>
+  <div class="note" style="margin-top:6px;"><strong>Programa de protección de MeLi:</strong> fuera de alcance por ahora. La NC se registra igual (la venta se anula); el recupero lo reconoce el cierre de ingresos en 401.01.005 Cashbacks MeLi, sin vínculo con la orden.</div>
+  <div class="connector" style="margin-top:12px;"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+</div>
+
+<!-- 6 -->
+<div class="section">
+  <div class="section-label"><div class="step-badge">6</div><div><h2>Log de conciliación</h2></div></div>
+  <div class="log-box">
+    <div class="criteria-row"><span class="criteria-key">order_id · SO · factura · NC Odoo</span><span class="criteria-val">Vínculo entre la orden, la factura original y la NC.</span></div>
+    <div class="criteria-row"><span class="criteria-key">UUID NC · UUID factura · folio MeLi</span><span class="criteria-val">CFDI de egreso de MeLi y factura relacionada.</span></div>
+    <div class="criteria-row"><span class="criteria-key">Origen · Tipo</span><span class="criteria-val">REFUND / DISPUTE y A / B / C.</span></div>
+    <div class="criteria-row"><span class="criteria-key">Estado de la factura</span><span class="criteria-val">Cobrada o no al registrar la NC (define el paso 5).</span></div>
+  </div>
+  <div class="note info" style="margin-top:8px;"><strong>Cierre mensual:</strong> el reporte de ventas reconoce el reembolso con la fecha de MeLi. Las diferencias de fecha o monto con las NC las cubre el complemento contable de ventas (Proyecto Ingresos), que se rehace desde junio al cargar las NC.</div>
+</div>
+
+</body>
+</html>

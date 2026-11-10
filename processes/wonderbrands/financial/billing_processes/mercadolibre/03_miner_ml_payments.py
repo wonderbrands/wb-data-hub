@@ -95,6 +95,7 @@ def extract_ml_payments():
     ml_errors    = 0
     mp_errors    = 0
     other_errors = 0
+    fully_refunded = 0  # Pagos aprobados pero reembolsados al 100%: no hay nada que cobrar
     token_expired = False
 
     for o in orders:
@@ -146,13 +147,22 @@ def extract_ml_payments():
                 date_rel = datetime.strptime(date_released_str[:19], "%Y-%m-%dT%H:%M:%S")
                 date_rel_utc = date_rel + timedelta(hours=MP_UTC_OFFSET_HOURS)
 
+                # Monto neto de reembolsos: un reembolso parcial deja el pago 'approved'
+                # (status_detail 'partially_refunded') y su NC ya baja el saldo de la factura;
+                # cobrar transaction_amount completo dejaría un sobrepago en la CxC.
+                amount_net = round(float(data_mp.get('transaction_amount') or 0)
+                                   - float(data_mp.get('transaction_amount_refunded') or 0), 2)
+                if amount_net <= 0:
+                    fully_refunded += 1
+                    continue
+
                 # PASO C: Validar si el dinero ya está liberado hoy
                 if date_rel_utc <= datetime.utcnow():
                     cursor.execute("""
                         INSERT IGNORE INTO finance.mkp_payments_prod
                         (marketplace, mkp_order_id, payment_id, amount, date_released, status)
                         VALUES (%s, %s, %s, %s, %s, 'PENDING')
-                    """, (MKP_MARKETPLACE, order_id, payment_id, data_mp['transaction_amount'], date_rel))
+                    """, (MKP_MARKETPLACE, order_id, payment_id, amount_net, date_rel))
                     db.commit()
                     released += cursor.rowcount
                 else:
@@ -170,7 +180,7 @@ def extract_ml_payments():
     total_errors = ml_errors + mp_errors + other_errors
     log.info(
         f"[{MKP_MARKETPLACE}] Resumen -> Órdenes revisadas: {len(orders)} | Pagos liberados: {released} | "
-        f"Pagos no liberados: {not_released} | "
+        f"Pagos no liberados: {not_released} | Reembolsados al 100%: {fully_refunded} | "
         f"Errores: {total_errors} (ml={ml_errors}, mp={mp_errors}, otros={other_errors})"
     )
     cursor.close()
