@@ -301,8 +301,8 @@ def process_fase_c():
             cdmx_time = (datetime.now() - timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
             models.execute_kw(ODOO_DB, uid, ODOO_PWD, 'sale.order', 'message_post', [[so_id]],
                               {'body': f'{cdmx_time}. Se insertó la guía de Mercado Libre ({SELLER_NAME}) '
-                                      f'Logistic type: {c_ref}, Carrier guía: {order.get("ml_tracking_method") or "N/D"} '
-                                      f'extraída vía API / KESTRA.'})
+                                      f'Tipo de logística: {c_ref} // Carrier: {order.get("ml_tracking_method") or "N/D"} //'
+                                      f'Extraída vía API / KESTRA.'})
 
             #Actualizar Base de Datos como Éxito (Guardando el ZPL raw y marcando como procesado)
             cursor.execute("""
