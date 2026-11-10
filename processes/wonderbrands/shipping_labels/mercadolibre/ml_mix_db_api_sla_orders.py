@@ -100,6 +100,10 @@ def get_odoo_carrier_mapping(logistic_type, tracking_method):
                     'xd_drop_off': 'Cross Docking con Drop Off'}
     carrier_ref_data = logistic_map.get(logistic_type, 'Desconocido')
     carrier_id = None
+    # Colecta: siempre "Colecta Meli" (id 10) para que el WMS agrupe bien; la paquetería
+    # real de la guía queda en ml_tracking_method.
+    if logistic_type == 'cross_docking':
+        return carrier_ref_data, 10
     if tracking_method:
         t_upper = tracking_method.upper()
         if 'MEL' in t_upper or 'MERCADO LIBRE' in t_upper:
