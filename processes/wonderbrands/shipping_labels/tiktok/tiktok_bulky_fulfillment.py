@@ -55,9 +55,24 @@ from pricing_check import check_pricing
 from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
 
 # Órdenes con VoBo humano (sheet de reproceso). Se carga en el main.
-VOBO = VoboSheet('TikTok')
-# Motivos de register_manual que son una validación dura de Odoo: no se reintenta.
-VOBO_BLOCKED_REASONS = ('ODOO_ORDER_MISSING',)
+# TikTok ya no escribe BLOQUEADA_VALIDACION: toda falla queda REINTENTO_FALLIDO.
+# `retry_states` vuelve elegibles las filas que quedaron BLOQUEADA_VALIDACION
+# cuando ODOO_ORDER_MISSING juntaba errores de Odoo y SO aún no creadas.
+VOBO = VoboSheet('TikTok', retry_states=(EST_BLOCKED,))
+# Motivos que no son culpa de la orden: se reintentan SIN gastar intento del VoBo.
+VOBO_FREE_RETRY_REASONS = ('ODOO_LOOKUP_ERROR', 'ODOO_ORDER_MISSING')
+
+# Detalle (columna Reason) de cada motivo que devuelve search_sale_order.
+ODOO_PROBLEM_DETAILS = {
+    'ODOO_LOOKUP_ERROR': "Odoo no respondió al buscar la sale.order de la orden TikTok "
+                         "{order_id}. Se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_MISSING': "Aún no existe una sale.order para la orden TikTok {order_id}. "
+                          "Se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_DUPLICATED': "Hay varias sale.order vigentes para la orden TikTok {order_id} "
+                             "({so}). Cancela las sobrantes; se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_CANCELLED': "La sale.order {so} de la orden TikTok {order_id} está cancelada. "
+                            "No se genera guía; se reintenta en la siguiente corrida.",
+}
 
 
 # PyPDF2 sólo se usa para consolidar guías multicaja en un único PDF. Si no
@@ -1087,28 +1102,55 @@ def odoo_execute(models, uid, model: str, method: str, args: list, kwargs=None):
 
 
 def search_sale_order(models, uid, tiktok_order_id: str):
-    """Busca la SO por los campos de referencia de canal. Devuelve (id, name)."""
+    """
+    Busca la SO por los campos de referencia de canal.
+
+    Devuelve (id, name, motivo). `motivo` es None si hay UNA SO vigente; si no:
+      ODOO_LOOKUP_ERROR      Odoo falló y ningún campo encontró la SO (no se sabe si existe).
+      ODOO_ORDER_DUPLICATED  Más de una SO vigente (no cancelada) para la orden.
+      ODOO_ORDER_CANCELLED   Sólo hay SO canceladas.
+      ODOO_ORDER_MISSING     Odoo respondió y no hay SO (Yuju aún no la crea).
+    Las SO canceladas se ignoran si existe otra vigente (Yuju recreó la orden).
+    """
+    lookup_failed = False
     for field in cfg.ODOO_ORDER_REFERENCE_FIELDS:
         try:
             records = odoo_execute(
                 models, uid, 'sale.order', 'search_read',
                 [[(field, '=', tiktok_order_id)]],
-                {'fields': ['id', 'name', 'state'], 'limit': 2},
+                {'fields': ['id', 'name', 'state'], 'limit': 10},
             )
         except Exception as e:
             logger.error(f"Odoo: error buscando SO por {field}={tiktok_order_id}: {e}")
+            lookup_failed = True
             continue
-        if len(records) > 1:
-            logger.error(f"Odoo: varias SO para {field}={tiktok_order_id}. Se requiere revisión.")
-            return None, None
-        if records:
-            logger.info(
-                f"Odoo: SO {records[0]['name']} (id={records[0]['id']}) "
-                f"encontrada por {field}."
+        if not records:
+            continue
+
+        active = [r for r in records if r.get('state') != 'cancel']
+        if len(active) > 1:
+            active_names = ', '.join(str(r['name']) for r in active)
+            logger.error(
+                f"Odoo: varias SO vigentes para {field}={tiktok_order_id} "
+                f"({active_names}). Se requiere revisión."
             )
-            return int(records[0]['id']), str(records[0]['name'])
+            return None, active_names, 'ODOO_ORDER_DUPLICATED'
+        if not active:
+            logger.warning(
+                f"Odoo: la orden TikTok {tiktok_order_id} sólo tiene SO cancelada(s) "
+                f"({', '.join(str(r['name']) for r in records)})."
+            )
+            return int(records[0]['id']), str(records[0]['name']), 'ODOO_ORDER_CANCELLED'
+
+        so = active[0]
+        logger.info(f"Odoo: SO {so['name']} (id={so['id']}) encontrada por {field}.")
+        return int(so['id']), str(so['name']), None
+
+    if lookup_failed:
+        logger.error(f"Odoo: no se pudo confirmar la SO de la orden TikTok {tiktok_order_id}.")
+        return None, None, 'ODOO_LOOKUP_ERROR'
     logger.warning(f"Odoo: no se encontró SO para la orden TikTok {tiktok_order_id}.")
-    return None, None
+    return None, None, 'ODOO_ORDER_MISSING'
 
 
 def update_sale_order_tracking(models, uid, so_id: int, labels: list) -> bool:
@@ -1449,7 +1491,7 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
     # POST_LABEL_UPDATE_FAILED llega tras register_success (ya marcada GUIA_GENERADA).
     VOBO.annotate(order_id, odoo_id=ctx.get('so_name'), tienda=ctx.get('seller_name'))
     if motivo != 'DRY_RUN':
-        VOBO.mark(order_id, EST_BLOCKED if motivo in VOBO_BLOCKED_REASONS else EST_FAIL)
+        VOBO.mark(order_id, EST_FAIL, count_attempt=motivo not in VOBO_FREE_RETRY_REASONS)
     logger.warning(f"MANUAL | Orden {order_id} | {motivo}: {detalle}")
     resumen.warning(
         f"MANUAL    | {ctx.get('seller_name', '')} | TikTok {order_id} | "
@@ -1694,11 +1736,13 @@ def process_order(order, shop, access_token, conn, models, uid,
         return 'manual'
 
     # --- Orden de venta en Odoo -----------------------------------------
-    so_id, so_name = search_sale_order(models, uid, order_id)
+    # Ningún motivo de Odoo bloquea la orden: todos se reintentan en la
+    # siguiente corrida (ver VOBO_FREE_RETRY_REASONS para los intentos del VoBo).
+    so_id, so_name, odoo_problem = search_sale_order(models, uid, order_id)
     ctx['so_name'] = so_name
-    if not so_id:
-        register_manual(conn, sheet_manual, ctx, 'ODOO_ORDER_MISSING',
-                        f"No existe una sale.order asociada a la orden TikTok {order_id}.")
+    if odoo_problem:
+        register_manual(conn, sheet_manual, ctx, odoo_problem,
+                        ODOO_PROBLEM_DETAILS[odoo_problem].format(order_id=order_id, so=so_name))
         return 'manual'
 
     # --- Check de pricing (ANTES de crear paquete, cotizar o generar guía) --
