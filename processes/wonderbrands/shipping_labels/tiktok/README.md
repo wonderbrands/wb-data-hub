@@ -82,13 +82,26 @@ intento. Créalo sólo si migras esos scripts al mismo criterio.
 | `RATES_CONNECTION_ERROR` | Falla de red con la API interna. Se reintenta en la siguiente corrida. |
 | `LABEL_GENERATION_FAILED` | Ninguna guía se generó. |
 | `PARTIAL_LABELS` | Se generaron menos guías que cajas. **Hay guías emitidas sin reportar.** |
-| `ODOO_ORDER_MISSING` | No existe la `sale.order` en Odoo. |
+| `ODOO_ORDER_MISSING` | Odoo respondió y aún no existe la `sale.order` (Yuju no la ha creado). Se reintenta. |
+| `ODOO_LOOKUP_ERROR` | Odoo falló al buscar la `sale.order` (timeout, 502). No se sabe si existe. Se reintenta. |
+| `ODOO_ORDER_DUPLICATED` | Hay más de una `sale.order` vigente (no cancelada) para la orden. Se reintenta; hay que cancelar las sobrantes. |
+| `ODOO_ORDER_CANCELLED` | La orden sólo tiene `sale.order` canceladas. No se genera guía. Se reintenta. |
 | `TIKTOK_PACKAGE_MISSING` | TikTok no tiene paquete y no se pudo crear. |
 | `TIKTOK_PROVIDER_UNRESOLVED` | TikTok no reconoce la paquetería cotizada. **No se genera guía**, para no emitirla sin poder reportarla. |
 | `ADDRESS_INCOMPLETE` / `ORDER_WITHOUT_SKUS` / `ORDER_VALUE_ZERO` | Datos insuficientes. |
 | `POST_LABEL_UPDATE_FAILED` | Guía generada, pero falló la actualización en Odoo o TikTok. |
 | `UNEXPECTED_ERROR` | Excepción no contemplada. |
 | `DRY_RUN` | Simulación: la orden pasó todas las validaciones pero no se generó guía. |
+
+### Reproceso con VoBo (pestaña `TikTok` del sheet de reprocesamiento)
+
+TikTok **no** escribe `BLOQUEADA_VALIDACION`: cualquier motivo de la tabla
+anterior deja la fila en `REINTENTO_FALLIDO` y se reintenta en la siguiente
+corrida. `ODOO_LOOKUP_ERROR` y `ODOO_ORDER_MISSING` no gastan intento (la falla
+no es de la orden); el resto sí y pasa a `AGOTADA` al llegar a
+`MAX_REPROCESS_ATTEMPTS`. Las filas que ya estaban en `BLOQUEADA_VALIDACION`
+(de cuando `ODOO_ORDER_MISSING` juntaba todos los casos de Odoo) vuelven a ser
+elegibles sin tocarlas a mano.
 
 ### Columnas de las pestañas
 

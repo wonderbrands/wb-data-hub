@@ -32,6 +32,7 @@ Estados (columna `estado`):
     REINTENTO_FALLIDO     -> elegible mientras `intentos` < MAX_REPROCESS_ATTEMPTS
     GUIA_GENERADA         -> terminal
     BLOQUEADA_VALIDACION  -> terminal; el operador la libera borrando el estado
+                             (un script puede volverla elegible con `retry_states`)
     AGOTADA               -> terminal; se alcanzó el máximo de intentos
 
 Variables de entorno:
@@ -107,8 +108,14 @@ def authenticate_google_sheets():
 class VoboSheet:
     """Lee las órdenes con VoBo de una pestaña y registra su resultado."""
 
-    def __init__(self, marketplace: str):
+    def __init__(self, marketplace: str, retry_states=()):
+        """
+        `retry_states`: estados terminales que ESTE script vuelve a tratar como
+        elegibles (p. ej. TikTok reintenta las BLOQUEADA_VALIDACION que escribió
+        antes de separar los motivos de Odoo). Por defecto, ninguno.
+        """
         self.marketplace = marketplace
+        self.eligible_states = _ELIGIBLE_STATES + tuple(s.upper() for s in retry_states)
         self.spreadsheet_id = os.getenv('SPREADSHEET_REPROCESS_ID')
         self.max_attempts = int(os.getenv('MAX_REPROCESS_ATTEMPTS', '3'))
         self.dry_run = _flag('VOBO_DRY_RUN')
@@ -184,7 +191,7 @@ class VoboSheet:
                 order_id = cell(row, 'marketplace_id').lstrip("'").strip()
                 if not order_id or cell(row, 'vobo').upper() not in _APPROVED_VALUES:
                     continue
-                if cell(row, 'estado').upper() not in _ELIGIBLE_STATES:
+                if cell(row, 'estado').upper() not in self.eligible_states:
                     continue
                 try:
                     attempts = int(cell(row, 'intentos') or 0)
@@ -214,7 +221,7 @@ class VoboSheet:
         return self
 
     # ------------------------------------------------------------------
-    def mark(self, order_id, estado: str):
+    def mark(self, order_id, estado: str, count_attempt: bool = True):
         """
         Registra el resultado de la orden en el sheet de reproceso.
 
@@ -222,6 +229,8 @@ class VoboSheet:
         - Sólo cuenta el primer resultado de la orden en la corrida (los scripts
           pueden pasar varias veces por la misma orden, p. ej. una fila por guía).
         - BLOQUEADA_VALIDACION no suma intento; GUIA_GENERADA y REINTENTO_FALLIDO sí.
+        - `count_attempt=False`: el fallo no fue de la orden (p. ej. Odoo no
+          respondió o la SO aún no existe); queda REINTENTO_FALLIDO sin gastar intento.
         - REINTENTO_FALLIDO pasa a AGOTADA al llegar al máximo de intentos.
 
         Devuelve el estado finalmente escrito (o None si no se registró).
@@ -232,7 +241,8 @@ class VoboSheet:
             return None
         self._marked.add(order_id)
 
-        attempts = entry['intentos'] + (0 if estado == EST_BLOCKED else 1)
+        counts = count_attempt and estado != EST_BLOCKED
+        attempts = entry['intentos'] + (1 if counts else 0)
         if estado == EST_FAIL and attempts >= self.max_attempts:
             estado = EST_EXHAUSTED
 
