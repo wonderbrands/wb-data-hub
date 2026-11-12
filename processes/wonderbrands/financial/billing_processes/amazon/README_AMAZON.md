@@ -43,8 +43,10 @@ El flujo clona la rama de `vars.branch` (`main`): lo que no esté en `main` no c
 ## Facturación (01)
 
 **Miner.** Lee desde el día 1 del mes anterior (`start_date` vacío) y siembra una fila por orden:
-- **B2B:** Amazon ya emitió el CFDI. Se replica en Odoo con su UUID, receptor, uso, forma de pago y fecha. **No se timbra**, porque Amazon no da el XML.
-- **B2C:** lo timbramos nosotros a público general (partner 13436). Antes espera **5 días de gracia** por si el cliente autofactura.
+- **B2B (Amazon Business):** una orden es Business si tiene `IsBusinessOrder` o si Amazon ya emitió su CFDI. **Las Business las factura solo Amazon.**
+  - Con CFDI: se replica en Odoo con su UUID, receptor, uso, forma de pago y fecha. **No se timbra**, porque Amazon no da el XML.
+  - Sin CFDI: `B2B_SIN_CFDI`. No se factura; en cuanto Amazon emita el CFDI, se vincula.
+- **B2C:** lo timbramos nosotros a público general (partner 13436). Antes espera **6 días de gracia desde la compra** (`PurchaseDate`) por si el cliente autofactura, y la orden tiene que estar cobrada.
 
 **Cierre de mes (días ≤ `dias_cierre_mes`, default 1).** La venta de un mes anterior (por `date_order` de la SO en CDMX) sale con **fecha del último día de ese mes, a las 23:59:59**:
 - sin periodo de gracia;
@@ -73,10 +75,10 @@ Una corrida que arranca en cierre termina en cierre, aunque pase la medianoche (
 
 - `payment_id = <settlement_id>:<order_id>`. Un cobro es una orden en un settlement. Amazon libera **por pieza**, así que una factura puede quedar pagada parcialmente hasta el siguiente settlement.
 - 03 registra el pago por lo liberado en el diario AMZ (102.02.008 LIBERACIONES AMAZON PENDIENTES DE PROCESAR).
-  - **±0.01** contra la factura: se salda en el mismo pago contra 704.23.001.
+  - **Hasta ±$0.15 por factura** contra lo liberado: se salda en el mismo pago contra 704.23.001.
   - **Excedente:** si es promoción confirmada, va a un asiento `AUTOPROMO:<settlement>:<orden>` (403.01.002 + 208.01.001). Nunca se aplica a la factura más que su saldo.
 - 03 busca la SO en `mkp_billing_prod`. Un cobro de una orden que 01 nunca leyó queda en `NO_INVOICE`.
-- **B2B sin vincular** (`PENDING_B2B_LINK` o `B2B_FACTURADA_PG`): el cobro espera en `NO_INVOICE`. Así nunca se aplica a una factura a público general que se va a cancelar.
+- **Business sin el CFDI de Amazon vinculado** (`PENDING_B2B_LINK`, `B2B_FACTURADA_PG`, `B2B_SIN_CFDI`, o cualquier orden con `IsBusinessOrder` que no esté en `ODOO_B2B_LINKED`): el cobro espera en `NO_INVOICE`. Así nunca se aplica a una factura nuestra que Finanzas va a cancelar. El resto de los cobros sigue aplicándose.
 - **Solo contra 105.01.006.** El asistente de pago usa la CxC de la factura; una factura del autofacturador trae 105.01.001. Si alguna factura abierta de la SO no está en 105.01.006, el cobro no se aplica: queda en `CXC_INCORRECTA` y avisa por Slack.
 
 ## Estados
@@ -87,7 +89,8 @@ Una corrida que arranca en cierre termina en cierre, aunque pase la medianoche (
 |---|---|---|
 | `PENDING_B2B_LINK` / `PENDING_WB_INVOICE` | Por facturar (B2B / B2C) | lo toma el loader |
 | `PROCESSING` | Tomada por una corrida; se libera sola a las 6 h | — |
-| `SKIPPED_GRACE` | B2C dentro de los 5 días de gracia | sí |
+| `SKIPPED_GRACE` | B2C dentro de los 6 días de gracia (desde la compra) | sí |
+| `B2B_SIN_CFDI` | Orden Business sin CFDI de Amazon. No se factura | sí: se vincula cuando Amazon emita el CFDI |
 | `ODOO_B2B_LINKED` | Factura B2B con el UUID de Amazon | final |
 | `ODOO_INVOICED` | B2C emitida y timbrada por WB. `cfdi_uuid` = nuestro UUID; si el PAC falló, `error_log` empieza con `TIMBRADO_FALLIDO` | final |
 | `ALREADY_ODOO_INVOICED` | Ya tenía factura (1a1, global o ambas) | final |
@@ -112,7 +115,7 @@ En `raw_json`:
 | `PENDING` | Minado, por aplicar | lo toma 03 |
 | `ODOO_PAID` | Aplicado (puede ser parcial) | final |
 | `ALREADY_PAID` | La factura ya estaba pagada | final |
-| `NO_INVOICE` | Sin factura todavía, o B2B esperando su CFDI | cada 6 h durante 60 días |
+| `NO_INVOICE` | Sin factura todavía, o Business esperando su CFDI | cada 6 h durante 60 días |
 | `CXC_INCORRECTA` | La factura no está en 105.01.006; no se aplicó | a mano: Contabilidad corrige la cuenta y TI la regresa a `PENDING` |
 | `ERROR` | Fallo de Odoo | a mano |
 | `HISTORICO_CONTABILIDAD` | Depósito del 23-sep-2026 (settlement 27581522881, 1,586 cobros de septiembre) que cierra Contabilidad | 03 no lo toca |

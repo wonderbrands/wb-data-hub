@@ -24,7 +24,7 @@ El descuadre contra el deposito real son las comisiones de Amazon.
 Dos asientos adicionales (revision del lote 4, oct-2026):
 
   Centavo de redondeo -- dentro del mismo pago, write-off nativo del wizard:
-    105.01.006 contra AMZ_ACCOUNT_REDONDEO por +-0.01. La factura queda
+    105.01.006 contra AMZ_ACCOUNT_REDONDEO hasta +-0.15. La factura queda
     "Pagado" y el pago es exactamente lo liberado.
 
   Promocion pagada por Amazon -- asiento aparte, ref AUTOPROMO:<stl>:<orden>,
@@ -119,9 +119,12 @@ TOLERANCE = 0.02        # centavos de tolerancia al comparar importes
 # "Pagado" y 102.02.008 recibe exactamente lo que deposita Amazon, que es lo
 # que hace falta para D9 (deposito = suma del diario por settlement).
 #
-# Un centavo POR FACTURA: una orden repartida en 2 facturas puede traer 0.02.
+# Hasta $0.15 POR FACTURA (Jero, 8-nov-2026, hoja A3): 14 facturas de octubre
+# diferian de OrderTotal entre 0.02 y 0.06 (INV/2026/164526: 3,398.02 contra
+# 3,398) porque el precio de la SO no coincide con el que cobro Amazon. Antes
+# era un centavo y esas facturas quedaban abiertas por la diferencia.
 # Sin AMZ_ACCOUNT_REDONDEO la corrida aborta (ver preparar_contexto).
-TOLERANCIA_REDONDEO = 0.01
+TOLERANCIA_REDONDEO = 0.15
 
 # =============================================================================
 # EXCEDENTE: PROMOCIONES PAGADAS POR AMAZON (D3)
@@ -242,7 +245,10 @@ def fetch_pendientes(db_conn):
     cursor.execute(f"""
         SELECT p.id, p.mkp_order_id, p.payment_id,
                p.amount, p.date_released, p.status,
-               b.odoo_so_name, b.raw_json, b.status AS billing_status
+               b.odoo_so_name, b.raw_json, b.status AS billing_status,
+               (SELECT MAX(IFNULL(o.IsBusinessOrder, 0))
+                  FROM somos_reyes.amazon_orders o
+                 WHERE o.AmazonOrderId = p.mkp_order_id) AS is_business
         FROM {TBL_PAYMENTS} p
         LEFT JOIN {TBL_BILLING} b
                ON b.marketplace = p.marketplace
@@ -828,14 +834,15 @@ def registrar_promo(odoo, journal_id, cuentas, record, promo, so_name, facturas)
 def repartir_centavos(destino, dif):
     """Cierra todas las facturas destino repartiendo 'dif' de a centavo.
 
-    Devuelve [(factura, monto_pago, redondeo)]. Nunca mas de 0.01 por factura:
-    es lo que aprobo Finanzas.
+    Devuelve [(factura, monto_pago, redondeo)]. Nunca mas de
+    TOLERANCIA_REDONDEO por factura: es lo que aprobo Finanzas. La diferencia
+    se carga a la primera factura y lo que pase del tope, a la siguiente.
     """
-    n = int(round(abs(dif) * 100))
-    signo = 1 if dif > 0 else -1
+    resto = round(dif, 2)
     montos = []
-    for k, inv in enumerate(destino):
-        ajuste = round(signo * 0.01, 2) if k < n else 0.0
+    for inv in destino:
+        ajuste = round(max(-TOLERANCIA_REDONDEO, min(TOLERANCIA_REDONDEO, resto)), 2)
+        resto = round(resto - ajuste, 2)
         saldo = a_float(inv.get('amount_residual'))
         montos.append((inv, round(saldo + ajuste, 2), ajuste))
     return montos
@@ -912,11 +919,26 @@ def procesar(odoo, db_conn, journal_id, record, stats, ctx):
     # Jero, 3-nov: PAMZ/2026/00710). Se espera como NO_INVOICE (se reintenta).
     # PENDING_B2B_LINK igual: la B2B aun no tiene su factura, y la que hubiera
     # en Odoo no es la del CFDI de Amazon.
-    if record.get('billing_status') in ('B2B_FACTURADA_PG', 'PENDING_B2B_LINK'):
+    if record.get('billing_status') in ('B2B_FACTURADA_PG', 'PENDING_B2B_LINK',
+                                        'B2B_SIN_CFDI'):
         update_payment(db_conn, record['id'], 'NO_INVOICE',
                        error_log=(f'{so_name}: {record["billing_status"]}. Se aplica '
                                   f'cuando se vincule el CFDI de Amazon (antes, '
                                   f'cancelar la factura a publico general si existe).'))
+        stats['espera_b2b'].append(so_name)
+        return
+
+    # Orden Amazon Business: la factura solo Amazon (Jero, 8-nov-2026). El
+    # cobro solo va contra la factura del CFDI de Amazon (ODOO_B2B_LINKED). Si
+    # la orden tiene una factura nuestra (publico general o portal), Finanzas
+    # la cancela y el cobro aplicado ahi quedaria colgado. Se espera.
+    if int(record.get('is_business') or 0) == 1 \
+            and record.get('billing_status') != 'ODOO_B2B_LINKED':
+        update_payment(db_conn, record['id'], 'NO_INVOICE',
+                       error_log=(f'{so_name}: orden Amazon Business sin el CFDI de '
+                                  f'Amazon vinculado ({record.get("billing_status")}). '
+                                  f'Se aplica cuando se cancele nuestra factura y se '
+                                  f'vincule el CFDI de Amazon.'))
         stats['espera_b2b'].append(so_name)
         return
 
