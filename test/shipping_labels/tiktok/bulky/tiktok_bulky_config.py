@@ -321,7 +321,7 @@ API_AUTH = (os.getenv('AUTH_USER'), os.getenv('AUTH_PASS'))
 API_TIMEOUT_RATES = 30
 API_TIMEOUT_LABEL = 45
 
-LABELARY_URL = 'http://api.labelary.com/v1/printers/8dpmm/labels/4x6/'
+LABELARY_URL = 'http://api.labelary.com/v1/printers/8dpmm/labels/4x8/'
 
 
 # ==========================================================================
