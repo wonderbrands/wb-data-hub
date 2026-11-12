@@ -334,7 +334,7 @@ def process_odoo_integration(models, uid, so_id, so_name, all_labels, latest_shi
 # ==========================================
 def convert_zpl_to_pdf_bytes(zpl_string: str) -> Optional[bytes]:
     """Convierte un string ZPL a bytes de PDF usando Labelary."""
-    url = "http://api.labelary.com/v1/printers/8dpmm/labels/4x6/"
+    url = "http://api.labelary.com/v1/printers/8dpmm/labels/4x8/"
     headers = {"Accept": "application/pdf"}
     try:
         response = requests.post(url, headers=headers, data=zpl_string, timeout=15)
