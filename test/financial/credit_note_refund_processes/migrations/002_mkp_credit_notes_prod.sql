@@ -85,10 +85,10 @@ GROUP  BY b.status;
 CREATE TABLE IF NOT EXISTS finance.mkp_credit_notes_prod (
     id                    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     marketplace           VARCHAR(50)   NOT NULL,
-    mkp_order_id          VARCHAR(32)   NOT NULL,     -- AJUSTAR al tipo de mkp_billing_prod
+    mkp_order_id          VARCHAR(100)   NOT NULL,     -- AJUSTAR al tipo de mkp_billing_prod
 
     -- CFDI de la NC (TipoDeComprobante = 'E')
-    cfdi_uuid             CHAR(36)      NOT NULL,
+    cfdi_uuid             CHAR(100)      NOT NULL,
     related_invoice_uuid  CHAR(36)      NULL,         -- CfdiRelacionados/CfdiRelacionado/@UUID
     tipo_relacion         VARCHAR(10)   NULL,         -- '01' esperado
     serie                 VARCHAR(25)   NULL,         -- 'MELINC' observado
@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS finance.mkp_credit_notes_prod (
 CREATE TABLE IF NOT EXISTS finance.mkp_credit_notes_scan (
     id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     marketplace       VARCHAR(50)  NOT NULL,
-    mkp_order_id      VARCHAR(32)  NOT NULL,          -- AJUSTAR al tipo de mkp_billing_prod
+    mkp_order_id      VARCHAR(100)  NOT NULL,          -- AJUSTAR al tipo de mkp_billing_prod
     signal_source     VARCHAR(40)  NOT NULL,          -- SWEEP | ORDER_CANCELLED | PAYMENT_REFUNDED
                                                       -- | CLAIM_COMPLAINANT | FIN_REFUND | MANUAL
     reference_date    DATETIME     NOT NULL,          -- SWEEP: entrada a mkp_billing_prod; señal: detección;

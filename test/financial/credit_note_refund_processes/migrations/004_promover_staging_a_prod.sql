@@ -21,7 +21,11 @@ INSERT INTO finance.mkp_credit_notes_scan
 SELECT marketplace, mkp_order_id, signal_source, reference_date, scan_status, check_count,
        last_http_status, first_checked_at, last_checked_at, next_check_at, created_at
 FROM   finance.mkp_credit_notes_scan_staging
-ON DUPLICATE KEY UPDATE scan_status = VALUES(scan_status);
+-- Se puede volver a correr: actualiza lo que el 05 haya avanzado en staging después de la primera copia.
+ON DUPLICATE KEY UPDATE scan_status = VALUES(scan_status), check_count = VALUES(check_count),
+       last_http_status = VALUES(last_http_status), first_checked_at = VALUES(first_checked_at),
+       last_checked_at = VALUES(last_checked_at), next_check_at = VALUES(next_check_at),
+       reference_date = VALUES(reference_date), signal_source = VALUES(signal_source);
 
 -- 2) NC descargadas (1 fila por CFDI de egreso)
 INSERT INTO finance.mkp_credit_notes_prod
@@ -36,7 +40,9 @@ SELECT marketplace, mkp_order_id, cfdi_uuid, related_invoice_uuid, tipo_relacion
        CASE WHEN status IN ('UUID_MISMATCH', 'AMOUNT_EXCEEDS_INVOICE') THEN error_log ELSE NULL END,
        created_at
 FROM   finance.mkp_credit_notes_staging
-ON DUPLICATE KEY UPDATE id = id;   -- idempotente por (marketplace, cfdi_uuid)
+-- idempotente por (marketplace, cfdi_uuid). El "id" va calificado porque también existe en la
+-- tabla de origen (error 1052 si se deja solo "id = id").
+ON DUPLICATE KEY UPDATE id = finance.mkp_credit_notes_prod.id;
 
 -- 3) Verificación: los conteos deben coincidir
 SELECT 'scan' AS tabla,

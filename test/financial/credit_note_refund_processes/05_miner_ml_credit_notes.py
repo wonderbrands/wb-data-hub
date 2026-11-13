@@ -68,9 +68,6 @@ MKP_MARKETPLACE = STORE['marketplace']
 # Corte de facturación: las señales anteriores no pueden tener NC de ML que nos toque
 ML_BILLING_START = STORE['billing_start']
 
-# Tablas de control. Fase de pruebas: *_staging (finance.mkp_billing_prod solo se LEE).
-NC_TABLE      = os.getenv("NC_TABLE", "finance.mkp_credit_notes_staging")
-NC_SCAN_TABLE = os.getenv("NC_SCAN_TABLE", "finance.mkp_credit_notes_scan_staging")
 
 # ══ PRUEBA LOCAL: editar aquí ═════════════════════════════════
 # Qué hace la corrida (UN solo modo a la vez):
@@ -87,10 +84,16 @@ LOCAL_RUN               = "both"
 LOCAL_ORDER_IDS         = "2000018238217954,2000016723575980,2000016949680478,2000017527328146"
 # Tope de órdenes que se CONSULTAN en ML en esta corrida (llenar la cola no cuenta)
 LOCAL_MAX_CALLS_PER_RUN = 100000
+# Tablas de control: "prod" = definitivas (finance.mkp_credit_notes_prod / _scan, desde el 11-nov)
+#                    "staging" = de pruebas (*_staging). finance.mkp_billing_prod solo se LEE.
+LOCAL_TABLES            = "prod"
 
 # En Kestra no aplica nada de este bloque: el flujo manda PREFLIGHT_ONLY, SCAN_MODE,
-# ONLY_ORDER_IDS y MAX_CALLS_PER_RUN como variables de entorno, y esas ganan.
+# ONLY_ORDER_IDS, MAX_CALLS_PER_RUN, NC_TABLE y NC_SCAN_TABLE como variables de entorno, y esas ganan.
 # ══════════════════════════════════════════════════════════════
+_SUFFIX = {"prod": ("_prod", ""), "staging": ("_staging", "_staging")}[LOCAL_TABLES]
+NC_TABLE      = os.getenv("NC_TABLE", f"finance.mkp_credit_notes{_SUFFIX[0]}")
+NC_SCAN_TABLE = os.getenv("NC_SCAN_TABLE", f"finance.mkp_credit_notes_scan{_SUFFIX[1]}")
 LOCAL_RUN_OPTIONS = ("preflight", "orders", "signals", "sweep", "both")
 if LOCAL_RUN not in LOCAL_RUN_OPTIONS:
     raise ValueError(f"LOCAL_RUN='{LOCAL_RUN}' inválido; opciones: {LOCAL_RUN_OPTIONS}")

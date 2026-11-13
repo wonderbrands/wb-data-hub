@@ -1,5 +1,22 @@
 # Prueba del 06 · Loader de NC → Odoo 18
 
+> **v5 (12-nov)**
+> - **Corte de retornos:** solo órdenes del flujo nuevo de NC, es decir, las que están en la cola del 05 (`NC_SCAN_TABLE`). Los retornos de ventas anteriores a junio no se reclasifican (Finanzas, 12-nov). En staging quedaron fuera 297 retornos.
+> - **Tablas:** `LOCAL_TABLES = "prod"` (`finance.mkp_credit_notes_prod` / `_scan`). Para probar en staging, usar `"staging"`. El 06 se niega a escribir con el Odoo de pruebas sobre las tablas `_prod`.
+> - **Nombre de la NC = serie-folio del CFDI (`NC_NAME_FROM_CFDI`, apagado):**
+>   - Solo se activa con diarios exclusivos de CFDI de terceros.
+>   - Probado en staging: si las NC de MeLi comparten diario con las propias, Odoo numera la siguiente NC manual como MELINC-xxxxx, porque continúa desde el folio más alto del diario.
+> - **Piloto en productivo (11-nov):** 10 NC de octubre, todas OK (`finanzas/Piloto_NC_ML_productivo_2026-11-11.csv`).
+
+> **v4 (11-nov): retorno con fecha del retorno (pedido de Finanzas).** Reemplaza la regla de retorno de la v3.
+> - Cada retorno WH/DEV validado de MeLi (equipo `ML_TEAM_NAME`, retornos desde `RETURNS_SINCE`) se reclasifica **en el mes del retorno**, exista o no la NC: Debe 205.06.003 / Haber 107.06.001, conciliado contra el retorno. `ref MLNC-RET:<retorno>`.
+> - El crédito en 107.06.001 queda abierto hasta que entra la NC tipo B, y se concilia en ese momento (`link_returns_to_nc`). Si la NC nunca llega, el saldo marca un retorno sin NC.
+> - Solo se reclasifican productos que salieron en la orden: los kits casan por componente; un producto ajeno o una orden sin salida no se reclasifica.
+> - Un retorno en periodo cerrado se deja para la reapertura.
+> - Corre en cada `orders` / `pending` y en `LOCAL_RUN = "returns"`. El `preflight` solo lo cuenta.
+> - Pendiente de Finanzas: si entran los retornos de ventas anteriores al autofacturador (`RETURNS_INCLUDE_PRE_BILLING_SALES`, hoy `false`).
+> - Lote v4: `finanzas/Lote_prueba_NC_ML_v4_retornos_staging_2026-11-11.csv`.
+
 > **v3 (10-nov), condiciones de Finanzas para el piloto:**
 > - **Reverso del cobro en el diario Mercado Pago** (`JOURNAL_CODE_COBRO`, código MP; antes MISC), con la fecha de la NC.
 > - **Retorno WH/DEV (solo tipo B):** asiento MISC Debe 205.06.003 / Haber 107.06.001 por el costo del retorno, conciliado contra el retorno (205.06.003) y contra la NC (107.06.001).

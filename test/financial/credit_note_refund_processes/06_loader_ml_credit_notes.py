@@ -7,7 +7,7 @@ import sys
 import time
 import csv
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── 06 · Loader de Notas de Crédito ML → Odoo 18 (flujo v2 de Finanzas, 9-nov; v3 10-nov) ──
 # Toma las NC que el 05 dejó en staging (PENDING) y crea en Odoo la out_refund ligada a
@@ -22,10 +22,10 @@ from datetime import datetime
 #   Cobro: factura con saldo -> se concilia NC <-> factura (±$0.01 contra 704.23.001).
 #          factura ya cobrada -> asiento en el diario Mercado Pago, Debe 105.01.004 / Haber 102.03.001
 #          por lo cobrado, con la fecha de la NC.
-#   Retorno WH/DEV (solo tipo B): por cada retorno validado de la orden, asiento Debe 205.06.003 /
-#          Haber 107.06.001 por el costo del retorno, conciliado contra el retorno (205.06.003) y
-#          contra la NC (107.06.001). Fecha = la más reciente entre la NC y el retorno. Lo que no
-#          vuelve queda abierto en 107.06.001. Corre al registrar la NC y en cada corrida (barrido).
+#   Retorno WH/DEV (Finanzas 11-nov): cada retorno validado de MeLi se reclasifica EN EL MES DEL
+#          RETORNO, exista o no la NC: Debe 205.06.003 / Haber 107.06.001 por su costo, conciliado
+#          contra el retorno. El crédito en 107.06.001 queda abierto hasta que entra la NC tipo B y se
+#          concilia ahí; si la NC nunca llega, marca un retorno sin NC. Barrido en cada corrida.
 #   Fecha contable = fecha fiscal de la NC. Si el mes está cerrado -> PERIOD_LOCKED (no se mueve).
 #   Sin reembolso ni disputa en MeLi -> MANUAL_REVIEW (posible refactura).
 #   Reventa (DeRemate) entra con las mismas reglas (INCLUDE_RESALE).
@@ -60,9 +60,9 @@ log = logging.getLogger(__name__)
 #   "preflight" -> valida Odoo/BD y muestra QUÉ HARÍA con cada NC. NO escribe nada.
 #   "orders"    -> registra solo las NC de las órdenes de LOCAL_ORDER_IDS.
 #   "pending"   -> registra las NC PENDING (más recientes primero; filtro LOCAL_MONTH).
-#   "returns"   -> solo el barrido de retornos: reclasifica los retornos validados de NC tipo B
-#                  ya registradas que todavía tienen costo abierto en 107.06.001.
-#   ("orders" y "pending" también corren el barrido de retornos al final.)
+#   "returns"   -> solo el barrido de retornos: reclasifica cada retorno WH/DEV validado de MeLi
+#                  (periodo abierto) en el mes del retorno y lo concilia con su NC tipo B si ya existe.
+#   ("orders" y "pending" también corren el barrido de retornos al final; "preflight" solo lo cuenta.)
 LOCAL_RUN            = "preflight"
 LOCAL_ODOO           = "test"      # test | prod  (prod = Odoo productivo REAL)
 LOCAL_ORDER_IDS      = ""
@@ -70,6 +70,7 @@ LOCAL_MONTH          = ""          # "2026-10" = solo NC timbradas ese mes; "" =
 LOCAL_MAX_NC_PER_RUN = 10
 LOCAL_PREFLIGHT_ALL  = False       # preflight: True = TODO el universo de NC (corrida en seco), no solo la cola
 LOCAL_PREFLIGHT_CSV  = True        # preflight: escribe el CSV con el estado que el proceso asignaría a cada NC
+LOCAL_TABLES         = "prod"      # prod = finance.mkp_credit_notes_prod (definitiva) | staging = *_staging (pruebas)
 # En Kestra el flujo manda RUN_MODE, ODOO_TARGET, ONLY_ORDER_IDS, NC_MONTH, MAX_NC_PER_RUN,
 # PREFLIGHT_ALL y PREFLIGHT_CSV como variables de entorno, y esas ganan.
 # ══════════════════════════════════════════════════════════════
@@ -100,7 +101,11 @@ DB_HOST, DB_USER, DB_PASSWORD, DB_NAME = (os.getenv(k) for k in ("DB_HOST", "DB_
 
 STORE           = get_store_config()
 MKP_MARKETPLACE = STORE['marketplace']
-NC_TABLE        = os.getenv("NC_TABLE", "finance.mkp_credit_notes_staging")
+NC_TABLE        = os.getenv("NC_TABLE", "finance.mkp_credit_notes_prod" if LOCAL_TABLES == "prod" else "finance.mkp_credit_notes_staging")
+NC_SCAN_TABLE   = os.getenv("NC_SCAN_TABLE", "finance.mkp_credit_notes_scan" if LOCAL_TABLES == "prod" else "finance.mkp_credit_notes_scan_staging")
+if ODOO_TARGET == "test" and NC_TABLE.endswith("_prod") and RUN_MODE in ("orders", "pending"):
+    raise ValueError("Odoo de PRUEBAS con la tabla definitiva: los IDs de staging ensuciarían "
+                     f"{NC_TABLE}. Usa LOCAL_TABLES = 'staging' para probar en staging.")
 
 # Configuración contable (flujo v2 de Finanzas)
 CLASS_CONFIG = {   # tipo -> (diario, cuenta de ingreso)
@@ -123,6 +128,17 @@ TAX_ID_MARKETPLACES = int(os.getenv("TAX_ID_MARKETPLACES", "38"))
 RFC_RESALE          = "DCM991109KR2"
 INCLUDE_RESALE      = os.getenv("INCLUDE_RESALE", "true").strip().lower() == "true"
 PREFIX, PREFIX_COBRO, PREFIX_CENT, PREFIX_RET = "MLNC:", "MLNC-COBRO:", "MLNC-CENT:", "MLNC-RET:"
+# Retornos WH/DEV que se reclasifican (Finanzas 12-nov): solo órdenes que entraron al flujo nuevo de NC,
+# es decir, las que están en la cola del 05 (NC_SCAN_TABLE: facturadas por el autofacturador de MeLi
+# desde el 1-jun). Los retornos de ventas anteriores no se reclasifican (sus NC no concilian).
+ML_TEAM_NAME      = os.getenv("ML_TEAM_NAME", "Team_MercadoLibre")
+# Nombre de la NC = serie-folio del CFDI de MeLi (MELINC-11844), pedido de Finanzas (12-nov).
+# SOLO con diarios exclusivos de CFDI de terceros: Odoo numera el siguiente documento del diario a
+# partir del folio más alto, así que en DEV/BON (compartidos con las NC propias) la siguiente NC
+# manual saldría como MELINC-xxxxx (probado en staging). Activar junto con JOURNAL_CODE_DEV/BON
+# apuntando a los diarios exclusivos de MeLi.
+NC_NAME_FROM_CFDI = os.getenv("NC_NAME_FROM_CFDI", "false").strip().lower() == "true"
+RETURNS_SINCE     = os.getenv("RETURNS_SINCE", "2026-06-01")
 
 AMOUNT_TOLERANCE  = float(os.getenv("AMOUNT_TOLERANCE", "1.0"))   # tope por factura y casado de unidades
 CENTS_TOLERANCE   = 0.0101                                         # ±$0.01 -> 704.23.001
@@ -210,6 +226,7 @@ def load_config(odoo):
         'accounts': {c: acc(code) for c, (_, code) in CLASS_CONFIG.items()},
         'journal_misc': one('account.journal', [('code', '=', JOURNAL_CODE_MISC)], f"diario {JOURNAL_CODE_MISC}"),
         'journal_cobro': one('account.journal', [('code', '=', JOURNAL_CODE_COBRO)], f"diario {JOURNAL_CODE_COBRO}"),
+        'team': one('crm.team', [('name', '=', ML_TEAM_NAME)], f"equipo de ventas {ML_TEAM_NAME}"),
         'acc_cxc': acc(ACCOUNT_CODE_CXC), 'acc_mp': acc(ACCOUNT_CODE_MP), 'acc_cents': acc(ACCOUNT_CODE_CENTS),
         'acc_fp_src': acc(ACCOUNT_CODE_FP_SRC), 'acc_fp_dst': acc(ACCOUNT_CODE_FP_DST),
         'bon_product': one('product.product', [('default_code', '=', BON_PRODUCT_CODE)], f"producto {BON_PRODUCT_CODE}"),
@@ -373,6 +390,7 @@ def plan_credit_note(rec, ctx, cfg):
         return {**base, 'status': 'PERIOD_LOCKED', 'error': f"Fecha fiscal {date} en periodo cerrado (bloqueo {cfg['lock_date']})"}
 
     header = {
+        **({'name': f"{rec['serie']}-{rec['folio']}"} if NC_NAME_FROM_CFDI else {}),   # serie-folio del CFDI de MeLi
         'move_type': 'out_refund', 'journal_id': cfg['journals'][op_class], 'partner_id': inv['partner_id'][0],
         'team_id': inv['team_id'][0] if inv.get('team_id') else False,
         'invoice_date': date, 'date': date, 'invoice_date_due': date, 'invoice_payment_term_id': False,
@@ -439,107 +457,138 @@ def residual(odoo, move_id, account_id):
                                                                 ['amount_residual'])), 2)
 
 
-def reclass_returns(odoo, cfg, refund_id, uuid, so_id, nc_date, partner):
-    """Retorno WH/DEV de una NC tipo B (Finanzas, 10-nov): por cada retorno validado de la orden,
-    Debe 205.06.003 / Haber 107.06.001 por su costo, conciliado contra el retorno (205.06.003)
-    y contra la NC (107.06.001). Solo productos que salieron en la orden (así entran los
-    componentes de un kit y no un producto ajeno) y hasta el costo que la NC tiene abierto en
-    107.06.001; lo que no vuelve queda abierto ahí. Idempotente: ref MLNC-RET:<UUID>:<retorno>."""
-    src, dst = cfg['acc_fp_src'], cfg['acc_fp_dst']
-    nc_open = odoo.read('account.move.line', [('move_id', '=', refund_id), ('account_id', '=', dst),
-                                              ('reconciled', '=', False), ('debit', '>', 0)], ['id', 'amount_residual'])
-    pending = round(sum(ln['amount_residual'] for ln in nc_open), 2)
-    if pending < 0.01:
-        return []
-    outs = odoo.call('stock.picking', 'search', [('sale_id', '=', so_id), ('state', '=', 'done'), ('location_dest_id.usage', '=', 'customer')])
-    rets = odoo.read('stock.picking', [('sale_id', '=', so_id), ('state', '=', 'done'), ('location_id.usage', '=', 'customer')],
-                     ['id', 'name'], order='date_done, id')
-    if not outs or not rets:
-        return []
-    shipped = {m['product_id'][0] for m in odoo.read('stock.move', [('picking_id', 'in', outs), ('state', '=', 'done')], ['product_id'])}
-    notes = []
-    for pick in rets:
-        moves = odoo.read('stock.move', [('picking_id', '=', pick['id']), ('state', '=', 'done')], ['product_id', 'account_move_ids'])
-        valuation = [mid for m in moves if m['product_id'][0] in shipped for mid in m['account_move_ids']]
-        if len(valuation) < sum(len(m['account_move_ids']) for m in moves):
-            notes.append(f"retorno {pick['name']}: trae productos que no salieron en la orden (no se reclasifican)")
-        ref = f"{PREFIX_RET}{uuid}:{pick['name']}"
-        entry = odoo.call('account.move', 'search', [('ref', '=', ref), ('state', '=', 'posted')], limit=1)
-        created = False
-        ret_lines = odoo.read('account.move.line', [('move_id', 'in', valuation), ('account_id', '=', src), ('credit', '>', 0),
-                                                    ('reconciled', '=', False), ('parent_state', '=', 'posted')],
-                              ['id', 'product_id', 'amount_residual', 'date'], order='id') if valuation else []
-        if not entry:
-            if pending < 0.01 or not ret_lines:
-                continue
-            lines, total, date = [], 0.0, nc_date
-            for ln in ret_lines:
-                amount = round(min(-ln['amount_residual'], pending - total), 2)
-                if amount < 0.01:
-                    break
-                total = round(total + amount, 2)
-                date = max(date, ln['date'])
-                lines.append({'account_id': src, 'partner_id': partner, 'product_id': ln['product_id'] and ln['product_id'][0],
-                              'debit': amount, 'credit': 0, 'name': f"Retorno {pick['name']} · NC ML {uuid}"})
-            lines.append({'account_id': dst, 'partner_id': partner, 'debit': 0, 'credit': total,
-                          'name': f"Retorno {pick['name']} · NC ML {uuid}"})
-            entry = [get_or_post_entry(odoo, ref, cfg['journal_misc'], date, lines)]
-            pending = round(pending - total, 2)
-            created = True
-        # concilia: 205.06.003 contra el retorno y 107.06.001 contra la NC
-        mine = odoo.read('account.move.line', [('move_id', '=', entry[0]), ('reconciled', '=', False)], ['id', 'account_id'])
-        src_ids = [ln['id'] for ln in mine if ln['account_id'][0] == src]
-        dst_ids = [ln['id'] for ln in mine if ln['account_id'][0] == dst]
-        if src_ids and ret_lines:
-            odoo.call('account.move.line', 'reconcile', src_ids + [ln['id'] for ln in ret_lines])
-            created = True
-        open_nc = odoo.call('account.move.line', 'search', [('move_id', '=', refund_id), ('account_id', '=', dst),
-                                                            ('reconciled', '=', False), ('debit', '>', 0)])
-        if dst_ids and open_nc:
-            odoo.call('account.move.line', 'reconcile', dst_ids + open_nc)
-            created = True
-        if not created:
-            continue
-        moved = odoo.one('account.move', entry[0], ['name', 'amount_total', 'date'])
-        notes.append(f"retorno {pick['name']} ${moved['amount_total']:,.2f} {ACCOUNT_CODE_FP_SRC} -> {ACCOUNT_CODE_FP_DST} "
-                     f"({moved['name']}, {moved['date']})")
-    return notes
+def _chunks(items, size=500):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
-def sweep_returns(odoo, cfg, so_refs=None):
-    """Barrido diario: NC tipo B registradas con costo abierto en 107.06.001 cuya orden ya
-    tiene un retorno validado -> reclasifica. Cubre los retornos que se validan después de la NC."""
-    domain = [('account_id', '=', cfg['acc_fp_dst']), ('reconciled', '=', False), ('parent_state', '=', 'posted'),
-              ('debit', '>', 0), ('move_id.move_type', '=', 'out_refund'), ('move_id.ref', '=like', PREFIX + '%')]
-    open_ids = sorted({ln['move_id'][0] for ln in odoo.read('account.move.line', domain, ['move_id'])})
-    if not open_ids:
-        return {}
-    ncs = odoo.call('account.move', 'read', open_ids, fields=['id', 'name', 'ref', 'date', 'invoice_origin', 'partner_id'])
-    sos = {}
-    for i in range(0, len(ncs), 500):
-        chunk = [n['invoice_origin'] for n in ncs[i:i + 500] if n['invoice_origin']]
-        so_domain = [('name', 'in', chunk)] + ([('channel_order_reference', 'in', so_refs)] if so_refs else [])
-        sos.update({s['name']: s['id'] for s in odoo.read('sale.order', so_domain, ['id', 'name'])})
-    with_return = set()
-    so_ids = list(sos.values())
-    for i in range(0, len(so_ids), 500):
-        with_return |= {p['sale_id'][0] for p in odoo.read('stock.picking', [('sale_id', 'in', so_ids[i:i + 500]), ('state', '=', 'done'),
-                                                                            ('location_id.usage', '=', 'customer')], ['sale_id'])}
+def link_returns_to_nc(odoo, cfg, so_id, so_name):
+    """Concilia en 107.06.001 el costo de la NC tipo B (Debe) contra los créditos abiertos de las
+    reclasificaciones de los retornos de su orden (Haber). Devuelve notas."""
+    dst = cfg['acc_fp_dst']
+    nc_lines = odoo.read('account.move.line', [('account_id', '=', dst), ('debit', '>', 0), ('reconciled', '=', False),
+                                               ('parent_state', '=', 'posted'), ('move_id.move_type', '=', 'out_refund'),
+                                               ('move_id.ref', '=like', PREFIX + '%'), ('move_id.invoice_origin', '=', so_name)],
+                         ['id', 'amount_residual'])
+    if not nc_lines:
+        return []
+    refs = [PREFIX_RET + p['name'] for p in odoo.read('stock.picking', [('sale_id', '=', so_id), ('state', '=', 'done'),
+                                                                        ('location_id.usage', '=', 'customer')], ['name'])]
+    ret_lines = odoo.read('account.move.line', [('account_id', '=', dst), ('credit', '>', 0), ('reconciled', '=', False),
+                                                ('parent_state', '=', 'posted'), ('move_id.ref', 'in', refs)],
+                          ['id', 'amount_residual']) if refs else []
+    if not ret_lines:
+        return []
+    before = sum(ln['amount_residual'] for ln in nc_lines)
+    odoo.call('account.move.line', 'reconcile', [ln['id'] for ln in nc_lines + ret_lines])
+    after = sum(ln['amount_residual'] for ln in odoo.call('account.move.line', 'read', [ln['id'] for ln in nc_lines],
+                                                          fields=['amount_residual']))
+    return [f"conciliada ${before - after:,.2f} en {ACCOUNT_CODE_FP_DST} contra el retorno; abierto ${after:,.2f}"]
+
+
+def in_nc_flow(db, order_refs):
+    """Órdenes que entraron al flujo nuevo de NC (están en la cola del 05)."""
+    found = set()
+    refs = [r for r in order_refs if r]
+    for ch in _chunks(refs, 1000):
+        cur = db.cursor()
+        cur.execute(f"SELECT mkp_order_id FROM {NC_SCAN_TABLE} WHERE marketplace = %s AND mkp_order_id IN ({','.join(['%s'] * len(ch))})",
+                    (MKP_MARKETPLACE, *ch))
+        found |= {str(o) for (o,) in cur.fetchall()}
+        cur.close()
+    return found
+
+
+def sweep_returns(odoo, cfg, db, so_refs=None, dry=False, out_notes=None):
+    """Retorno WH/DEV de MeLi (Finanzas, 11-nov): cada retorno validado se reclasifica en el MES DEL
+    RETORNO, exista o no la NC: Debe 205.06.003 / Haber 107.06.001 por su costo, conciliado contra el
+    retorno en 205.06.003. El crédito en 107.06.001 queda abierto hasta que entra la NC tipo B
+    (link_returns_to_nc); si nunca llega, marca un retorno sin NC.
+    Solo productos que salieron en la orden (los kits regresan por componente; un producto ajeno o
+    una orden sin salida no se reclasifica). Retornos en periodo cerrado: se dejan para la reapertura.
+    Idempotente: ref MLNC-RET:<retorno>. dry=True solo cuenta (preflight)."""
+    src = cfg['acc_fp_src']
+    dom = [('account_id', '=', src), ('credit', '>', 0), ('reconciled', '=', False), ('parent_state', '=', 'posted'),
+           ('date', '>=', RETURNS_SINCE), ('move_id.stock_move_id.picking_id.location_id.usage', '=', 'customer'),
+           ('move_id.stock_move_id.picking_id.sale_id.team_id', '=', cfg['team'])]
+    if so_refs:
+        dom.append(('move_id.stock_move_id.picking_id.sale_id.channel_order_reference', 'in', list(so_refs)))
+    lines = odoo.read('account.move.line', dom, ['id', 'move_id', 'product_id', 'amount_residual', 'date'], order='date, id')
     counts = {}
-    for nc in ncs:
-        so_id = sos.get(nc['invoice_origin'])
-        if so_id not in with_return:
+    bump = lambda k, n=1: counts.__setitem__(k, counts.get(k, 0) + n)
+    if not lines:
+        return counts
+    # retorno de cada línea: asiento de valuación -> stock.move -> picking -> SO
+    smove_of = {}
+    for ch in _chunks({ln['move_id'][0] for ln in lines}):
+        smove_of.update({m['id']: m['stock_move_id'][0] for m in odoo.call('account.move', 'read', ch, fields=['stock_move_id'])
+                         if m['stock_move_id']})
+    pick_of = {}
+    for ch in _chunks(set(smove_of.values())):
+        pick_of.update({m['id']: m['picking_id'][0] for m in odoo.call('stock.move', 'read', ch, fields=['picking_id'])
+                        if m['picking_id']})
+    picks = {}
+    for ch in _chunks(set(pick_of.values())):
+        picks.update({p['id']: p for p in odoo.call('stock.picking', 'read', ch, fields=['name', 'sale_id'])})
+    so_ids = {p['sale_id'][0] for p in picks.values() if p['sale_id']}
+    sos, shipped = {}, {}
+    for ch in _chunks(so_ids):
+        sos.update({s['id']: s for s in odoo.call('sale.order', 'read', ch, fields=['name', 'partner_id', 'channel_order_reference'])})
+        out_picks = {p['id']: p['sale_id'][0] for p in odoo.read('stock.picking', [('sale_id', 'in', ch), ('state', '=', 'done'),
+                                                                                  ('location_dest_id.usage', '=', 'customer')],
+                                                                 ['sale_id'])}
+        for ch2 in _chunks(out_picks):
+            for m in odoo.read('stock.move', [('picking_id', 'in', ch2), ('state', '=', 'done')], ['product_id', 'picking_id']):
+                shipped.setdefault(out_picks[m['picking_id'][0]], set()).add(m['product_id'][0])
+
+    in_flow = in_nc_flow(db, [s['channel_order_reference'] for s in sos.values()])
+    outside = {sid for sid, so_ in sos.items() if so_['channel_order_reference'] not in in_flow}
+    by_pick = {}
+    for ln in lines:
+        pid = pick_of.get(smove_of.get(ln['move_id'][0]))
+        if pid:
+            by_pick.setdefault(pid, []).append(ln)
+    for pid, plines in by_pick.items():
+        pick = picks[pid]
+        so = sos.get(pick['sale_id'][0]) if pick['sale_id'] else None
+        if not so or so['id'] in outside:
+            bump('retornos fuera del flujo nuevo de NC (no se reclasifican)')
+            continue
+        out_products = shipped.get(so['id'], set())
+        valid = [ln for ln in plines if ln['product_id'] and ln['product_id'][0] in out_products]
+        if len(valid) < len(plines):
+            bump('líneas sin salida en la orden (no se reclasifican)', len(plines) - len(valid))
+        if not valid:
+            continue
+        date = max(ln['date'] for ln in valid)
+        amount = round(-sum(ln['amount_residual'] for ln in valid), 2)
+        period = 'periodo cerrado' if cfg['lock_date'] and date <= cfg['lock_date'] else 'periodo abierto'
+        bump(f"retornos {period}")
+        bump(f"$ {period}", amount)
+        if dry or period == 'periodo cerrado':
             continue
         try:
-            notes = reclass_returns(odoo, cfg, nc['id'], nc['ref'][len(PREFIX):], so_id, nc['date'], nc['partner_id'][0])
-            if notes:
-                log.info(f"[RETORNO] {nc['name']} ({nc['invoice_origin']}) -> {' | '.join(notes)}")
-            key = 'reclasificadas' if any(' -> ' in n for n in notes) else 'sin cambio'
-            counts[key] = counts.get(key, 0) + 1
+            entry_lines = [{'account_id': src, 'partner_id': so['partner_id'][0], 'product_id': ln['product_id'][0],
+                            'debit': round(-ln['amount_residual'], 2), 'credit': 0, 'name': f"Retorno {pick['name']} · {so['name']}"}
+                           for ln in valid]
+            entry_lines.append({'account_id': cfg['acc_fp_dst'], 'partner_id': so['partner_id'][0], 'debit': 0, 'credit': amount,
+                                'name': f"Retorno {pick['name']} · {so['name']}"})
+            entry = get_or_post_entry(odoo, PREFIX_RET + pick['name'], cfg['journal_misc'], date, entry_lines)
+            mine = odoo.call('account.move.line', 'search', [('move_id', '=', entry), ('account_id', '=', src), ('reconciled', '=', False)])
+            if mine:
+                odoo.call('account.move.line', 'reconcile', mine + [ln['id'] for ln in valid])
+            notes = link_returns_to_nc(odoo, cfg, so['id'], so['name'])
+            bump('reclasificados')
+            msg = (f"retorno {pick['name']} {date} ${amount:,.2f} {ACCOUNT_CODE_FP_SRC} -> {ACCOUNT_CODE_FP_DST}"
+                   + (f" ({notes[0]})" if notes else " (sin NC aún: queda abierto en 107.06.001)"))
+            log.info(f"[RETORNO] {so['name']} {msg}")
+            if out_notes is not None:
+                out_notes.append(msg)
         except Exception as e:
-            log.error(f"[RETORNO ERROR] {nc['name']} ({nc['invoice_origin']}): {str(e)[:500]}")
-            counts['error'] = counts.get('error', 0) + 1
-    return counts
+            bump('error')
+            log.error(f"[RETORNO ERROR] {pick['name']}: {str(e)[:500]}")
+    return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in counts.items()}
 
 
 def execute_plan(odoo, db, rec, plan, cfg):
@@ -606,8 +655,9 @@ def execute_plan(odoo, db, rec, plan, cfg):
         reconcile_lines(odoo, [refund_id, cobro], cxc)
         notes.append(f"reverso de cobro ${amount:,.2f} en {ACCOUNT_CODE_MP}")
     status = 'ODOO_CREDITED' if abs(residual(odoo, refund_id, cxc)) < 0.005 else 'ODOO_CREDITED_CHECK'
-    if plan['op_class'] == 'B' and plan['so']:                    # 4) retorno WH/DEV: 205.06.003 -> 107.06.001
-        notes += reclass_returns(odoo, cfg, refund_id, uuid, plan['so']['id'], date, partner)
+    if plan['op_class'] == 'B' and plan['so']:                    # 4) retorno WH/DEV ya reclasificado -> concilia 107.06.001
+        notes += link_returns_to_nc(odoo, cfg, plan['so']['id'], plan['so']['name'])   # retornos reclasificados antes
+        sweep_returns(odoo, cfg, db, [rec['mkp_order_id']], out_notes=notes)                # retornos aún sin reclasificar
 
     body = (f"Nota de crédito ML {refund['name']} · NC {rec['serie']}-{rec['folio']} · UUID {uuid} · "
             f"${refund['amount_total']:,.2f} · Tipo {plan['op_class']} ({CLASS_DESC[plan['op_class']]}, {plan['account_code']}) · "
@@ -721,7 +771,7 @@ def main():
              f"bloqueo hasta {cfg['lock_date'] or '-'}")
 
     if RUN_MODE == "returns":
-        counts = sweep_returns(odoo, cfg, ONLY_ORDER_IDS or None)
+        counts = sweep_returns(odoo, cfg, db, ONLY_ORDER_IDS or None)
         db.close()
         log.info(f"=== Resumen barrido de retornos -> {counts} ===")
         return
@@ -790,8 +840,8 @@ def main():
                 log.error(f"[{status}] {tag}: {str(e)[:500]}")
                 bump(status)
 
-    if RUN_MODE != "preflight":   # retornos validados después de la NC
-        counts['retornos'] = sweep_returns(odoo, cfg, ONLY_ORDER_IDS or None)
+    # retornos WH/DEV: en preflight solo se cuentan; en orders/pending se reclasifican
+    counts['retornos'] = sweep_returns(odoo, cfg, db, ONLY_ORDER_IDS or None, dry=RUN_MODE == "preflight")
     if csv_file:
         csv_file.close()
         log.info(f"CSV de la corrida en seco: {csv_path}")
