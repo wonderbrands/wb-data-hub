@@ -1,6 +1,9 @@
 id: ml_credit_notes_flow
 namespace: wonderbrands.financial.mercadolibre
 description: "Pipeline Notas de Crédito ML (SOMOS-REYES, seller 25523702): Extrae de ML las NC (CFDI E) de órdenes facturadas (05). Arranca al terminar los pagos."
+# APAGADO hasta el pase a producción del flujo de NC: el 05 y el 06 todavía viven en test/
+# y hoy se corren a mano. Al promoverlos a processes/ se quita esta línea.
+disabled: true
 
 # La primera ejecución manual (scan_mode=sweep) es el barrido histórico desde el corte
 # de facturación; las automáticas solo consultan las órdenes que ya tocan según la cola
