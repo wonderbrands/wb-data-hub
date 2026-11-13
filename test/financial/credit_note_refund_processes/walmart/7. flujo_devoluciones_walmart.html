@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flujo de Devoluciones — Walmart</title>
+<style>
+  :root {
+    --black: #1A1A1A;
+    --yellow: #FFE600;
+    --white: #FFFFFF;
+    --gray-bg: #F7F7F5;
+    --gray-border: #E0E0DC;
+    --gray-text: #6B6B65;
+    --red-light: #FFF0ED;
+    --red-border: #F5A898;
+    --red-text: #C0392B;
+    --green-light: #EAF5EA;
+    --green-border: #90D090;
+    --green-text: #2E7D32;
+    --blue-light: #EBF3FB;
+    --blue-border: #90BBE0;
+    --blue-text: #1565C0;
+    --amber-light: #FFF8E6;
+    --amber-border: #F0D080;
+    --amber-text: #956300;
+    --lila-light: #F0EFFC;
+    --lila-border: #C4C0EC;
+    --lila-text: #4A46A0;
+    --walmart-light: #E8F5E9;
+    --walmart-border: #81C784;
+    --walmart-text: #1B5E20;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px; background: var(--white); color: var(--black);
+    line-height: 1.5; max-width: 860px; margin: 0 auto; padding: 32px 24px 60px;
+  }
+  .doc-header { margin-bottom: 32px; padding-bottom: 16px; border-bottom: 3px solid var(--yellow); }
+  .doc-header-tags { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .doc-header-tag { background: var(--black); color: var(--yellow); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px; }
+  .doc-header h1 { font-size: 20px; font-weight: 600; }
+  .doc-header-meta { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+  .section { margin-bottom: 32px; }
+  .section-label { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .step-badge { width: 26px; height: 26px; border-radius: 50%; background: var(--black); color: var(--yellow); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .section-label h2 { font-size: 14px; font-weight: 600; }
+  .connector { display: flex; flex-direction: column; align-items: center; padding: 4px 0; width: 100%; }
+  .connector .arrow-line { width: 2px; background: var(--gray-border); min-height: 20px; }
+  .arrow-head { font-size: 14px; line-height: 1; color: var(--gray-text); }
+  .card { border-radius: 8px; padding: 12px 14px; border: 1.5px solid var(--gray-border); background: var(--white); }
+  .card-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .card-sub { font-size: 11px; color: var(--gray-text); }
+  .card.trigger { background: var(--black); border-color: var(--black); color: var(--white); text-align: center; }
+  .card.trigger .card-title { color: var(--yellow); font-size: 14px; }
+  .card.ok { background: var(--green-light); border-color: var(--green-border); }
+  .card.ok .card-title { color: var(--green-text); }
+  .card.ok .card-sub { color: #1B5E20; }
+  .card.alert { background: var(--red-light); border-color: var(--red-border); }
+  .card.alert .card-title { color: var(--red-text); }
+  .card.alert .card-sub { color: var(--red-text); }
+  .card.process { background: var(--lila-light); border-color: var(--lila-border); text-align: center; width: 100%; }
+  .card.process .card-title { color: var(--lila-text); font-size: 14px; }
+  .card.process .card-sub { color: #3D39A0; }
+  .card.blue { background: var(--blue-light); border-color: var(--blue-border); }
+  .card.blue .card-title { color: var(--blue-text); }
+  .card.blue .card-sub { color: #0D47A1; }
+  .card.amber { background: var(--amber-light); border-color: var(--amber-border); }
+  .card.amber .card-title { color: var(--amber-text); }
+  .split-container { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }
+  .split-col { display: flex; flex-direction: column; align-items: center; }
+  .split-col .card { width: 100%; }
+  .branch-label { text-align: center; font-size: 11px; font-weight: 600; padding-bottom: 4px; }
+  .criteria-box { background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 6px; padding: 10px 14px; margin-top: 8px; }
+  .criteria-title { font-weight: 600; font-size: 11px; color: var(--black); margin-bottom: 6px; }
+  .criteria-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .criteria-row:last-child { margin-bottom: 0; }
+  .criteria-key { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--white); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--blue-text); white-space: nowrap; flex-shrink: 0; }
+  .criteria-val { font-size: 11px; color: var(--gray-text); }
+  code { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--black); }
+  .note { font-size: 11px; color: var(--gray-text); padding: 8px 12px; background: var(--amber-light); border-left: 3px solid var(--amber-border); border-radius: 0 6px 6px 0; margin-top: 6px; }
+  .note strong { color: var(--amber-text); }
+  .note.info { background: var(--blue-light); border-left-color: var(--blue-border); }
+  .note.info strong { color: var(--blue-text); }
+  .note.alert { background: var(--red-light); border-left-color: var(--red-border); }
+  .note.alert strong { color: var(--red-text); }
+  .asiento-box { border: 1.5px solid var(--lila-border); border-radius: 8px; overflow: hidden; width: 100%; margin-top: 10px; }
+  .asiento-header { background: var(--lila-light); padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--lila-text); border-bottom: 1px solid var(--lila-border); }
+  .asiento-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .asiento-table th { background: var(--gray-bg); padding: 5px 10px; font-size: 10px; font-weight: 600; color: var(--gray-text); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table th.r { text-align: right; }
+  .asiento-table td { padding: 6px 10px; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table tr:last-child td { border-bottom: none; }
+  .asiento-table tr:hover td { background: var(--gray-bg); }
+  .acc-name { font-weight: 500; color: var(--black); }
+  .acc-code { font-size: 10px; color: var(--gray-text); font-family: 'SF Mono','Fira Code',monospace; margin-top: 1px; }
+  .acc-sub { font-size: 10px; color: var(--gray-text); font-style: italic; margin-top: 1px; }
+  .db { font-weight: 500; color: var(--blue-text); text-align: right; }
+  .cr { font-weight: 500; color: var(--green-text); text-align: right; }
+  .dash { color: var(--gray-border); text-align: right; }
+  .sep-row td { background: var(--gray-bg); padding: 3px 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray-text); }
+  .log-box { background: var(--gray-bg); border: 1.5px solid var(--gray-border); border-radius: 8px; padding: 12px 14px; width: 100%; }
+  .log-box .card-title { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="doc-header">
+  <div class="doc-header-tags">
+    <span class="doc-header-tag">Proyecto IVA</span>
+    <span class="doc-header-tag" style="background:var(--walmart-light);color:var(--walmart-text);border:1px solid var(--walmart-border);">Walmart</span>
+  </div>
+  <h1>Flujo de Devoluciones — Reconocimiento Contable</h1>
+  <p class="doc-header-meta">Requerimientos de Finanzas → equipo de Data · Proceso propuesto · Junio 2026</p>
+</div>
+
+
+<!-- SECCIÓN 1 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">1</div>
+    <div><h2>Identificar devoluciones del mes en el reporte Walmart</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card trigger" style="width:320px;">
+      <div class="card-title">Devolución registrada en Walmart</div>
+    </div>
+  </div>
+
+  <div class="note info" style="margin-bottom:10px;">
+    <strong>Alcance del barrido:</strong> debido a potenciales errores y modificaciones en los reportes de los marketplaces, este proceso no se limitará a devoluciones generadas exclusivamente en el período de análisis. Sugerimos correr el script haciendo un barrido desde el 1 de enero de 2026 hasta la fecha de cierre del período de análisis (con un cap en 12 meses). Dependiendo de la demanda que dicho ejercicio genere, podríamos (i) separar el flujo de control hacia atrás del ejercicio mensual de emisión de notas de crédito, o (ii) limitar el período de revisión a menos meses. A definir a partir del feedback de Data.
+  </div>
+
+  <div class="criteria-box">
+    <div class="criteria-title">Cómo identificar una devolución en el reporte Walmart</div>
+    <div class="criteria-row">
+      <span class="criteria-key">return_quantity</span>
+      <span class="criteria-val">&gt; <code>0</code> · identifica filas de devolución</span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">return_order_date</span>
+      <span class="criteria-val">campo completo con fecha de la devolución</span>
+    </div>
+    <div class="note info" style="margin-top:8px;">
+      <strong>Criterio de corte:</strong> la devolución corresponde al mes en que Walmart registra la solicitud de devolución (<code>return_order_date</code>), independientemente de cuándo fue la venta original (<code>order_date</code>). Es habitual que la venta y la devolución caigan en períodos distintos.
+    </div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--gray-border);">
+      <div class="criteria-title">Campos clave por fila de devolución</div>
+      <div class="criteria-row">
+        <span class="criteria-key">customer_order_id</span>
+        <span class="criteria-val">ID del pedido original — vincula con la factura de venta en Odoo</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">return_order_id</span>
+        <span class="criteria-val">ID único de la devolución en Walmart (formato <code>RXXXXXXXXX</code>) — identificador de la NC</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">return_so_prime_line_sub_line_no</span>
+        <span class="criteria-val">ID de línea de la devolución — complementa el vínculo con Odoo</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">return_status</span>
+        <span class="criteria-val"><code>Completed</code> = devolución finalizada · única condición presente en el reporte</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">return_reason</span>
+        <span class="criteria-val">Motivo de la devolución reportado por el cliente — útil para análisis operativo</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">refund_amount</span>
+        <span class="criteria-val">Monto reembolsado al cliente (con IVA) — base para el importe de la NC</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Base NC</span>
+        <span class="criteria-val"><code>price_without_tax_amount</code> de la fila — ya viene desglosada en el reporte</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">IVA NC</span>
+        <span class="criteria-val"><code>tax_amount</code> de la fila — ya viene desglosada en el reporte</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">fulfillment_type</span>
+        <span class="criteria-val"><code>S2H</code> = WB despachó · <code>WFS</code> = Walmart despachó — determina el tratamiento de COGS (ver Paso 4)</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+
+<!-- SECCIÓN 2 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">2</div>
+    <div><h2>Validación cruzada con Odoo</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card process" style="width:380px;">
+      <div class="card-title">Script de validación cruzada</div>
+      <div class="card-sub">¿La SO asociada al customer_order_id existe en Odoo y tiene factura?</div>
+    </div>
+  </div>
+
+  <div style="margin-top:12px;">
+    <div class="split-container">
+      <div class="split-col">
+        <div class="branch-label" style="color:var(--green-text);">✓ SO existe con factura</div>
+        <div class="card ok">
+          <div class="card-title">Procede emisión de NC</div>
+          <div class="card-sub">Continúa al Paso 3</div>
+        </div>
+      </div>
+      <div class="split-col">
+        <div class="branch-label" style="color:var(--red-text);">✗ SO faltante o sin factura</div>
+        <div class="card alert">
+          <div class="card-title">Crear SO y generar factura</div>
+          <div class="card-sub">Para que la NC quede debidamente vinculada</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+  <div class="note" style="margin-top:6px;">
+    <strong>Este paso es parcialmente redundante con el flujo de facturación:</strong> si el proceso de facturación corrió correctamente, toda orden del mes ya debería tener SO y registro en Odoo antes de que se procese su devolución. La validación aquí actúa como salvaguarda. Queda a consideración de Data si implementarlo como un chequeo independiente o apoyarse en el resultado del flujo de facturación.
+  </div>
+
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+
+<!-- SECCIÓN 3 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">3</div>
+    <div><h2>Generación de Nota de Crédito</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card process" style="width:380px;">
+      <div class="card-title">Script genera NC en Odoo</div>
+      <div class="card-sub">WB emite la NC · vinculada a la factura original de la SO</div>
+    </div>
+  </div>
+
+  <div class="criteria-box" style="margin-top:10px;">
+    <div class="criteria-title">Importe de la NC</div>
+    <div class="criteria-row">
+      <span class="criteria-key">Base NC</span>
+      <span class="criteria-val"><code>price_without_tax_amount</code> — ya viene desglosada en el reporte</span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">IVA NC</span>
+      <span class="criteria-val"><code>tax_amount</code> — ya viene desglosada en el reporte</span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">Total NC</span>
+      <span class="criteria-val"><code>refund_amount</code> = <code>price_without_tax_amount</code> + <code>tax_amount</code></span>
+    </div>
+  </div>
+
+  <div class="note alert" style="margin-top:8px;">
+    <strong>⚠ Pendiente confirmación Walmart:</strong> WB es siempre el emisor de la NC. El <code>return_order_id</code> actúa como identificador de la devolución para el log de conciliación.
+  </div>
+  <div class="note info" style="margin-top:6px;">
+    <strong>NC por SO:</strong> si bien el reporte de devoluciones de Walmart tiene una fila por producto, si se devuelven dos productos de la misma SO en el mismo mes, podrá emitirse una única nota de crédito englobando ambas operaciones.
+  </div>
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+
+<!-- SECCIÓN 4 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">4</div>
+    <div><h2>Clasificación del tipo de devolución y asiento contable</h2></div>
+  </div>
+
+
+
+  <div class="criteria-box" style="margin-bottom:14px;">
+    <div class="criteria-title">⚠ Check previo — ¿Devolución completa o bonificación parcial?</div>
+    <div class="criteria-row">
+      <span class="criteria-key">refund_amount = price_amount</span>
+      <span class="criteria-val"><strong>Devolución completa</strong> — el cliente devuelve el producto y se reembolsa el 100% · aplica el asiento completo según Tipo A, B o C</span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">refund_amount &lt; price_amount</span>
+      <span class="criteria-val"><strong>Bonificación parcial</strong> — el cliente recibe un reembolso menor al precio original · aplica únicamente el asiento de ingresos (Dev., Descuentos o Bonificaciones + IVA + CxC). Sin movimiento de COGS independientemente del tipo.</span>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:8px;">
+
+    <!-- TIPO A -->
+    <div class="split-col">
+      <div class="branch-label" style="color:var(--blue-text);">Tipo A — Cancelación antes de despacho</div>
+      <div class="card blue" style="width:100%;margin-bottom:8px;">
+        <div class="card-title">Sin OUT en Odoo</div>
+        <div class="card-sub">Producto nunca despachado · aplica S2H y WFS</div>
+      </div>
+      <div class="asiento-box" style="margin-top:0;">
+        <div class="asiento-header">Asiento — Tipo A</div>
+        <table class="asiento-table">
+          <thead><tr><th>Cuenta</th><th></th><th class="r">Db</th><th class="r">Cr</th></tr></thead>
+          <tbody>
+            <tr class="sep-row"><td colspan="4">Ingresos</td></tr>
+            <tr>
+              <td><div class="acc-name">Dev., Descuentos o Bonificaciones</div><div class="acc-code">402-001-001</div></td>
+              <td></td><td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+              <td></td><td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Walmart</div><div class="acc-code">105.01.007</div></td>
+              <td></td><td class="dash">—</td><td class="cr">$</td>
+            </tr>
+            <tr class="sep-row"><td colspan="4">COGS</td></tr>
+            <tr>
+              <td><div class="acc-name">Mercancía Facturada No Enviada</div><div class="acc-code">205.06.003</div><div class="acc-sub">Transitoria · se revierte</div></td>
+              <td></td><td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Costo de Venta</div></td>
+              <td></td><td class="dash">—</td><td class="cr">$</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note info" style="width:100%;margin-top:6px;border-radius:6px;">
+        <strong>COGS:</strong> Mercancía Facturada No Enviada se revierte porque el costo nunca se materializó en una salida física. Solo aplica si es devolución completa — si es bonificación parcial, sin movimiento de COGS.
+      </div>
+    </div>
+
+    <!-- TIPO B -->
+    <div class="split-col">
+      <div class="branch-label" style="color:var(--green-text);">Tipo B — Devolución post-despacho</div>
+      <div class="card ok" style="width:100%;margin-bottom:8px;">
+        <div class="card-title">Con OUT · producto retorna</div>
+        <div class="card-sub">Aplica S2H y WFS · el producto vuelve al almacén</div>
+      </div>
+      <div class="asiento-box" style="margin-top:0;">
+        <div class="asiento-header">Asiento — Tipo B</div>
+        <table class="asiento-table">
+          <thead><tr><th>Cuenta</th><th></th><th class="r">Db</th><th class="r">Cr</th></tr></thead>
+          <tbody>
+            <tr class="sep-row"><td colspan="4">Ingresos</td></tr>
+            <tr>
+              <td><div class="acc-name">Dev., Descuentos o Bonificaciones</div><div class="acc-code">402-001-001</div></td>
+              <td></td><td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+              <td></td><td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Walmart</div><div class="acc-code">105.01.007</div></td>
+              <td></td><td class="dash">—</td><td class="cr">$</td>
+            </tr>
+            <tr class="sep-row"><td colspan="4">COGS</td></tr>
+            <tr>
+              <td><div class="acc-name">Devoluciones en Tránsito</div><div class="acc-sub">Transitoria · pendiente de creación</div></td>
+              <td></td><td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Costo de Venta</div></td>
+              <td></td><td class="dash">—</td><td class="cr">$</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note" style="width:100%;margin-top:6px;border-radius:6px;">
+        <strong>COGS:</strong> Devoluciones en Tránsito se libera contra Inventario al confirmarse la recepción física del producto (movimiento de RET en Odoo). Solo aplica si es devolución completa — si es bonificación parcial, sin movimiento de COGS.
+      </div>
+    </div>
+
+    <!-- TIPO C -->
+    <div class="split-col">
+      <div class="branch-label" style="color:var(--amber-text);">Tipo C — Bonificación sin retorno</div>
+      <div class="card amber" style="width:100%;margin-bottom:8px;">
+        <div class="card-title">Con OUT · producto no retorna</div>
+        <div class="card-sub">Producto despachado · no vuelve al almacén</div>
+      </div>
+      <div class="asiento-box" style="margin-top:0;">
+        <div class="asiento-header">Asiento — Tipo C</div>
+        <table class="asiento-table">
+          <thead><tr><th>Cuenta</th><th></th><th class="r">Db</th><th class="r">Cr</th></tr></thead>
+          <tbody>
+            <tr class="sep-row"><td colspan="4">Ingresos</td></tr>
+            <tr>
+              <td><div class="acc-name">Dev., Descuentos o Bonificaciones</div><div class="acc-code">402-001-001</div></td>
+              <td></td><td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+              <td></td><td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Walmart</div><div class="acc-code">105.01.007</div></td>
+              <td></td><td class="dash">—</td><td class="cr">$</td>
+            </tr>
+            <tr class="sep-row"><td colspan="4">COGS</td></tr>
+            <tr>
+              <td colspan="3"><div class="acc-sub" style="padding:4px 0;">Sin movimiento. El producto no retorna; el costo no se recupera.</div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note" style="width:100%;margin-top:6px;border-radius:6px;background:var(--amber-light);">
+        <strong>COGS:</strong> sin movimiento. El costo de la mercancía no se recupera porque el producto no vuelve al inventario.
+      </div>
+    </div>
+
+  </div>
+
+  <div class="note" style="margin-top:4px;">
+    <strong>WFS y clasificación:</strong> para órdenes <code>WFS</code>, Walmart gestiona el despacho y potencialmente la recepción del retorno. Pendiente confirmar con Operaciones si el OUT y RET de órdenes WFS se registra en Odoo o si requiere un flujo de conciliación adicional con Walmart.
+  </div>
+
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+
+<!-- SECCIÓN 5 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">5</div>
+    <div><h2>Log de conciliación</h2></div>
+  </div>
+
+  <div class="log-box">
+    <div class="card-title">Información registrada en la SO e Invoice de Odoo</div>
+    <div class="criteria-box" style="margin-top:8px;">
+      <div class="criteria-title">Datos a registrar en SO e Invoice de Odoo</div>
+      <div class="criteria-row">
+        <span class="criteria-key">customer_order_id</span>
+        <span class="criteria-val">ID del pedido original Walmart</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">return_order_id</span>
+        <span class="criteria-val">Identificador único de la devolución en Walmart</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">NC Odoo</span>
+        <span class="criteria-val">Referencia de la NC generada en Odoo</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">CFDI UUID</span>
+        <span class="criteria-val">UUID de la NC emitida por WB</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Tipo</span>
+        <span class="criteria-val">A — Cancelación antes de despacho / B — Devolución post-OUT / C — Bonificación sin retorno</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="connector"><div class="arrow-line"></div><div class="arrow-head">▼</div></div>
+
+
+<!-- SECCIÓN 6 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">6</div>
+    <div><h2>Aplicación del cobro en Odoo</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card blue" style="width:380px;text-align:center;">
+      <div class="card-title">Automático al registrar la NC en Odoo</div>
+      <div class="card-sub">Reverso de la aplicación de cobro</div>
+    </div>
+  </div>
+
+  <div class="criteria-box" style="margin-top:10px;">
+    <div class="criteria-title">El comportamiento depende del estado de la factura original al registrar la NC</div>
+    <div class="criteria-row">
+      <span class="criteria-key">Factura con cobro aplicado</span>
+      <span class="criteria-val">La aplicación se rompe, aumentando el saldo en la cuenta CxC Walmart</span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">Factura sin cobro aplicado</span>
+      <span class="criteria-val">La CxC ya disminuyó con la emisión de la NC, no se requieren acciones adicionales</span>
+    </div>
+  </div>
+
+  <div class="asiento-box">
+    <div class="asiento-header">Asiento — Reverso de cobro (por NC)</div>
+    <table class="asiento-table">
+      <thead>
+        <tr>
+          <th style="width:40%">Cuenta</th>
+          <th></th>
+          <th class="r">Db</th>
+          <th class="r">Cr</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <div class="acc-name">Walmart</div>
+            <div class="acc-code">105.01.007</div>
+            <div class="acc-sub">CxC — se disminuye por el importe de la NC</div>
+          </td>
+          <td></td>
+          <td class="db">$ NC + IVA</td>
+          <td class="dash">—</td>
+        </tr>
+        <tr>
+          <td>
+            <div class="acc-name">Liberaciones Walmart Pendientes de Procesar</div>
+            <div class="acc-sub">Cuenta puente · reverso del cobro registrado al momento de la liberación</div>
+          </td>
+          <td></td>
+          <td class="dash">—</td>
+          <td class="cr">$ NC + IVA</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+</body>
+</html>

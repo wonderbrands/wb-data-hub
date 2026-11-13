@@ -52,6 +52,27 @@ from _00_shipping_labels_db import (
 )
 import pricing_check
 from pricing_check import check_pricing
+from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
+
+# Órdenes con VoBo humano (sheet de reproceso). Se carga en el main.
+# TikTok ya no escribe BLOQUEADA_VALIDACION: toda falla queda REINTENTO_FALLIDO.
+# `retry_states` vuelve elegibles las filas que quedaron BLOQUEADA_VALIDACION
+# cuando ODOO_ORDER_MISSING juntaba errores de Odoo y SO aún no creadas.
+VOBO = VoboSheet('TikTok', retry_states=(EST_BLOCKED,))
+# Motivos que no son culpa de la orden: se reintentan SIN gastar intento del VoBo.
+VOBO_FREE_RETRY_REASONS = ('ODOO_LOOKUP_ERROR', 'ODOO_ORDER_MISSING')
+
+# Detalle (columna Reason) de cada motivo que devuelve search_sale_order.
+ODOO_PROBLEM_DETAILS = {
+    'ODOO_LOOKUP_ERROR': "Odoo no respondió al buscar la sale.order de la orden TikTok "
+                         "{order_id}. Se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_MISSING': "Aún no existe una sale.order para la orden TikTok {order_id}. "
+                          "Se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_DUPLICATED': "Hay varias sale.order vigentes para la orden TikTok {order_id} "
+                             "({so}). Cancela las sobrantes; se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_CANCELLED': "La sale.order {so} de la orden TikTok {order_id} está cancelada. "
+                            "No se genera guía; se reintenta en la siguiente corrida.",
+}
 
 
 # PyPDF2 sólo se usa para consolidar guías multicaja en un único PDF. Si no
@@ -1081,28 +1102,55 @@ def odoo_execute(models, uid, model: str, method: str, args: list, kwargs=None):
 
 
 def search_sale_order(models, uid, tiktok_order_id: str):
-    """Busca la SO por los campos de referencia de canal. Devuelve (id, name)."""
+    """
+    Busca la SO por los campos de referencia de canal.
+
+    Devuelve (id, name, motivo). `motivo` es None si hay UNA SO vigente; si no:
+      ODOO_LOOKUP_ERROR      Odoo falló y ningún campo encontró la SO (no se sabe si existe).
+      ODOO_ORDER_DUPLICATED  Más de una SO vigente (no cancelada) para la orden.
+      ODOO_ORDER_CANCELLED   Sólo hay SO canceladas.
+      ODOO_ORDER_MISSING     Odoo respondió y no hay SO (Yuju aún no la crea).
+    Las SO canceladas se ignoran si existe otra vigente (Yuju recreó la orden).
+    """
+    lookup_failed = False
     for field in cfg.ODOO_ORDER_REFERENCE_FIELDS:
         try:
             records = odoo_execute(
                 models, uid, 'sale.order', 'search_read',
                 [[(field, '=', tiktok_order_id)]],
-                {'fields': ['id', 'name', 'state'], 'limit': 2},
+                {'fields': ['id', 'name', 'state'], 'limit': 10},
             )
         except Exception as e:
             logger.error(f"Odoo: error buscando SO por {field}={tiktok_order_id}: {e}")
+            lookup_failed = True
             continue
-        if len(records) > 1:
-            logger.error(f"Odoo: varias SO para {field}={tiktok_order_id}. Se requiere revisión.")
-            return None, None
-        if records:
-            logger.info(
-                f"Odoo: SO {records[0]['name']} (id={records[0]['id']}) "
-                f"encontrada por {field}."
+        if not records:
+            continue
+
+        active = [r for r in records if r.get('state') != 'cancel']
+        if len(active) > 1:
+            active_names = ', '.join(str(r['name']) for r in active)
+            logger.error(
+                f"Odoo: varias SO vigentes para {field}={tiktok_order_id} "
+                f"({active_names}). Se requiere revisión."
             )
-            return int(records[0]['id']), str(records[0]['name'])
+            return None, active_names, 'ODOO_ORDER_DUPLICATED'
+        if not active:
+            logger.warning(
+                f"Odoo: la orden TikTok {tiktok_order_id} sólo tiene SO cancelada(s) "
+                f"({', '.join(str(r['name']) for r in records)})."
+            )
+            return int(records[0]['id']), str(records[0]['name']), 'ODOO_ORDER_CANCELLED'
+
+        so = active[0]
+        logger.info(f"Odoo: SO {so['name']} (id={so['id']}) encontrada por {field}.")
+        return int(so['id']), str(so['name']), None
+
+    if lookup_failed:
+        logger.error(f"Odoo: no se pudo confirmar la SO de la orden TikTok {tiktok_order_id}.")
+        return None, None, 'ODOO_LOOKUP_ERROR'
     logger.warning(f"Odoo: no se encontró SO para la orden TikTok {tiktok_order_id}.")
-    return None, None
+    return None, None, 'ODOO_ORDER_MISSING'
 
 
 def update_sale_order_tracking(models, uid, so_id: int, labels: list) -> bool:
@@ -1440,6 +1488,10 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
     forma de repartirlo y se registra el total.
     """
     order_id = ctx['order_id']
+    # POST_LABEL_UPDATE_FAILED llega tras register_success (ya marcada GUIA_GENERADA).
+    VOBO.annotate(order_id, odoo_id=ctx.get('so_name'), tienda=ctx.get('seller_name'))
+    if motivo != 'DRY_RUN':
+        VOBO.mark(order_id, EST_FAIL, count_attempt=motivo not in VOBO_FREE_RETRY_REASONS)
     logger.warning(f"MANUAL | Orden {order_id} | {motivo}: {detalle}")
     resumen.warning(
         f"MANUAL    | {ctx.get('seller_name', '')} | TikTok {order_id} | "
@@ -1511,7 +1563,8 @@ def close_manual_row(sheet_manual: dict, ctx: dict, labels: list,
         ctx.get('so_name') or cfg.NOT_APPLICABLE,
         'RESUELTA_AUTOMATICAMENTE',
         f"Guía generada en una corrida posterior: "
-        f"{', '.join(l['tracking_number'] for l in labels)}. Ya no requiere revisión.",
+        f"{', '.join(l['tracking_number'] for l in labels)}. Ya no requiere revisión."
+        f"{VOBO.note(order_id)}",
         get_attempt_number(sheet_manual, order_id),
         ", ".join(i['sku'] for i in ctx.get('items', [])) or cfg.NOT_APPLICABLE,
         normalize_provider(labels[0]['provider']),
@@ -1530,6 +1583,8 @@ def register_success(conn, sheet_success, sheet_manual, ctx: dict, labels: list,
     main_carrier = normalize_provider(labels[0]['provider'])
     main_service = labels[0]['service_level']
     status = 'LABELS_GENERATED' if (tiktok_ok and odoo_ok) else 'LABELS_GENERATED_PARTIAL_UPDATE'
+    VOBO.annotate(order_id, odoo_id=ctx.get('so_name'), tienda=ctx.get('seller_name'))
+    VOBO.mark(order_id, EST_OK)  # la guía existe aunque falle el reporte posterior
 
     upsert_sheet_row(sheet_success, order_id, [
         now_cdmx_str(),                                              # Time-stamp
@@ -1667,9 +1722,12 @@ def process_order(order, shop, access_token, conn, models, uid,
         return 'manual'
 
     if total_order_value <= 0:
-        register_manual(conn, sheet_manual, ctx, 'ORDER_VALUE_ZERO',
-                        "El valor de la orden es 0; no se puede validar el ratio de costo.")
-        return 'manual'
+        if order_id in VOBO:
+            logger.info(f"VoBo: la orden {order_id} tiene valor <= 0 pero tiene VoBo. Se continúa sin ratio de costo.")
+        else:
+            register_manual(conn, sheet_manual, ctx, 'ORDER_VALUE_ZERO',
+                            "El valor de la orden es 0; no se puede validar el ratio de costo.")
+            return 'manual'
 
     recipient_data = build_recipient_data(order)
     if not recipient_data['zip']:
@@ -1678,16 +1736,22 @@ def process_order(order, shop, access_token, conn, models, uid,
         return 'manual'
 
     # --- Orden de venta en Odoo -----------------------------------------
-    so_id, so_name = search_sale_order(models, uid, order_id)
+    # Ningún motivo de Odoo bloquea la orden: todos se reintentan en la
+    # siguiente corrida (ver VOBO_FREE_RETRY_REASONS para los intentos del VoBo).
+    so_id, so_name, odoo_problem = search_sale_order(models, uid, order_id)
     ctx['so_name'] = so_name
-    if not so_id:
-        register_manual(conn, sheet_manual, ctx, 'ODOO_ORDER_MISSING',
-                        f"No existe una sale.order asociada a la orden TikTok {order_id}.")
+    if odoo_problem:
+        register_manual(conn, sheet_manual, ctx, odoo_problem,
+                        ODOO_PROBLEM_DETAILS[odoo_problem].format(order_id=order_id, so=so_name))
         return 'manual'
 
     # --- Check de pricing (ANTES de crear paquete, cotizar o generar guía) --
     # Va después de buscar la SO para que el Sheet de manuales lleve el ID Odoo.
-    pricing_problems = check_order_pricing(order, conn, sheet_manual)
+    if order_id in VOBO:
+        logger.info(f"VoBo: la orden {order_id} tiene VoBo. Se omite el check de pricing.")
+        pricing_problems = []
+    else:
+        pricing_problems = check_order_pricing(order, conn, sheet_manual)
     if pricing_problems:
         pricing_status, pricing_message = pricing_check.resolve_pricing_outcome(pricing_problems)
         register_manual(conn, sheet_manual, ctx, pricing_status, pricing_message)
@@ -1721,7 +1785,8 @@ def process_order(order, shop, access_token, conn, models, uid,
 
     # --- Regla del 21% ---------------------------------------------------
     shipping_cost = sum(r['total_price'] for r in best_rates_map.values()) / 100.0
-    cost_ratio = shipping_cost / total_order_value
+    # Con valor <= 0 (sólo llega aquí con VoBo) no hay ratio que validar.
+    cost_ratio = shipping_cost / total_order_value if total_order_value > 0 else 0.0
 
     # Carrier cotizado: se registra aunque la guía no llegue a generarse.
     quoted_service = str(list(best_rates_map.values())[0].get('service_name') or '')
@@ -1735,7 +1800,9 @@ def process_order(order, shop, access_token, conn, models, uid,
         'rates_map': best_rates_map,
     }
 
-    if cost_ratio > cfg.LIMIT_RATIO_PERCENTAGE:
+    if cost_ratio > cfg.LIMIT_RATIO_PERCENTAGE and order_id in VOBO:
+        logger.info(f"VoBo: la orden {order_id} supera el límite ({cost_ratio:.1%}) pero tiene VoBo. Se continúa.")
+    elif cost_ratio > cfg.LIMIT_RATIO_PERCENTAGE:
         register_manual(
             conn, sheet_manual, ctx, 'LIMIT_RATIO_OVERCOME',
             f"El costo de envío (${shipping_cost:.2f}) representa el {cost_ratio:.1%} "
@@ -1777,7 +1844,8 @@ def process_order(order, shop, access_token, conn, models, uid,
         return 'skipped'
 
     # --- Generación de guías ---------------------------------------------
-    labels = generate_labels(best_rates_map, recipient_data, total_order_value)
+    declared_value = total_order_value if total_order_value > 0 else cfg.ZERO_VALUE_DECLARED_MXN
+    labels = generate_labels(best_rates_map, recipient_data, declared_value)
     if not labels:
         register_manual(conn, sheet_manual, ctx, 'LABEL_GENERATION_FAILED',
                         "La API interna no generó ninguna guía para la orden.",
@@ -1945,7 +2013,10 @@ def process_tiktok_bulky_labels():
         conn.close()
         return counters
 
-    sheet_success, sheet_manual = setup_report_sheets(authenticate_google_sheets())
+    gc = authenticate_google_sheets()
+    sheet_success, sheet_manual = setup_report_sheets(gc)
+    VOBO.load(gc)
+    resumen.info(f"VOBO      | {len(VOBO.ids())} orden(es) con VoBo para reproceso: {', '.join(VOBO.ids()) or 'ninguna'}")
     if sheet_success['worksheet'] is None or sheet_manual['worksheet'] is None:
         logger.warning(
             "Reportería de Google Sheets no disponible. El proceso continúa, "

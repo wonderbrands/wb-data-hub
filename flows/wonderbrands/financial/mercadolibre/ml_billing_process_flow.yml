@@ -79,3 +79,4 @@ errors:
       {
         "text": "🚨 *¡Fallo en Pipeline de Facturación ML (Scripts 01-02)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
       }
+disabled: false

@@ -26,6 +26,7 @@ pip-delete-this-directory.txt
 *.swo
 
 *.xml
+*.pdf
 
 #Files
 *.csv
@@ -33,3 +34,5 @@ pip-delete-this-directory.txt
 
 #Carpetas
 ml_traza/
+
+*.zip

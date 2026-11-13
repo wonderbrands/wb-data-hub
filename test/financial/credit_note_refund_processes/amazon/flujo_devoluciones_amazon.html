@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flujo de Devoluciones — Amazon</title>
+<style>
+  :root {
+    --black: #1A1A1A;
+    --yellow: #FFE600;
+    --white: #FFFFFF;
+    --gray-bg: #F7F7F5;
+    --gray-border: #E0E0DC;
+    --gray-text: #6B6B65;
+    --red-light: #FFF0ED;
+    --red-border: #F5A898;
+    --red-text: #C0392B;
+    --green-light: #EAF5EA;
+    --green-border: #90D090;
+    --green-text: #2E7D32;
+    --blue-light: #EBF3FB;
+    --blue-border: #90BBE0;
+    --blue-text: #1565C0;
+    --amber-light: #FFF8E6;
+    --amber-border: #F0D080;
+    --amber-text: #956300;
+    --lila-light: #F0EFFC;
+    --lila-border: #C4C0EC;
+    --lila-text: #4A46A0;
+    --orange-light: #FFF3E8;
+    --orange-border: #F5C080;
+    --orange-text: #8B4500;
+    --teal-light: #E6F5F2;
+    --teal-border: #80C8BC;
+    --teal-text: #0F6E56;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px; background: var(--white); color: var(--black);
+    line-height: 1.5; max-width: 900px; margin: 0 auto; padding: 32px 24px 60px;
+  }
+
+  .doc-header { margin-bottom: 32px; padding-bottom: 16px; border-bottom: 3px solid var(--yellow); }
+  .doc-header-tags { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .doc-header-tag { background: var(--black); color: var(--yellow); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px; }
+  .doc-header h1 { font-size: 20px; font-weight: 600; }
+  .doc-header-meta { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+
+  .section { margin-bottom: 28px; }
+  .section-label { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .step-badge { width: 26px; height: 26px; border-radius: 50%; background: var(--black); color: var(--yellow); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .section-label h2 { font-size: 14px; font-weight: 600; }
+  .section-label p { font-size: 12px; color: var(--gray-text); margin-top: 1px; }
+
+  .connector { display: flex; flex-direction: column; align-items: center; padding: 4px 0; width: 100%; }
+  .connector .arrow-line { width: 2px; background: var(--gray-border); min-height: 20px; }
+  .arrow-head { font-size: 14px; line-height: 1; color: var(--gray-text); }
+
+  .card { border-radius: 8px; padding: 12px 14px; border: 1.5px solid var(--gray-border); background: var(--white); }
+  .card-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .card-sub { font-size: 11px; color: var(--gray-text); }
+  .card.trigger { background: var(--black); border-color: var(--black); color: var(--white); text-align: center; }
+  .card.trigger .card-title { color: var(--yellow); font-size: 14px; }
+  .card.condition { background: var(--amber-light); border-color: var(--amber-border); text-align: center; }
+  .card.condition .card-title { color: var(--amber-text); }
+  .card.condition .card-sub { color: #7A5200; }
+  .card.ok { background: var(--green-light); border-color: var(--green-border); }
+  .card.ok .card-title { color: var(--green-text); }
+  .card.ok .card-sub { color: #1B5E20; }
+  .card.alert { background: var(--red-light); border-color: var(--red-border); }
+  .card.alert .card-title { color: var(--red-text); }
+  .card.process { background: var(--lila-light); border-color: var(--lila-border); text-align: center; width: 100%; }
+  .card.process .card-title { color: var(--lila-text); }
+  .card.blue { background: var(--blue-light); border-color: var(--blue-border); }
+  .card.blue .card-title { color: var(--blue-text); }
+  .card.orange { background: var(--orange-light); border-color: var(--orange-border); }
+  .card.orange .card-title { color: var(--orange-text); }
+
+  .split-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .split-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .split-col { display: flex; flex-direction: column; align-items: center; }
+  .split-col .card { width: 100%; }
+  .split-connector { width: 2px; background: var(--gray-border); height: 14px; }
+  .branch-label { text-align: center; font-size: 11px; font-weight: 600; padding-bottom: 4px; }
+  .branch-label.ok { color: var(--green-text); }
+  .branch-label.warn { color: var(--red-text); }
+  .branch-label.amber { color: var(--amber-text); }
+  .branch-label.blue { color: var(--blue-text); }
+  .branch-label.orange { color: var(--orange-text); }
+
+  .criteria-box { background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 6px; padding: 10px 14px; margin-top: 8px; }
+  .criteria-title { font-weight: 600; font-size: 11px; color: var(--black); margin-bottom: 6px; }
+  .criteria-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .criteria-row:last-child { margin-bottom: 0; }
+  .criteria-key { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--white); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--blue-text); white-space: nowrap; flex-shrink: 0; }
+  .criteria-val { font-size: 11px; color: var(--gray-text); }
+  code { font-family: 'SF Mono','Fira Code',monospace; font-size: 10px; background: var(--gray-bg); border: 1px solid var(--gray-border); border-radius: 3px; padding: 1px 5px; color: var(--black); }
+
+  .note { font-size: 11px; color: var(--gray-text); padding: 8px 12px; background: var(--amber-light); border-left: 3px solid var(--amber-border); border-radius: 0 6px 6px 0; margin-top: 6px; }
+  .note strong { color: var(--amber-text); }
+  .note.info { background: var(--blue-light); border-left-color: var(--blue-border); }
+  .note.info strong { color: var(--blue-text); }
+
+  /* Asiento tables */
+  .asiento-box { border: 1.5px solid var(--lila-border); border-radius: 8px; overflow: hidden; width: 100%; margin-top: 8px; }
+  .asiento-box.ok { border-color: var(--green-border); }
+  .asiento-box.amber { border-color: var(--amber-border); }
+  .asiento-box.orange { border-color: var(--orange-border); }
+  .asiento-header { background: var(--lila-light); padding: 7px 12px; font-size: 11px; font-weight: 600; color: var(--lila-text); border-bottom: 1px solid var(--lila-border); }
+  .asiento-box.ok .asiento-header { background: var(--green-light); color: var(--green-text); border-bottom-color: var(--green-border); }
+  .asiento-box.amber .asiento-header { background: var(--amber-light); color: var(--amber-text); border-bottom-color: var(--amber-border); }
+  .asiento-box.orange .asiento-header { background: var(--orange-light); color: var(--orange-text); border-bottom-color: var(--orange-border); }
+  .asiento-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .asiento-table th { background: var(--gray-bg); padding: 5px 10px; font-size: 10px; font-weight: 600; color: var(--gray-text); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table th.r { text-align: right; }
+  .asiento-table td { padding: 6px 10px; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table tr:last-child td { border-bottom: none; }
+  .asiento-table tr:hover td { background: var(--gray-bg); }
+  .acc-name { font-weight: 500; color: var(--black); }
+  .acc-code { font-size: 10px; color: var(--gray-text); font-family: 'SF Mono','Fira Code',monospace; margin-top: 1px; }
+  .acc-sub { font-size: 10px; color: var(--gray-text); font-style: italic; margin-top: 1px; }
+  .db { font-weight: 500; color: var(--blue-text); text-align: right; }
+  .cr { font-weight: 500; color: var(--green-text); text-align: right; }
+  .dash { color: var(--gray-border); text-align: right; }
+  .sep-row td { background: var(--gray-bg); padding: 3px 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray-text); }
+  .no-cogs td { font-size: 11px; color: var(--gray-text); font-style: italic; padding: 7px 10px; }
+
+  .log-box { background: var(--gray-bg); border: 1.5px solid var(--gray-border); border-radius: 8px; padding: 12px 14px; width: 100%; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="doc-header">
+  <div class="doc-header-tags">
+    <span class="doc-header-tag">Proyecto IVA</span>
+    <span class="doc-header-tag" style="background:var(--orange-light);color:var(--orange-text);border:1px solid var(--orange-border);">Amazon</span>
+  </div>
+  <h1>Flujo de Devoluciones — Reconocimiento Contable</h1>
+  <p class="doc-header-meta">Requerimientos de Finanzas → equipo de Data · Proceso propuesto · Mayo 2026</p>
+</div>
+
+
+<!-- PASO 1 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">1</div>
+    <div><h2>Identificar devoluciones del mes en el reporte Amazon</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card trigger" style="width:320px;">
+      <div class="card-title">Devolución registrada en Amazon</div>
+    </div>
+  </div>
+
+  <div class="criteria-box">
+    <div class="criteria-title">Cómo identificar devoluciones en el reporte BI 3.0</div>
+    <div class="criteria-row">
+      <span class="criteria-key">Col G — transaction_type</span>
+      <span class="criteria-val">= <code>Refund</code></span>
+    </div>
+    <div class="criteria-row">
+      <span class="criteria-key">Col F — posted_date</span>
+      <span class="criteria-val">= mes bajo análisis</span>
+    </div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--gray-border);">
+      <div class="criteria-title">Dos tipos de movimiento dentro de Refund</div>
+      <div class="criteria-row">
+        <span class="criteria-key">description = Refund</span>
+        <span class="criteria-val">Devolución regular — el cliente devuelve el producto. Aplican los tres tipos de asiento (A / B / C).</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">description = DisbursementOnlyRefund</span>
+        <span class="criteria-val">Ajuste de fondos sin retorno de producto — equivalente a una bonificación. Solo aplica el asiento Tipo C.</span>
+      </div>
+    </div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--gray-border);">
+      <div class="criteria-title">Campos clave</div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col C — order_id</span>
+        <span class="criteria-val">ID de la orden original en Amazon</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col D — so</span>
+        <span class="criteria-val">SO de Odoo ya cruzada en el reporte</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col Z — product_charges</span>
+        <span class="criteria-val">Monto devuelto (valor negativo). Base para la NC.</span>
+      </div>
+      <div class="criteria-row">
+        <span class="criteria-key">Col X — our_price_tax</span>
+        <span class="criteria-val">IVA devuelto (valor negativo). <code>product_charges + our_price_tax</code> = importe total de la NC.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- PASO 2 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">2</div>
+    <div><h2>Validación cruzada con Odoo</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card condition" style="width:340px;">
+      <div class="card-title">Script de validación cruzada</div>
+      <div class="card-sub">¿La SO asociada al order_id existe en Odoo y tiene factura?</div>
+    </div>
+  </div>
+
+  <div style="margin-top:4px;" class="split-2">
+    <div class="split-col">
+      <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+      <div class="branch-label ok">✓ SO existe con factura</div>
+      <div class="card ok" style="width:90%">
+        <div class="card-title">Procede emisión de NC</div>
+        <div class="card-sub">Continúa al Paso 3</div>
+      </div>
+    </div>
+    <div class="split-col">
+      <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+      <div class="branch-label warn">✗ SO faltante o sin factura</div>
+      <div class="card alert" style="width:90%">
+        <div class="card-title">Crear SO y generar factura</div>
+        <div class="card-sub">Para que la NC quede debidamente vinculada y el proceso documentado</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="note info" style="margin-top:8px;">
+    <strong>Nota para equipo de Data:</strong> Este paso es parcialmente redundante con el flujo de facturación — si el proceso de facturación corrió correctamente, toda orden de venta del mes ya debería tener SO y factura en Odoo antes de que se procese su devolución. La validación aquí actúa como salvaguarda. Queda a consideración de Data si implementarlo como un chequeo independiente o apoyarse en el resultado del flujo de facturación.
+  </div>
+
+  <div class="connector" style="margin-top:8px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- PASO 3 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">3</div>
+    <div><h2>Generación de Nota de Crédito</h2></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card condition" style="width:360px;">
+      <div class="card-title">¿La orden es de Amazon Business (B2B)?</div>
+      <div class="card-sub">Determina si Amazon emite la NC o si WB la genera</div>
+    </div>
+  </div>
+
+  <div style="margin-top:4px;" class="split-2">
+
+    <!-- B2B -->
+    <div class="split-col">
+      <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+      <div class="branch-label blue">✓ B2B — Amazon emite la NC</div>
+      <div class="card blue" style="width:100%">
+        <div class="card-title">Jalar NC de Amazon a Odoo</div>
+        <div class="card-sub">Vincular a la factura original · mismo mecanismo que facturación B2B</div>
+      </div>
+    </div>
+
+    <!-- B2C -->
+    <div class="split-col">
+      <div style="width:2px;height:20px;background:var(--gray-border);"></div>
+      <div class="branch-label orange">✗ B2C — WB genera la NC</div>
+      <div class="card orange" style="width:100%">
+        <div class="card-title">Script genera NC en Odoo</div>
+        <div class="card-sub">NC vinculada a la factura original de la SO · importe: <code>product_charges + our_price_tax</code></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- PASO 4 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">4</div>
+    <div><h2>Clasificación del tipo de devolución y asiento contable</h2><p>Misma lógica de tres tipos que Mercado Libre · pendiente revisar con Data la implementación en el script actual</p></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;margin-bottom:8px;">
+    <div class="card condition" style="width:380px;">
+      <div class="card-title">¿Qué tipo de devolución es?</div>
+      <div class="card-sub">El script clasifica según el estado de la orden: despacho y retorno del producto</div>
+      <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--amber-border);font-size:11px;color:var(--amber-text);text-align:left;">
+        Los <strong>DisbursementOnlyRefund</strong> siempre son Tipo C. Para los <strong>Refund</strong> regulares, la clasificación entre A/B vs. C debería seguir lineamientos iguales o similares a los que usamos hoy para separar las bonificaciones y descuentos de Amazon — pendiente confirmar la lógica exacta con Data revisando el script actual.
+      </div>
+    </div>
+  </div>
+
+  <div class="split-3" style="align-items:start;">
+
+    <!-- TIPO A -->
+    <div class="split-col">
+      <div class="branch-label warn" style="font-size:10px;">Tipo A — Cancelación antes de despacho</div>
+      <div style="font-size:10px;color:var(--gray-text);text-align:center;margin-bottom:4px;">Sin OUT en Odoo</div>
+      <div class="asiento-box" style="border-color:var(--red-border);">
+        <div class="asiento-header" style="background:var(--red-light);color:var(--red-text);border-bottom-color:var(--red-border);">Asiento — Tipo A</div>
+        <table class="asiento-table">
+          <thead><tr><th style="width:52%">Cuenta</th><th class="r">Db</th><th class="r">Cr</th></tr></thead>
+          <tbody>
+            <tr class="sep-row"><td colspan="3">Ingresos</td></tr>
+            <tr>
+              <td><div class="acc-name">Dev., Descuentos o Bonificaciones</div><div class="acc-code">402-001-001</div></td>
+              <td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+              <td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Amazon</div><div class="acc-code">105-001-006</div></td>
+              <td class="dash">—</td><td class="cr">$</td>
+            </tr>
+            <tr class="sep-row"><td colspan="3">COGS</td></tr>
+            <tr>
+              <td><div class="acc-name">Mercancía Facturada No Enviada</div><div class="acc-sub">Transitoria · se revierte</div></td>
+              <td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Costo de Venta</div></td>
+              <td class="dash">—</td><td class="cr">$</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note" style="width:100%;margin-top:6px;font-size:10px;">
+        <strong>Mercancía Facturada No Enviada</strong> se revierte porque el costo nunca se materializó en una salida física.
+      </div>
+    </div>
+
+    <!-- TIPO B -->
+    <div class="split-col">
+      <div class="branch-label amber" style="font-size:10px;">Tipo B — Devolución post-despacho</div>
+      <div style="font-size:10px;color:var(--gray-text);text-align:center;margin-bottom:4px;">Con OUT · producto retorna</div>
+      <div class="asiento-box amber">
+        <div class="asiento-header">Asiento — Tipo B</div>
+        <table class="asiento-table">
+          <thead><tr><th style="width:52%">Cuenta</th><th class="r">Db</th><th class="r">Cr</th></tr></thead>
+          <tbody>
+            <tr class="sep-row"><td colspan="3">Ingresos</td></tr>
+            <tr>
+              <td><div class="acc-name">Dev., Descuentos o Bonificaciones</div><div class="acc-code">402-001-001</div></td>
+              <td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+              <td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Amazon</div><div class="acc-code">105-001-006</div></td>
+              <td class="dash">—</td><td class="cr">$</td>
+            </tr>
+            <tr class="sep-row"><td colspan="3">COGS</td></tr>
+            <tr>
+              <td><div class="acc-name">Devoluciones en Tránsito</div><div class="acc-sub">Transitoria · pendiente de creación</div></td>
+              <td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Costo de Venta</div></td>
+              <td class="dash">—</td><td class="cr">$</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note" style="width:100%;margin-top:6px;font-size:10px;">
+        <strong>Devoluciones en Tránsito</strong> se libera contra Inventario al confirmarse la recepción física del producto (movimiento de RET en Odoo).
+      </div>
+    </div>
+
+    <!-- TIPO C -->
+    <div class="split-col">
+      <div class="branch-label ok" style="font-size:10px;">Tipo C — Bonificación sin retorno</div>
+      <div style="font-size:10px;color:var(--gray-text);text-align:center;margin-bottom:4px;">DisbursementOnlyRefund o bonif. acordada</div>
+      <div class="asiento-box ok">
+        <div class="asiento-header">Asiento — Tipo C</div>
+        <table class="asiento-table">
+          <thead><tr><th style="width:52%">Cuenta</th><th class="r">Db</th><th class="r">Cr</th></tr></thead>
+          <tbody>
+            <tr class="sep-row"><td colspan="3">Ingresos</td></tr>
+            <tr>
+              <td><div class="acc-name">Dev., Descuentos o Bonificaciones</div><div class="acc-code">402-001-001</div></td>
+              <td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+              <td class="db">$</td><td class="dash">—</td>
+            </tr>
+            <tr>
+              <td><div class="acc-name">Amazon</div><div class="acc-code">105-001-006</div></td>
+              <td class="dash">—</td><td class="cr">$</td>
+            </tr>
+            <tr class="sep-row"><td colspan="3">COGS</td></tr>
+            <tr class="no-cogs"><td colspan="3">Sin movimiento. El producto no retorna; el costo no se recupera.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note" style="width:100%;margin-top:6px;font-size:10px;">
+        Los movimientos <strong>DisbursementOnlyRefund</strong> siempre clasifican como Tipo C.
+      </div>
+    </div>
+
+  </div>
+
+  <div class="connector" style="margin-top:14px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- PASO 5 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">5</div>
+    <div><h2>Log de conciliación</h2><p>Información registrada en la SO e Invoice de Odoo</p></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="log-box" style="max-width:500px;">
+      <div class="card-title" style="margin-bottom:8px;">Datos a registrar en SO e Invoice de Odoo</div>
+      <div style="display:flex;flex-direction:column;gap:5px;">
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">Amazon order_id</span>
+          <span class="criteria-val">ID de la orden original (Col C del reporte)</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">NC Odoo</span>
+          <span class="criteria-val">Referencia de la NC generada en Odoo</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">CFDI UUID</span>
+          <span class="criteria-val">UUID de la NC emitida (por Amazon en B2B, por WB en B2C)</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">Tipo</span>
+          <span class="criteria-val">A — Cancelación antes de despacho / B — Devolución post-OUT / C — Bonificación</span>
+        </div>
+        <div class="criteria-row" style="margin:0;">
+          <span class="criteria-key" style="background:var(--white);">Canal</span>
+          <span class="criteria-val">B2B (NC emitida por Amazon) / B2C (NC emitida por WB)</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector" style="margin-top:12px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head">▼</div>
+  </div>
+</div>
+
+
+<!-- PASO 6 -->
+<div class="section">
+  <div class="section-label">
+    <div class="step-badge">6</div>
+    <div><h2>Aplicación del cobro en Odoo</h2><p>Automático al registrar la NC en Odoo</p></div>
+  </div>
+
+  <div style="display:flex;justify-content:center;">
+    <div class="card" style="max-width:520px;width:100%;background:var(--blue-light);border-color:var(--blue-border);">
+      <div class="card-title" style="color:var(--blue-text);margin-bottom:8px;">Reverso de la aplicación de cobro</div>
+      <div style="font-size:11px;color:var(--gray-text);margin-bottom:10px;">El comportamiento depende del estado de la factura de venta original al momento de registrar la NC:</div>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <div style="background:var(--white);border:1px solid var(--blue-border);border-radius:6px;padding:8px 12px;">
+          <div style="font-size:11px;font-weight:600;color:var(--blue-text);margin-bottom:3px;">Si la factura ya tenía cobro aplicado</div>
+          <div style="font-size:11px;color:var(--gray-text);">La aplicación se rompe y se disminuye el saldo en <code>Liberaciones Amazon Pendientes de Procesar</code>.</div>
+        </div>
+        <div style="background:var(--white);border:1px solid var(--blue-border);border-radius:6px;padding:8px 12px;">
+          <div style="font-size:11px;font-weight:600;color:var(--blue-text);margin-bottom:3px;">Si la factura aún no tenía cobro aplicado</div>
+          <div style="font-size:11px;color:var(--gray-text);">Se disminuye directamente la cuenta por cobrar <code>105-001-006 Amazon</code>.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

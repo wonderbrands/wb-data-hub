@@ -14,6 +14,7 @@ variables:
   db_user: "kestra_bot"
   db_name: "tools"
   db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  spreadsheet_reprocess_id: "1bnymFhXE75ejJVAF9FepTpBQrRocCcmE9NA6VO6-_ac"
 
 tasks:
   - id: working_env_amazon
@@ -49,6 +50,14 @@ tasks:
           odoo_dbV18: "{{ vars.odoo_db }}"
           odoo_user_dataV18: "{{ secret('odoo_user_dataV18') }}"
           odoo_password_dataV18: "{{ secret('odoo_password_dataV18') }}"
+
+          # Google Sheets (sheet de reproceso)
+          GOOGLE_CREDS_JSON: "{{ secret('GOOGLE_CREDS_TIKTOK_JSON') }}"
+
+          # --- Reproceso de guías con VoBo (sheet de control de reprocesamiento) ---
+          SPREADSHEET_REPROCESS_ID: "{{ vars.spreadsheet_reprocess_id }}"
+          MAX_REPROCESS_ATTEMPTS: "3"
+          VOBO_DRY_RUN: "false"
 
           #Nivel de Logs
           LOG_LEVEL: "INFO"
