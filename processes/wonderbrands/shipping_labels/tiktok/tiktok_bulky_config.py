@@ -118,6 +118,7 @@ _SHOP_DEFINITIONS = [
     {'slug': 'NEON', 'seller_name': 'Neon', 'default_enabled': 'true'},          # próximamente
     {'slug': 'KH', 'seller_name': 'KingsHouse', 'default_enabled': 'true'},
     {'slug': 'NEOND', 'seller_name': 'ColorDreams Home (NEON Deportes)', 'default_enabled': 'true'},
+    {'slug': 'VOLTIO', 'seller_name': 'Voltio', 'default_enabled': 'true'},
 ]
 
 

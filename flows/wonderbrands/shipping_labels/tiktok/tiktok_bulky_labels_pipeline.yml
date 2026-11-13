@@ -69,6 +69,10 @@ tasks:
           TIKTOK_NEON_APP_SECRET: "{{ secret('TIKTOK_NEON_APP_SECRET') }}"
           TIKTOK_NEON_SHOP_CIPHER: "{{ secret('TIKTOK_NEON_SHOP_CIPHER') }}"
 
+          TIKTOK_VOLTIO_APP_KEY: "{{ secret('TIKTOK_VOLTIO_APP_KEY') }}"
+          TIKTOK_VOLTIO_APP_SECRET: "{{ secret('TIKTOK_VOLTIO_APP_SECRET') }}"
+          TIKTOK_VOLTIO_SHOP_CIPHER: "{{ secret('TIKTOK_VOLTIO_SHOP_CIPHER') }}"
+
 
           # NO es BULKY
           TIKTOK_CDH_APP_KEY: "{{ secret('TIKTOK_CDH_APP_KEY') }}"
@@ -116,6 +120,9 @@ tasks:
 
           TIKTOK_NEON_ENABLED: "true"
           TIKTOK_NEON_SELLER_NAME: "Neon"
+
+          TIKTOK_VOLTIO_ENABLED: "true"
+          TIKTOK_VOLTIO_SELLER_NAME: "Voltio"
 
           # --- Tienda FULL: TikTok entrega la guía, no aplica a este flujo ---
           TIKTOK_CDH_ENABLED: "false"
