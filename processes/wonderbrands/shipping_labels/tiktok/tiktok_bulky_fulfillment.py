@@ -1662,6 +1662,60 @@ def _to_decimal(value):
         return None
 
 
+# --- HOTFIX BUEN FIN ---------------------------------------------------------
+# Mínimos fijos (sin cupón) de los SKU -DPT. Mientras dure el Buen Fin SUSTITUYEN
+# al MATI y al Sheet de pricing para estos SKU, en todas las tiendas de TikTok.
+# Pasada BUEN_FIN_HASTA el mapa se ignora solo y todo vuelve al check de siempre;
+# después se puede borrar este bloque y `check_line_pricing`.
+BUEN_FIN_MINIMOS = {
+    'CLASSH2-DPT': Decimal('1699.00'),
+    'CLASSH1-DPT': Decimal('1399.00'),
+    'PLUS2-DPT': Decimal('2299.00'),
+    'CLASSICFOAM2-S-DPT': Decimal('1799.00'),
+    'PLUS4-DPT': Decimal('3399.00'),
+    'PLUS1-DPT': Decimal('1849.00'),
+    'CLASSICFOAM1-DPT': Decimal('1399.00'),
+    'DLUXEH2-DPT': Decimal('2849.00'),
+    'PLUS3-DPT': Decimal('2659.00'),
+    'PROH1-DPT': Decimal('1949.00'),
+    'PLUS4-S-DPT': Decimal('3429.00'),
+    'PLUS3-S-DPT': Decimal('2659.00'),
+    'CP3DREAM80-DPT': Decimal('899.00'),
+    'CLASSICFOAM2-DPT': Decimal('1799.00'),
+    'TOPDREAM2M-DPT': Decimal('899.00'),
+    'MAXH2-DPT': Decimal('1859.00'),
+    'MAXH3-DPT': Decimal('2159.00'),
+}
+# Vigencia en hora CDMX, evaluada al momento de procesar la orden.
+BUEN_FIN_HASTA = datetime(2026, 11, 17, 23, 59, 59, tzinfo=CDMX_TZ)
+BUEN_FIN_SOURCE = 'BUEN_FIN_HARDCODE'
+
+
+def check_line_pricing(sku, price, sale_time, conn, now=None):
+    """
+    Igual que `check_pricing`, salvo que durante el Buen Fin los SKU de
+    BUEN_FIN_MINIMOS se validan contra su mínimo fijo (precio >= mínimo).
+    Cualquier otro SKU, o cualquier momento posterior a BUEN_FIN_HASTA, va
+    directo a `check_pricing` sin cambio alguno.
+    """
+    sku = str(sku or '').strip()
+    now = now or datetime.now(timezone.utc)
+    minimum = BUEN_FIN_MINIMOS.get(sku)
+    if minimum is None or now > BUEN_FIN_HASTA:
+        return check_pricing(
+            sku, price, sale_time, conn,
+            sheet_rows=_PRICING_SHEET_ROWS, channel_id='tiktok',
+        )
+    price_dec = _to_decimal(price)
+    approved = price_dec is not None and price_dec >= minimum
+    return {
+        'approved': approved,
+        'minimum': minimum,
+        'source': BUEN_FIN_SOURCE,
+        'problem': None if approved else 'PRICE_BELOW_MINIMUM',
+    }
+
+
 def get_platform_coupon(line: dict):
     """
     Cupón / descuento de plataforma de UNA línea (en TikTok, una pieza).
@@ -1773,19 +1827,13 @@ def check_order_pricing(order: dict, conn, sheet_manual: dict):
                     f"Pricing: conexión al Sheet de pricing FALLIDA: "
                     f"{type(e).__name__}: {e!r}"
                 )
-        result = check_pricing(
-            sku, line.get('sale_price'), sale_time, conn,
-            sheet_rows=_PRICING_SHEET_ROWS, channel_id='tiktok',
-        )
+        result = check_line_pricing(sku, line.get('sale_price'), sale_time, conn)
         coupon, coupon_valid = get_platform_coupon(line)
         sale_price = _to_decimal(line.get('sale_price'))
         rescued = False
         if (not result['approved'] and result['problem'] == 'PRICE_BELOW_MINIMUM'
                 and coupon_valid):
-            retry = check_pricing(
-                sku, sale_price + coupon, sale_time, conn,
-                sheet_rows=_PRICING_SHEET_ROWS, channel_id='tiktok',
-            )
+            retry = check_line_pricing(sku, sale_price + coupon, sale_time, conn)
             if retry['approved']:
                 result, rescued = retry, True
         notes.append({
