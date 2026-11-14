@@ -30,9 +30,11 @@ de Amazon quedan fuera del alcance de este script. Ese hueco lo cubre
 ===============================================================================
 LAS TRES REGLAS QUE PIDIO FINANZAS
 ===============================================================================
-  1. Distinguir B2B. Se detecta por la existencia real del CFDI en
-     somos_reyes.amz_b2b_invoices, no por la marca IsBusinessOrder: preferimos
-     verificar que el comprobante exista antes que asumir que deberia existir.
+  1. Distinguir B2B. Una orden es Amazon Business si tiene IsBusinessOrder O
+     si Amazon ya emitio su CFDI (somos_reyes.amz_b2b_invoices). Las Business
+     las factura SOLO Amazon (Jero, 8-nov-2026): con CFDI se vincula; sin CFDI
+     queda en B2B_SIN_CFDI y nunca se emite a publico general. Hasta el 8-nov
+     se decidia solo por el CFDI, y 75 Business sin CFDI salieron a PG.
 
   2. Sin restriccion de OUT. Se factura sobre la cantidad PEDIDA, haya
      movimiento de salida o no. La politica de Odoo ya esta en "cantidades
@@ -73,6 +75,9 @@ ESTADOS EN finance.mkp_billing_{staging|prod}
   ALREADY_ODOO_INVOICED  ya tenia factura viva en Odoo (incluye factura global)
   B2B_FACTURADA_PG       B2B con factura viva a publico general: anularla
                          antes de vincular el CFDI de Amazon. Se reevalua.
+  B2B_SIN_CFDI           orden Business (IsBusinessOrder) sin CFDI de Amazon.
+                         No se factura; pasa a PENDING_B2B_LINK cuando Amazon
+                         emita el CFDI. Se reevalua.
   SKIPPED_GRACE          dentro del periodo de gracia
   TOTAL_DIFF             el importe de Odoo no cuadra con el de Amazon. NO se
                          factura; sale en el reporte de Finanzas.
@@ -208,8 +213,12 @@ AMZ_ORDER_IDS = [o.strip() for o in os.getenv('AMZ_ORDER_IDS', '').split(',') if
 CON_ALCANCE = bool(AMZ_SETTLEMENT_ID or AMZ_ORDER_IDS)
 
 # Dias que se le dan al cliente para autofacturar con su RFC antes de que
-# emitamos a publico en general.
-GRACE_DAYS = int(os.getenv('AMZ_GRACE_DAYS', '5'))
+# emitamos a publico en general. Se cuentan desde la COMPRA (PurchaseDate), y
+# la orden ademas tiene que estar cobrada (el miner solo lee ordenes con
+# transaccion). Jero, 9-nov-2026: "al menos 6 dias desde la compra y ya tiene
+# su Shipment". Antes eran 5 dias desde el cobro, y como Amazon cobra con una
+# mediana de 6 dias, la factura salia ~11 dias despues de la compra.
+GRACE_DAYS = int(os.getenv('AMZ_GRACE_DAYS', '6'))
 
 # =============================================================================
 # CIERRE DE MES -- LA VENTA SE FACTURA CON FECHA DE SU MES
@@ -404,10 +413,11 @@ MINER_OVERFETCH = int(os.getenv('AMZ_MINER_OVERFETCH', '3'))
 # se saltean"): SO_DRAFT (fallo la confirmacion), SO_CANCELLED (filas de
 # antes de que se facturaran las SO canceladas), B2B_NO_RECEPTOR (Odoo
 # rechazo el alta del cliente) y B2B_FACTURADA_PG (en cuanto se anule la
-# factura a publico general, la orden se vincula al CFDI de Amazon).
+# factura a publico general, la orden se vincula al CFDI de Amazon) y
+# B2B_SIN_CFDI (en cuanto Amazon emita el CFDI, la orden se vincula).
 REFRESCABLES = ('PENDING_B2B_LINK', 'PENDING_WB_INVOICE', 'SKIPPED_GRACE', 'ERROR',
                 'SO_DRAFT', 'SO_CANCELLED', 'B2B_NO_RECEPTOR', 'B2B_FACTURADA_PG',
-                'ENVIO_SIN_CONFIRMAR')
+                'ENVIO_SIN_CONFIRMAR', 'B2B_SIN_CFDI')
 
 # Las que el miner regresa a pendiente al refrescarlas (todas menos ERROR, que
 # se reintenta por retry_count_loader y lo revisa una persona).
@@ -993,6 +1003,7 @@ def run_miner(db_conn):
 
     if not rows:
         return {'b2b': 0, 'b2c': 0, 'ya_existian': 0, 'gracia': 0,
+                'business_sin_cfdi': 0,
                 'multi_cfdi': [], 'split_fallido': [], 'refrescadas': 0}
 
     # posted_date viene en hora de CDMX (QUERY_LOTE resta las 6 h).
@@ -1004,6 +1015,7 @@ def run_miner(db_conn):
                  f"{corte_gracia:%Y-%m-%d} se factura sin gracia y con fecha "
                  f"{corte_gracia - timedelta(days=1):%Y-%m-%d} (incluye DEFERRED).")
     res = {'b2b': 0, 'b2c': 0, 'ya_existian': 0, 'gracia': 0,
+           'business_sin_cfdi': 0,
            'multi_cfdi': [], 'split_fallido': [], 'refrescadas': 0}
     w = db_conn.cursor()
     # Cursor aparte, con diccionario, para las consultas de desglose de las
@@ -1055,8 +1067,17 @@ def run_miner(db_conn):
             continue
         es_nueva = ya is None
 
-        tipo = 'B2B' if es_b2b else 'B2C_PUBLICO_GENERAL'
-        status = 'PENDING_B2B_LINK' if es_b2b else 'PENDING_WB_INVOICE'
+        # Orden Business sin CFDI de Amazon: la factura solo Amazon. No se
+        # emite a publico general; se espera el CFDI (Jero, 8-nov-2026).
+        es_business = es_b2b or int(row.get('is_business_order') or 0) == 1
+        tipo = 'B2B' if es_business else 'B2C_PUBLICO_GENERAL'
+        if es_b2b:
+            status = 'PENDING_B2B_LINK'
+        elif es_business:
+            status = 'B2B_SIN_CFDI'
+            res['business_sin_cfdi'] += 1
+        else:
+            status = 'PENDING_WB_INVOICE'
 
         # Referencia de importe. En B2B manda el CFDI que YA emitio Amazon, no
         # nuestra suma de transacciones: el comprobante fiscal existe y su
@@ -1105,15 +1126,16 @@ def run_miner(db_conn):
             importe_ref = a_float(row['cfdi_total'])
 
         # Periodo de gracia: solo aplica a B2C. Si Amazon ya emitio el CFDI no
-        # hay nada que esperar.
-        if not es_b2b and row['posted_date']:
+        # hay nada que esperar. Se cuenta desde la compra; si amazon_orders no
+        # trae PurchaseDate, desde el cobro.
+        if not es_business and row['posted_date']:
             posted = row['posted_date']
             if isinstance(posted, str):
                 posted = datetime.strptime(posted[:19], '%Y-%m-%d %H:%M:%S')
             venta = row.get('purchase_date') or posted
             if isinstance(venta, str):
                 venta = datetime.strptime(venta[:19], '%Y-%m-%d %H:%M:%S')
-            if (hoy - posted).days < GRACE_DAYS \
+            if (hoy - venta).days < GRACE_DAYS \
                     and not (corte_gracia and venta < corte_gracia):
                 status = 'SKIPPED_GRACE'
                 res['gracia'] += 1
@@ -1146,7 +1168,7 @@ def run_miner(db_conn):
             # la tomara igual, porque busca por status y no por id.
             res['refrescadas'] += 1
             continue
-        if status in ('SKIPPED_GRACE', 'B2B_SPLIT_MISMATCH'):
+        if status in ('SKIPPED_GRACE', 'B2B_SPLIT_MISMATCH', 'B2B_SIN_CFDI'):
             continue
         if es_b2b:
             res['b2b'] += 1
@@ -1156,8 +1178,9 @@ def run_miner(db_conn):
     w.close()
     w_dict.close()
     log.info(f"[MINER] Nuevas -> B2B: {res['b2b']} | B2C: {res['b2c']} | "
-             f"en gracia: {res['gracia']} | refrescadas: {res['refrescadas']} | "
-             f"ya cerradas: {res['ya_existian']}")
+             f"en gracia: {res['gracia']} | Business sin CFDI de Amazon (no se "
+             f"facturan): {res['business_sin_cfdi']} | refrescadas: "
+             f"{res['refrescadas']} | ya cerradas: {res['ya_existian']}")
 
     if res['multi_cfdi']:
         log.info(f"[MINER] {len(res['multi_cfdi'])} orden(es) con varios CFDI "
@@ -1372,6 +1395,34 @@ def detectar_b2b_tardio(db_conn, records):
     """, tuple(ids))
     con_cfdi = dict(cursor.fetchall())
 
+    # Orden Business sin CFDI de Amazon: tampoco se emite a publico general
+    # (Jero, 8-nov-2026). Cubre filas que el miner ya no relee (fuera de su
+    # ventana) o que quedaron PENDING_WB_INVOICE antes de esta regla.
+    sin_cfdi = [r['mkp_order_id'] for r in candidatos
+                if r['mkp_order_id'] not in con_cfdi]
+    business = set()
+    if sin_cfdi:
+        cursor.execute(f"""
+            SELECT AmazonOrderId FROM somos_reyes.amazon_orders
+            WHERE AmazonOrderId IN ({', '.join(['%s'] * len(sin_cfdi))})
+            GROUP BY AmazonOrderId
+            HAVING MAX(IFNULL(IsBusinessOrder, 0)) = 1
+        """, tuple(sin_cfdi))
+        business = {f[0] for f in cursor.fetchall()}
+    if business:
+        for r in candidatos:
+            if r['mkp_order_id'] not in business:
+                continue
+            cursor.execute(f"""
+                UPDATE {TBL_BILLING}
+                SET status = 'B2B_SIN_CFDI', error_log = %s, processed_at = NOW()
+                WHERE id = %s AND status = 'PENDING_WB_INVOICE'
+            """, ('Orden Amazon Business sin CFDI de Amazon: la factura solo '
+                  'Amazon. No se emite a publico general.', r['id']))
+        db_conn.commit()
+        log.warning(f"[LOADER] {len(business)} orden(es) Business sin CFDI de "
+                    f"Amazon estaban como B2C. Pasan a B2B_SIN_CFDI; no se facturan.")
+
     if con_cfdi:
         for r in candidatos:
             uuid = con_cfdi.get(r['mkp_order_id'])
@@ -1390,7 +1441,7 @@ def detectar_b2b_tardio(db_conn, records):
                     f"tienen CFDI vivo de Amazon. Reclasificadas a "
                     f"PENDING_B2B_LINK; no se facturan en esta corrida.")
     cursor.close()
-    return set(con_cfdi.keys())
+    return set(con_cfdi.keys()) | business
 
 
 def buscar_so(odoo, so_name):

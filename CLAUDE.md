@@ -205,7 +205,7 @@ Volumen de SO en Odoo de sep–oct-2026 (`odoo_new_sale_order_live`, `state` en 
 - **Toda venta cobrada se factura**, aunque la SO esté en borrador (`action_confirm`) o cancelada (se factura y la NC sale por devoluciones). **Yuju crea las SO; nosotros nunca.** Sin SO → solo alerta.
 - **Sin restricción de OUT.** Se factura lo pedido; la contrapartida va a la 205.06.003 y se concilia con la salida (`conciliar_salida`). Cierre mensual del residuo de costeo contra 501.01.001 (`11_ajuste_cogs_205.py`).
 - **La venta se factura en su mes.** Los días de cierre (≤ 3 por las 72 h del SAT) la venta del mes anterior sale con fecha del último día, sin gracia. **El SAT no permite timbrar un CFDI con más de 72 h de antigüedad**: el histórico no se puede emitir con su fecha.
-- **Centavos.** En una factura que timbramos **nunca se edita la línea de IVA**: Odoo recalcula por línea y el PAC rechaza (CFDI40119). El ±0.01 se salda en el cobro contra 704.23.001.
+- **Centavos.** En una factura que timbramos **nunca se edita la línea de IVA**: Odoo recalcula por línea y el PAC rechaza (CFDI40119). La diferencia (hasta $0.15 por factura en Amazon) se salda en el cobro contra 704.23.001.
 - **Cobros.** La unidad de liberación puede ser la pieza, no la orden: una factura puede quedar **parcialmente pagada** entre depósitos (no es error). La conciliación va contra la **transitoria** del marketplace.
 - **El asistente de pago usa la CxC de la factura.** Antes de aplicar, se valida que la factura esté en la CxC del marketplace (`CXC_INCORRECTA`).
 - **Un cobro aplicado a una factura que después se cancela queda colgado** y el loader lo da por aplicado. No aplicar cobros a facturas que se van a cancelar (por eso los cobros de B2B esperan a que se vincule el CFDI).
@@ -241,8 +241,9 @@ Una tienda nueva va en `ml_stores.STORES` más un par de YAML, nunca con scripts
 
 **Resumen:**
 - `amz_billing_payments_flow` corre 00 → 01 → 02 → 03 a las 02:30 y 15:00. `start_date` vacío = día 1 del mes anterior.
-- **01:** B2B = CFDI de Amazon Business vinculado (no se timbra); B2C = lo timbramos nosotros tras 5 días de gracia.
-- **02/03:** cobros por settlement; solo contra 105.01.006; los cobros de B2B esperan la vinculación.
+- **01:** Business (`IsBusinessOrder` o CFDI de Amazon) = solo la factura Amazon: con CFDI se vincula (no se timbra), sin CFDI queda en `B2B_SIN_CFDI`. B2C = lo timbramos nosotros tras 6 días de gracia desde la compra.
+- **02/03:** cobros por settlement; solo contra 105.01.006; los cobros de Business esperan la vinculación del CFDI de Amazon; redondeo hasta $0.15 por factura contra 704.23.001.
+- **Barrido histórico** (Business A6–A9 y facturación ene–oct): brief en `test/.../amazon/BARRIDO_HISTORICO_AMAZON.md`.
 - `amz_cierre_mercFacNoEnv_flow` (11): cierre de la 205.06.003, día 2.
 
 **Datos de Amazon (`somos_reyes`):**
