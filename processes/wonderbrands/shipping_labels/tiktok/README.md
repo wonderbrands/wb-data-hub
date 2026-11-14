@@ -93,6 +93,28 @@ intento. Créalo sólo si migras esos scripts al mismo criterio.
 | `UNEXPECTED_ERROR` | Excepción no contemplada. |
 | `DRY_RUN` | Simulación: la orden pasó todas las validaciones pero no se generó guía. |
 
+### Cupón de TikTok en el check de pricing
+
+TikTok paga los descuentos de plataforma (cupones), pero `sale_price` (lo que
+Yuju pasa a Odoo) ya los trae restados, así que una orden con cupón podía caer en
+`LIMIT_PRICING_OVERCOME` aunque el precio real no estuviera bajo el priceado.
+
+`check_order_pricing` valida primero con `sale_price`, como siempre. **Solo si
+una línea queda bajo el mínimo** y `original_price − seller_discount −
+platform_discount = sale_price` (tolerancia de $0.01), reintenta con
+`sale_price + platform_discount`. Si falta un campo o no cuadra, no se suma
+nada. No cambia el mínimo, MATI ni el Sheet, ni la regla del 21 %, ni el valor
+declarado a la paquetería.
+
+- **Aprobada por cupón**: la guía sigue su camino normal y la nota ("precio +
+  cupón = total ≥ mínimo") queda en el chatter de la SO, en `error_log` de
+  `tools.shipping_labels` (status `LABELS_GENERATED`) y en el resumen de Kestra.
+- **Sigue bajo el mínimo**: status `LIMIT_PRICING_OVERCOME` y la columna
+  `Reason` de `Guias_automaticas_manuales` agrega por SKU el precio, el mínimo y
+  si hubo cupón: `sin cupón TikTok`, `cupón TikTok $X (con cupón $Y) tampoco
+  alcanza`, `cupón no validado` o `cupón no informado`. CS ya no necesita bajar
+  el reporte de ventas de TikTok.
+
 ### Reproceso con VoBo (pestaña `TikTok` del sheet de reprocesamiento)
 
 TikTok **no** escribe `BLOQUEADA_VALIDACION`: cualquier motivo de la tabla
