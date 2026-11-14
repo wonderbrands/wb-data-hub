@@ -115,6 +115,22 @@ declarado a la paquetería.
   alcanza`, `cupón no validado` o `cupón no informado`. CS ya no necesita bajar
   el reporte de ventas de TikTok.
 
+### Mínimos fijos del Buen Fin (temporal, hasta el 17-nov-2026 23:59:59 CDMX)
+
+Mientras dure el Buen Fin, 17 SKU `-DPT` se validan contra un mínimo fijo
+(`BUEN_FIN_MINIMOS` en `tiktok_bulky_fulfillment.py`) **en lugar de** MATI y del
+Sheet de pricing, en todas las tiendas de TikTok. El mapa también cubre
+`CLASSICFOAM2-S-DPT` y `DLUXEH2-DPT`, que antes caían en `NOT_SKU_PRICED`.
+
+- La regla es la de siempre: precio ≥ mínimo, y si queda bajo el mínimo todavía
+  aplica el reintento con el cupón de TikTok (arriba).
+- Cualquier SKU fuera del mapa conserva el check normal (MATI y luego Sheet).
+- La vigencia se evalúa al momento de **procesar** la orden (`BUEN_FIN_HASTA`,
+  hora CDMX). Pasada esa hora el mapa se ignora solo, sin redeploy; después se
+  puede borrar el bloque y `check_line_pricing`.
+- El log por línea muestra `fuente BUEN_FIN_HARDCODE` cuando se usó el mínimo fijo.
+- No cambian la regla del 21 %, el valor declarado ni el reproceso con VoBo.
+
 ### Reproceso con VoBo (pestaña `TikTok` del sheet de reprocesamiento)
 
 TikTok **no** escribe `BLOQUEADA_VALIDACION`: cualquier motivo de la tabla
