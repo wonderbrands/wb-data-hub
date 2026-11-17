@@ -28,6 +28,7 @@ variables:
 
 concurrency:
   limit: 1
+  behavior: CANCEL
 
 tasks:
   # ---------- 1. Respaldo del estado actual de Kestra -> rama kestra-drift ----------
