@@ -132,14 +132,18 @@ def classify_sla(expected_date_cdmx, override_days, cutoff_time):
 
     if expected_date <= today_date:
         return "TODAY"
+
+    # Adelantamiento activo (override_days > 0 y vigente): gana al corte.
+    # Cubre mañana y días posteriores, a cualquier hora.
+    if override_days > 0 and expected_date <= today_date + timedelta(days=override_days):
+        return "FORCED_BY_WAREHOUSE"
+
+    # Sin adelantamiento (0 días o vencido): solo mañana, después del corte.
     if expected_date == today_date + timedelta(days=1):
         # Usamos el cutoff_time dinámico de la BD
         if now.hour >= cutoff_time:
             return "NEXT_DAY_LABEL_CREATED_EARLY"
         return "FUTURE_DAYS"
-
-    if override_days > 0 and expected_date <= today_date + timedelta(days=override_days):
-        return "FORCED_BY_WAREHOUSE"
 
     return "FUTURE_DAYS"
 
