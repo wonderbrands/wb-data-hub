@@ -34,6 +34,9 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
+          memory:
+            memory: "512MB"
+            memorySwap: "1024MB"
         env:
           #Credenciales de la API de Cotización y Generación
           AUTH_USER: "{{ secret('AUTH_USER') }}"

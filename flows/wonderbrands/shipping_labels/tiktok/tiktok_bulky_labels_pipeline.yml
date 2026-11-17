@@ -38,6 +38,9 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
+          memory:
+            memory: "512MB"
+            memorySwap: "1024MB"
         # El reintento es seguro: una orden que ya tiene guía queda con
         # label_generated=1 en tools.shipping_labels y se omite en el reintento.
         env:
