@@ -36,6 +36,9 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
+          memory:
+            memory: "768MB"
+            memorySwap: "1024MB"
         env:
           DB_HOST: "{{ vars.db1_host }}"
           DB_USER: "{{ vars.db_user }}"
@@ -52,6 +55,9 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
+          memory:
+            memory: "768MB"
+            memorySwap: "1024MB"
         env:
           ODOO_URL: "{{ vars.odoo_url }}" 
           ODOO_DB: "{{ vars.odoo_db }}"
