@@ -41,7 +41,7 @@ tasks:
           pullPolicy: NEVER
           memory:
             memory: "512MB"
-            memorySwap: "2048MB"
+            memorySwap: "1024MB"
           #cpus: 1
         env:
            DB_HOST: "{{ vars.db1_host }}"

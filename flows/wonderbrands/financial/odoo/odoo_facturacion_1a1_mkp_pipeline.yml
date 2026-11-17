@@ -54,7 +54,7 @@ tasks:
           pullPolicy: NEVER
           memory:
             memory: "512MB"
-            memorySwap: "2048MB"
+            memorySwap: "1024MB"
         env:
           ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"

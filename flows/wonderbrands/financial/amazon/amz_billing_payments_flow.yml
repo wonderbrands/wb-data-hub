@@ -88,7 +88,7 @@ tasks:
           pullPolicy: NEVER
           memory:
             memory: "512MB"
-            memorySwap: "2048MB"
+            memorySwap: "1024MB"
         env:
           AMZ_ENTORNO: "prod"
           PYTHONUNBUFFERED: "1"   # el log se ve en vivo en Kestra

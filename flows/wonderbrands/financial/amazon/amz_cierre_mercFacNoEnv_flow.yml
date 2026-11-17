@@ -50,7 +50,7 @@ tasks:
           pullPolicy: NEVER
           memory:
             memory: "512MB"
-            memorySwap: "2048MB"
+            memorySwap: "1024MB"
         env:
           AMZ_ENTORNO: "prod"
           ODOO_URL: "{{ vars.odoo_url }}"
