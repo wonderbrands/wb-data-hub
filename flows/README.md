@@ -50,6 +50,16 @@ y este sync no los toca. No agregues aquí flujos de esos namespaces.
 4. **Nunca editar en la UI de Kestra** flujos de estos namespaces. Para probar, usa el sandbox (ver abajo).
 5. **Secrets siempre con `{{ secret('NOMBRE') }}`.** Nunca credenciales en el YAML.
 6. Todo flujo productivo lleva un bloque `errors` con alerta a Slack.
+7. **Todo `taskRunner` Docker declara `memory`.** Kestra v2 ya no tiene defaults globales de plugin:
+   sin este bloque el contenedor no tiene límite (`docker inspect` → `Memory 0`) y un script
+   descontrolado puede tumbar a Kestra y Postgres en la EC2 (4 GB). Valores actuales:
+   - Guías, reportes, alertas: `memory: "512MB"`, `memorySwap: "1024MB"`.
+   - Facturación/pagos de ML: `memory: "768MB"`, `memorySwap: "1024MB"`. Más holgado porque
+     si el kernel mata el script a media escritura en Odoo, el estado queda incierto.
+
+   `memorySwap` es RAM **+** swap (no solo swap). No subirlo de más: un script que vive en swap
+   es muy lento y retiene un hilo del worker. Si un flujo necesita más, se ajusta en su YAML
+   con el pico medido (`memory.peak` del cgroup del contenedor).
 
 ---
 
@@ -106,6 +116,9 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
+          memory:                 # obligatorio (regla 7)
+            memory: "512MB"
+            memorySwap: "1024MB"
         env:
           LOG_LEVEL: "INFO"
         commands:
