@@ -65,10 +65,18 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # subiendo carpeta por carpeta desde el archivo que los importa, así que desde
 # cualquier carpeta donde Kestra clone el repo termina encontrándolos acá.
 # (NODE_PATH solo no alcanza: los archivos .mjs del motor lo ignoran.)
-RUN npm install --prefix / --no-save --no-package-lock --omit=dev --no-audit --no-fund \
+#
+# Se instala en una carpeta propia y después se mueve a /: npm no acepta la raíz
+# del disco como proyecto. Con `npm install --prefix /` corriendo en / el build
+# fallaba con `npm error Tracker "idealTree" already exists`.
+WORKDIR /tmp/npm-build
+RUN npm install --no-save --no-package-lock --omit=dev --no-audit --no-fund \
     mysql2@3.24.6 \
     dotenv@17.4.2 \
-    && npm cache clean --force
+    && mv node_modules /node_modules \
+    && npm cache clean --force \
+    && cd / && rm -rf /tmp/npm-build
+WORKDIR /
 ENV NODE_PATH=/node_modules
 
 # Prueba final: si falta cualquier cosa, el build falla acá.
