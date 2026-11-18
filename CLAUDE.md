@@ -244,6 +244,12 @@ Una tienda nueva va en `ml_stores.STORES` más un par de YAML, nunca con scripts
 - **01:** Business (`IsBusinessOrder` o CFDI de Amazon) = solo la factura Amazon: con CFDI se vincula (no se timbra), sin CFDI queda en `B2B_SIN_CFDI`. B2C = lo timbramos nosotros tras 6 días de gracia desde la compra.
 - **02/03:** cobros por settlement; solo contra 105.01.006; los cobros de Business esperan la vinculación del CFDI de Amazon; redondeo hasta $0.15 por factura contra 704.23.001.
 - **Barrido histórico** (Business A6–A9 y facturación ene–oct): brief en `test/.../amazon/BARRIDO_HISTORICO_AMAZON.md`.
+- **Autocorrección (17-nov):**
+  - una factura cancelada sin reemplazo reabre la orden (la B2C se reemite con sustitución 04);
+  - un cobro que cancela Finanzas se reaplica solo;
+  - `B2B_SPLIT_MISMATCH` y `NO_SO_IN_ODOO` se reevalúan en cada corrida;
+  - las órdenes cobradas sin SO se siembran y alertan;
+  - alerta de compañía por CFDI cancelado ante el SAT con asiento publicado.
 - `amz_cierre_mercFacNoEnv_flow` (11): cierre de la 205.06.003, día 2.
 
 **Datos de Amazon (`somos_reyes`):**

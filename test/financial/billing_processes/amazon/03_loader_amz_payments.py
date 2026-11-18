@@ -71,7 +71,7 @@ import sys
 import json
 import time as tm
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import xmlrpc.client
 
 logging.basicConfig(level=logging.INFO,
@@ -286,6 +286,82 @@ def claim(db_conn, record_id):
     ganado = cursor.rowcount > 0
     cursor.close()
     return ganado
+
+
+# =============================================================================
+# REAPLICACION DE COBROS QUE CANCELA FINANZAS
+# =============================================================================
+# Acuerdo 2.4 (Jero, 8-nov-2026) y flujo v3, paso 6: "Finanzas cancela el
+# cobro (borrador con nota y cancelar) y el flujo lo reaplica contra la
+# factura vigente". Pasa cuando un cobro quedo sobre una factura que despues
+# se cancelo (B2B a publico general, portal) o sobre una CxC equivocada.
+#
+# La fila de mkp_payments_prod se quedaba en ODOO_PAID y nadie la volvia a
+# tomar. Ahora, al arrancar, se buscan los pagos del diario AMZ cancelados en
+# los ultimos AMZ_REAPLICAR_DIAS dias, se identifica su fila por el memo
+# ("AMZ <settlement> / <orden>", el que pone aplicar_pago) y se regresa a
+# PENDING. Si la orden ya tiene otro pago vivo con el mismo memo (ya se
+# reaplico, o Finanzas solo cancelo uno de varios), no se toca.
+#
+# El asiento AUTOPROMO no se duplica: registrar_promo() lo reconoce por ref.
+# Las reglas de siempre siguen aplicando a la reaplicacion: si la factura
+# vigente no esta en 105.01.006 queda en CXC_INCORRECTA, y si es Business sin
+# CFDI de Amazon vinculado, espera en NO_INVOICE.
+# =============================================================================
+REAPLICAR_DIAS = int(os.getenv('AMZ_REAPLICAR_DIAS', '30'))
+PREFIJO_MEMO = 'AMZ '
+
+
+def reabrir_cobros_cancelados(odoo, db_conn, journal_id):
+    """Regresa a PENDING los cobros cuyo pago cancelo Finanzas en Odoo.
+    Devuelve la lista '<pago> -> <payment_id>' de lo reabierto."""
+    campos = odoo.execute_kw('account.payment', 'fields_get', [],
+                             {'attributes': ['type']})
+    # Odoo 18 guarda el memo en 'memo'; versiones anteriores, en 'ref'.
+    memo = 'memo' if 'memo' in campos else 'ref'
+    desde = (datetime.utcnow() - timedelta(days=REAPLICAR_DIAS)).strftime('%Y-%m-%d %H:%M:%S')
+    cancelados = odoo.execute_kw(
+        'account.payment', 'search_read',
+        [[('journal_id', '=', journal_id), ('state', 'in', ['canceled', 'cancel']),
+          ('write_date', '>=', desde), (memo, '=like', f'{PREFIJO_MEMO}%')]],
+        {'fields': ['name', memo]})
+    if not cancelados:
+        return []
+
+    memos = sorted({p[memo] for p in cancelados if p.get(memo)})
+    vivos = odoo.execute_kw(
+        'account.payment', 'search_read',
+        [[('journal_id', '=', journal_id), ('state', 'not in', ['canceled', 'cancel']),
+          (memo, 'in', memos)]],
+        {'fields': [memo]})
+    con_pago_vivo = {p[memo] for p in vivos}
+
+    reabiertos = []
+    cursor = db_conn.cursor()
+    for p in cancelados:
+        texto = p.get(memo) or ''
+        if texto in con_pago_vivo:
+            continue
+        partes = texto[len(PREFIJO_MEMO):].split(' / ', 1)
+        if len(partes) != 2:
+            continue
+        payment_id = f"{partes[0].strip()}:{partes[1].strip()}"
+        cursor.execute(f"""
+            UPDATE {TBL_PAYMENTS}
+            SET status = 'PENDING', processed_at = NOW(),
+                error_log = %s
+            WHERE marketplace = %s AND payment_id = %s
+              AND status IN ('ODOO_PAID', 'ALREADY_PAID')
+        """, (f"REAPLICAR: {p['name']} cancelado en Odoo; se aplica contra la "
+              f"factura vigente.", MARKETPLACE, payment_id))
+        if cursor.rowcount:
+            reabiertos.append(f"{p['name']} -> {payment_id}")
+    db_conn.commit()
+    cursor.close()
+    if reabiertos:
+        log.info(f"{len(reabiertos)} cobro(s) cancelado(s) por Finanzas regresan a "
+                 f"PENDING para reaplicarse.")
+    return reabiertos
 
 
 def update_payment(db_conn, record_id, status, error_log=None):
@@ -1239,6 +1315,11 @@ def procesar(odoo, db_conn, journal_id, record, stats, ctx):
 def run():
     validar_entorno()
     db_conn = get_db_connection()
+    # Odoo se abre antes de leer la cola: primero se reabren los cobros que
+    # Finanzas cancelo, para que entren en esta misma corrida.
+    odoo = OdooModelProxy(timeout=300)
+    journal_id = resolve_journal(odoo)
+    reaplicados = reabrir_cobros_cancelados(odoo, db_conn, journal_id)
     records = fetch_pendientes(db_conn)
 
     if not records:
@@ -1250,8 +1331,6 @@ def run():
     log.info(f"{len(records)} cobro(s) pendientes "
              f"({reintentos} son reintentos de NO_INVOICE).")
 
-    odoo = OdooModelProxy(timeout=300)
-    journal_id = resolve_journal(odoo)
     ctx = preparar_contexto(odoo)
 
     stats = {'aplicados': 0, 'ya_pagadas': 0, 'monto': 0.0,
@@ -1259,7 +1338,8 @@ def run():
              'inciertos': [], 'ajustados': [], 'parciales': [],
              'por_settlement': {}, 'sin_envio': [],
              'promos': [], 'redondeos': [],
-             'cxc_incorrecta': [], 'espera_b2b': []}
+             'cxc_incorrecta': [], 'espera_b2b': [],
+             'reaplicados': reaplicados}
 
     for record in records:
         if not claim(db_conn, record['id']):
@@ -1297,6 +1377,9 @@ def reportar(stats):
     log.info(f"  Reparto sin envio       : {len(stats['sin_envio'])}")
     log.info(f"  CxC incorrecta (aparte) : {len(stats['cxc_incorrecta'])}")
     log.info(f"  B2B esperando su CFDI   : {len(stats['espera_b2b'])}")
+    log.info(f"  Reabiertos (cancelados por Finanzas): {len(stats['reaplicados'])}")
+    for r in stats['reaplicados'][:20]:
+        log.info(f"    {r}")
     log.info(f"  QUEDAN EN COLA          : {stats.get('quedan', 0)}"
              + (f"  <- volver a correr (BATCH_LIMIT={BATCH_LIMIT})"
                 if stats.get('quedan') else ''))
