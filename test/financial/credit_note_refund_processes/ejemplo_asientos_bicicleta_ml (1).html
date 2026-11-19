@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ejemplo — Asientos Contables ML</title>
+<style>
+  :root {
+    --black: #1A1A1A;
+    --yellow: #FFE600;
+    --white: #FFFFFF;
+    --gray-bg: #F7F7F5;
+    --gray-border: #E0E0DC;
+    --gray-text: #6B6B65;
+    --blue-light: #EBF3FB;
+    --blue-border: #90BBE0;
+    --blue-text: #1565C0;
+    --green-light: #EAF5EA;
+    --green-border: #90D090;
+    --green-text: #2E7D32;
+    --amber-light: #FFF8E6;
+    --amber-border: #F0D080;
+    --amber-text: #956300;
+    --lila-light: #F0EFFC;
+    --lila-border: #C4C0EC;
+    --lila-text: #4A46A0;
+    --teal-light: #E6F5F2;
+    --teal-border: #80C8BC;
+    --teal-text: #0F6E56;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px; background: var(--white); color: var(--black);
+    line-height: 1.5; max-width: 860px; margin: 0 auto; padding: 32px 24px 60px;
+  }
+
+  /* Header */
+  .doc-header { margin-bottom: 28px; padding-bottom: 16px; border-bottom: 3px solid var(--yellow); }
+  .doc-header-tags { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .doc-header-tag { background: var(--black); color: var(--yellow); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px; }
+  .doc-header h1 { font-size: 20px; font-weight: 600; margin-bottom: 2px; }
+  .doc-header-meta { font-size: 12px; color: var(--gray-text); }
+
+  /* Intro box */
+  .intro-box { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 28px; }
+  .intro-card { background: var(--gray-bg); border: 0.5px solid var(--gray-border); border-radius: 8px; padding: 10px 14px; }
+  .intro-card-label { font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray-text); margin-bottom: 4px; }
+  .intro-card-val { font-size: 15px; font-weight: 600; color: var(--black); }
+  .intro-card-sub { font-size: 11px; color: var(--gray-text); margin-top: 1px; }
+
+  /* Timeline */
+  .timeline { position: relative; padding-left: 28px; margin-bottom: 32px; }
+  .timeline::before { content: ''; position: absolute; left: 9px; top: 0; bottom: 0; width: 1.5px; background: var(--gray-border); }
+  .event { position: relative; margin-bottom: 20px; }
+  .event:last-child { margin-bottom: 0; }
+  .event-dot { position: absolute; left: -24px; top: 14px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid; background: var(--white); }
+
+  /* Step badge colors */
+  .c-blue .event-dot  { border-color: #1565C0; }
+  .c-teal .event-dot  { border-color: #0F6E56; }
+  .c-amber .event-dot { border-color: #956300; }
+  .c-green .event-dot { border-color: #2E7D32; }
+
+  /* Event card */
+  .event-card { border-radius: 8px; border: 1.5px solid var(--gray-border); overflow: hidden; }
+  .event-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; user-select: none; border-bottom: 1px solid transparent; transition: background 0.15s; }
+  .event-header:hover { background: var(--gray-bg); }
+  .event-header.open { border-bottom-color: var(--gray-border); }
+  .step-pill { font-size: 10px; font-weight: 700; padding: 2px 9px; border-radius: 20px; white-space: nowrap; flex-shrink: 0; }
+  .c-blue  .step-pill { background: var(--blue-light);  color: var(--blue-text); }
+  .c-teal  .step-pill { background: var(--teal-light);  color: var(--teal-text); }
+  .c-amber .step-pill { background: var(--amber-light); color: var(--amber-text); }
+  .c-green .step-pill { background: var(--green-light); color: var(--green-text); }
+  .event-title { font-size: 13px; font-weight: 600; flex: 1; }
+  .event-chevron { font-size: 18px; color: var(--gray-text); transition: transform 0.2s; flex-shrink: 0; }
+  .event-chevron.open { transform: rotate(180deg); }
+  .event-body { padding: 14px; display: none; }
+  .event-body.open { display: block; }
+  .event-desc { font-size: 12px; color: var(--gray-text); margin-bottom: 12px; }
+
+  /* Asiento table */
+  .asiento-box { border: 1.5px solid var(--lila-border); border-radius: 8px; overflow: hidden; }
+  .asiento-header { background: var(--lila-light); padding: 7px 12px; font-size: 11px; font-weight: 700; color: var(--lila-text); letter-spacing: 0.05em; text-transform: uppercase; border-bottom: 1px solid var(--lila-border); }
+  .asiento-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .asiento-table th { background: var(--gray-bg); padding: 5px 10px; font-size: 10px; font-weight: 600; color: var(--gray-text); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table th.r { text-align: right; }
+  .asiento-table td { padding: 6px 10px; border-bottom: 1px solid var(--gray-border); }
+  .asiento-table tr:last-child td { border-bottom: none; }
+  .asiento-table tr:hover td { background: var(--gray-bg); }
+  .acc-name { font-weight: 500; color: var(--black); }
+  .acc-code { font-size: 10px; color: var(--gray-text); font-family: 'SF Mono','Fira Code',monospace; margin-top: 1px; }
+  .acc-sub  { font-size: 10px; color: var(--gray-text); font-style: italic; margin-top: 1px; }
+  .db { font-weight: 500; color: var(--blue-text); text-align: right; }
+  .cr { font-weight: 500; color: var(--green-text); text-align: right; }
+  .dash { color: var(--gray-border); text-align: right; }
+  .sep-row td { background: var(--gray-bg); padding: 3px 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray-text); }
+
+  /* Note */
+  .note { font-size: 11px; color: var(--gray-text); margin-top: 8px; padding: 8px 12px; background: var(--amber-light); border-left: 3px solid var(--amber-border); border-radius: 0 6px 6px 0; }
+  .note strong { color: var(--amber-text); }
+  .note.info { background: var(--blue-light); border-left-color: var(--blue-border); }
+  .note.info strong { color: var(--blue-text); }
+
+  /* Summary table */
+  .summary-box { border: 1.5px solid var(--gray-border); border-radius: 8px; overflow: hidden; }
+  .summary-header { background: var(--black); color: var(--yellow); padding: 9px 14px; font-size: 12px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+  .summary-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .summary-table th { background: var(--gray-bg); padding: 5px 10px; font-size: 10px; font-weight: 600; color: var(--gray-text); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--gray-border); }
+  .summary-table th.r { text-align: right; }
+  .summary-table td { padding: 7px 10px; border-bottom: 1px solid var(--gray-border); }
+  .summary-table tr:last-child td { border-bottom: none; }
+  .summary-table tr:hover td { background: var(--gray-bg); }
+  .net-zero { color: var(--gray-text); text-align: right; font-family: 'SF Mono','Fira Code',monospace; font-size: 11px; }
+  .net-pos  { color: var(--blue-text); font-weight: 500; text-align: right; font-family: 'SF Mono','Fira Code',monospace; font-size: 11px; }
+  .net-neg  { color: var(--green-text); font-weight: 500; text-align: right; font-family: 'SF Mono','Fira Code',monospace; font-size: 11px; }
+  .mono-val { font-family: 'SF Mono','Fira Code',monospace; font-size: 11px; text-align: right; }
+  .summary-footer { padding: 10px 14px; font-size: 11px; color: var(--gray-text); background: var(--gray-bg); border-top: 1px solid var(--gray-border); }
+  .summary-footer b { color: var(--black); }
+
+  .section-title { font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray-text); margin-bottom: 12px; }
+</style>
+</head>
+<body>
+
+<div class="doc-header">
+  <div class="doc-header-tags">
+    <span class="doc-header-tag">Proyecto IVA</span>
+    <span class="doc-header-tag" style="background:var(--lila-light);color:var(--lila-text);border:1px solid var(--lila-border);">Mercado Libre</span>
+    <span class="doc-header-tag" style="background:var(--gray-bg);color:var(--gray-text);border:1px solid var(--gray-border);">Ejemplo para equipo Data</span>
+  </div>
+  <h1>Asientos contables — transacción completa con devolución vía disputa</h1>
+  <p class="doc-header-meta">Venta → despacho → cobro → disputa → devolución → recepción en bodega · Mayo 2026</p>
+</div>
+
+<!-- PARÁMETROS -->
+<div class="intro-box">
+  <div class="intro-card">
+    <div class="intro-card-label">Producto</div>
+    <div class="intro-card-val">Bicicleta</div>
+    <div class="intro-card-sub">1 unidad</div>
+  </div>
+  <div class="intro-card">
+    <div class="intro-card-label">Precio de venta</div>
+    <div class="intro-card-val">$1,000 MXN</div>
+    <div class="intro-card-sub">+ IVA 16% = $1,160</div>
+  </div>
+  <div class="intro-card">
+    <div class="intro-card-label">Costo de venta</div>
+    <div class="intro-card-val">$500 MXN</div>
+    <div class="intro-card-sub">Unitario</div>
+  </div>
+</div>
+
+<!-- TIMELINE -->
+<div class="section-title">Flujo paso a paso</div>
+<div class="timeline">
+
+  <!-- PASO 1 -->
+  <div class="event c-blue">
+    <div class="event-dot"></div>
+    <div class="event-card">
+      <div class="event-header" onclick="toggle(this)">
+        <span class="step-pill">Paso 1</span>
+        <span class="event-title">Venta confirmada en ML — factura CFDI emitida</span>
+        <span class="event-chevron">▾</span>
+      </div>
+      <div class="event-body">
+        <p class="event-desc">ML confirma la venta y emite el CFDI con sello de WB. Se reconoce el ingreso, el IVA trasladado y el costo de venta.</p>
+        <div class="asiento-box">
+          <div class="asiento-header">Asiento — Venta</div>
+          <table class="asiento-table">
+            <thead><tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr></thead>
+            <tbody>
+              <tr class="sep-row"><td colspan="3">Ingresos</td></tr>
+              <tr>
+                <td><div class="acc-name">Mercado Libre</div><div class="acc-code">105-001-004</div><div class="acc-sub">Cuenta por cobrar</div></td>
+                <td class="db">$1,160</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">Ventas y/o Servicios Gravados</div><div class="acc-code">401-001-001</div></td>
+                <td class="dash">—</td><td class="cr">$1,000</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+                <td class="dash">—</td><td class="cr">$160</td>
+              </tr>
+              <tr class="sep-row"><td colspan="3">Costo</td></tr>
+              <tr>
+                <td><div class="acc-name">Costo de Venta</div></td>
+                <td class="db">$500</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">Mercancía Facturada No Enviada</div><div class="acc-sub">Transitoria · pendiente de creación</div></td>
+                <td class="dash">—</td><td class="cr">$500</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">
+          <strong>Mercancía Facturada No Enviada</strong> acumula el costo hasta que ocurra el OUT. Si al cierre del mes esta cuenta tiene saldo, hay órdenes facturadas sin despacho pendiente.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PASO 2 -->
+  <div class="event c-teal">
+    <div class="event-dot"></div>
+    <div class="event-card">
+      <div class="event-header" onclick="toggle(this)">
+        <span class="step-pill">Paso 2</span>
+        <span class="event-title">OUT registrado en Odoo — producto despachado</span>
+        <span class="event-chevron">▾</span>
+      </div>
+      <div class="event-body">
+        <p class="event-desc">Sale el inventario del almacén. La cuenta transitoria se libera contra inventario.</p>
+        <div class="asiento-box">
+          <div class="asiento-header">Asiento — Despacho (OUT)</div>
+          <table class="asiento-table">
+            <thead><tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><div class="acc-name">Mercancía Facturada No Enviada</div><div class="acc-sub">Transitoria · se libera</div></td>
+                <td class="db">$500</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">Inventario</div></td>
+                <td class="dash">—</td><td class="cr">$500</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">
+          La cuenta transitoria queda en cero. El Costo de Venta ya estaba reconocido desde el Paso 1; este asiento solo mueve el activo de inventario.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PASO 3 -->
+  <div class="event c-teal">
+    <div class="event-dot"></div>
+    <div class="event-card">
+      <div class="event-header" onclick="toggle(this)">
+        <span class="step-pill">Paso 3</span>
+        <span class="event-title">Cobro aplicado en Odoo — ML libera los fondos</span>
+        <span class="event-chevron">▾</span>
+      </div>
+      <div class="event-body">
+        <p class="event-desc"><code style="font-size:11px;background:var(--gray-bg);border:1px solid var(--gray-border);border-radius:3px;padding:1px 5px;">money_release_date</code> se cumple. Se aplica el cobro sobre la factura de venta.</p>
+        <div class="asiento-box">
+          <div class="asiento-header">Asiento — Cobro</div>
+          <table class="asiento-table">
+            <thead><tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><div class="acc-name">Mercado Pago</div><div class="acc-code">102-002-007</div></td>
+                <td class="db">$1,160</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">Mercado Libre</div><div class="acc-code">105-001-004</div><div class="acc-sub">CxC — se cancela</div></td>
+                <td class="dash">—</td><td class="cr">$1,160</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">La CxC de ML queda en cero. Los fondos están ahora en la cuenta de Mercado Pago.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PASO 4 -->
+  <div class="event c-amber">
+    <div class="event-dot"></div>
+    <div class="event-card">
+      <div class="event-header" onclick="toggle(this)">
+        <span class="step-pill">Paso 4</span>
+        <span class="event-title">Disputa resuelta — ML emite NC total (CFDI)</span>
+        <span class="event-chevron">▾</span>
+      </div>
+      <div class="event-body">
+        <p class="event-desc">ML resuelve la disputa a favor del cliente y emite NC total. Como la factura ya tenía cobro aplicado, Odoo primero deshace esa aplicación y luego registra la NC. Simultáneamente se recupera el costo vía "Devoluciones en Tránsito".</p>
+        <div class="asiento-box">
+          <div class="asiento-header">Asiento — Devolución vía disputa</div>
+          <table class="asiento-table">
+            <thead><tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr></thead>
+            <tbody>
+              <tr class="sep-row"><td colspan="3">Ingresos — NC total</td></tr>
+              <tr>
+                <td><div class="acc-name">Devoluciones, Descuentos o Bonificaciones</div><div class="acc-code">402-001-001</div></td>
+                <td class="db">$1,000</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+                <td class="db">$160</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">Mercado Libre</div><div class="acc-code">105-001-004</div><div class="acc-sub">CxC — se reactiva y vuelve a cancelarse</div></td>
+                <td class="dash">—</td><td class="cr">$1,160</td>
+              </tr>
+              <tr class="sep-row"><td colspan="3">Cobro — se deshace la aplicación</td></tr>
+              <tr>
+                <td><div class="acc-name">Mercado Libre</div><div class="acc-code">105-001-004</div><div class="acc-sub">Reverso del cobro aplicado en Paso 3</div></td>
+                <td class="db">$1,160</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">Mercado Pago</div><div class="acc-code">102-002-007</div></td>
+                <td class="dash">—</td><td class="cr">$1,160</td>
+              </tr>
+              <tr class="sep-row"><td colspan="3">COGS — recupero por retorno del producto</td></tr>
+              <tr>
+                <td><div class="acc-name">Devoluciones en Tránsito</div><div class="acc-sub">Transitoria · pendiente de creación</div></td>
+                <td class="db">$500</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">Costo de Venta</div></td>
+                <td class="dash">—</td><td class="cr">$500</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">
+          <strong>¿Por qué dos pasos para el cobro?</strong> Odoo deshace mecánicamente el match entre la factura y el pago antes de registrar la NC. El resultado económico es idéntico a debitar Mercado Pago directamente (-$1,160), pero esta forma deja trazabilidad explícita de que existió un cobro que se revirtió — útil para auditoría y conciliación.
+        </div>
+        <div class="note info" style="margin-top:6px;">
+          <strong>Devoluciones en Tránsito</strong> acumula el costo recuperado hasta confirmarse la recepción física del producto. Si al cierre del mes esta cuenta tiene saldo, hay devoluciones en tránsito pendientes de recibir en bodega.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PASO 5 -->
+  <div class="event c-green">
+    <div class="event-dot"></div>
+    <div class="event-card">
+      <div class="event-header" onclick="toggle(this)">
+        <span class="step-pill">Paso 5</span>
+        <span class="event-title">Producto recibido en bodega (movimiento de RET en Odoo) — cuenta transitoria liberada</span>
+        <span class="event-chevron">▾</span>
+      </div>
+      <div class="event-body">
+        <p class="event-desc">Se confirma la recepción física del producto devuelto. "Devoluciones en Tránsito" se libera contra Inventario.</p>
+        <div class="asiento-box">
+          <div class="asiento-header">Asiento — Recepción en bodega</div>
+          <table class="asiento-table">
+            <thead><tr><th style="width:56%">Cuenta</th><th class="r">Débito</th><th class="r">Crédito</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><div class="acc-name">Inventario</div></td>
+                <td class="db">$500</td><td class="dash">—</td>
+              </tr>
+              <tr>
+                <td><div class="acc-name">Devoluciones en Tránsito</div><div class="acc-sub">Transitoria · se libera</div></td>
+                <td class="dash">—</td><td class="cr">$500</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">La cuenta transitoria queda en cero. El inventario recupera el costo del producto devuelto.</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- SUMMARY -->
+<div class="section-title">Saldo neto de todas las cuentas al cierre</div>
+<div class="summary-box">
+  <div class="summary-header">Resumen de la transacción completa</div>
+  <table class="summary-table">
+    <thead>
+      <tr>
+        <th style="width:42%">Cuenta</th>
+        <th class="r">Total débitos</th>
+        <th class="r">Total créditos</th>
+        <th class="r">Saldo neto</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><div style="font-weight:500">Ventas y/o Servicios Gravados</div><div class="acc-code">401-001-001</div></td>
+        <td class="mono-val" style="color:var(--gray-text)">—</td>
+        <td class="mono-val">$1,000</td>
+        <td class="net-neg">−$1,000</td>
+      </tr>
+      <tr>
+        <td><div style="font-weight:500">Devoluciones, Descuentos o Bonificaciones</div><div class="acc-code">402-001-001</div></td>
+        <td class="mono-val">$1,000</td>
+        <td class="mono-val" style="color:var(--gray-text)">—</td>
+        <td class="net-pos">+$1,000</td>
+      </tr>
+      <tr>
+        <td><div style="font-weight:500">IVA Trasladado Cobrado</div><div class="acc-code">208-001-001</div></td>
+        <td class="mono-val">$160</td>
+        <td class="mono-val">$160</td>
+        <td class="net-zero">—</td>
+      </tr>
+      <tr>
+        <td><div style="font-weight:500">Mercado Libre (CxC)</div><div class="acc-code">105-001-004</div></td>
+        <td class="mono-val">$2,320</td>
+        <td class="mono-val">$2,320</td>
+        <td class="net-zero">—</td>
+      </tr>
+      <tr>
+        <td><div style="font-weight:500">Mercado Pago</div><div class="acc-code">102-002-007</div></td>
+        <td class="mono-val">$1,160</td>
+        <td class="mono-val">$1,160</td>
+        <td class="net-zero">—</td>
+      </tr>
+      <tr>
+        <td><div style="font-weight:500">Costo de Venta</div></td>
+        <td class="mono-val">$500</td>
+        <td class="mono-val">$500</td>
+        <td class="net-zero">—</td>
+      </tr>
+      <tr>
+        <td><div style="font-weight:500">Inventario</div></td>
+        <td class="mono-val">$500</td>
+        <td class="mono-val">$500</td>
+        <td class="net-zero">—</td>
+      </tr>
+      <tr>
+        <td><div style="font-weight:500">Mercancía Facturada No Enviada</div><div style="font-size:10px;color:var(--gray-text);font-style:italic">Transitoria</div></td>
+        <td class="mono-val">$500</td>
+        <td class="mono-val">$500</td>
+        <td class="net-zero">—</td>
+      </tr>
+      <tr>
+        <td><div style="font-weight:500">Devoluciones en Tránsito</div><div style="font-size:10px;color:var(--gray-text);font-style:italic">Transitoria</div></td>
+        <td class="mono-val">$500</td>
+        <td class="mono-val">$500</td>
+        <td class="net-zero">—</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="summary-footer">
+    Al cierre, las cuentas de resultado quedan con saldo: <b>401-001-001 Ventas</b> (−$1,000 acreedor) y <b>402-001-001 Devoluciones y Descuentos</b> (+$1,000 deudor). Ambas se neutralizan, dejando impacto neto cero en el P&L — la venta se realizó y revirtió en su totalidad. Las dos cuentas transitorias quedan en cero, confirmando que todos los eventos físicos (despacho y recepción en bodega) se completaron correctamente.
+  </div>
+</div>
+
+<script>
+function toggle(header) {
+  const body = header.nextElementSibling;
+  const chev = header.querySelector('.event-chevron');
+  const isOpen = body.classList.contains('open');
+  body.classList.toggle('open', !isOpen);
+  header.classList.toggle('open', !isOpen);
+  chev.classList.toggle('open', !isOpen);
+}
+</script>
+</body>
+</html>

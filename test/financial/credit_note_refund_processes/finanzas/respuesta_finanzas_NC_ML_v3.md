@@ -1,0 +1,62 @@
+**Asunto:** RE: Notas de crédito MeLi · condiciones del piloto listas (lote v3) y backlog
+
+Hola Jero,
+
+Gracias por el VoBo. Las dos condiciones del piloto ya funcionan y están probadas en staging:
+**https://somosreyes-test-06-nov-2026-41423118.dev.odoo.com**
+
+**Adjuntos**
+- `Lote_prueba_NC_ML_v3_staging_2026-11-10.csv`: 22 casos, **todos OK**: las 13 NC del lote v2, con el cobro rehecho en el diario MP y los retornos reclasificados, más 4 de Reventa nuevas y los 5 casos que no se registran.
+- `Corrida_en_seco_NC_ML_2026-11-10.csv`: corrida en seco contra Odoo productivo, sin registrar nada. Son 4,002 NC, Reventa incluida, con el estado que les asigna hoy el proceso, el tipo A/B/C, la factura, si está cobrada y si tiene retorno.
+- `Cruce_completitud_NC_ML_2026-11-10.csv`: las órdenes de G4, G5, G5R y G10, una por una, contra la tabla de facturas de MeLi, la cola de NC y Odoo.
+
+**Hoja de ruta**
+✅ hecho · 🟡 en curso · ⏳ pendiente
+
+| # | Acción | Resp. | Estado | Detalle |
+|---|--------|-------|--------|---------|
+| 1 | Reclasificación del retorno WH/DEV (G7) | Serch | ✅ | Debe 205.06.003 / Haber 107.06.001 por el costo del retorno, conciliado contra el retorno y contra la NC. Probado con los 2 casos B del lote y con INV/2026/159887: volvió 1 de 3 unidades, se reclasificaron $270.31 y quedan $540.63 abiertos en 107.06.001. Fecha: la más reciente entre la NC y el retorno. Si el retorno se valida después de la NC, lo toma el barrido diario. Los kits casan por componente. |
+| 2 | Reverso del cobro en el diario Mercado Pago (G8) | Serch | ✅ | 7 asientos MP/2026/… en staging, con la fecha de la NC. |
+| 3 | Piloto de 10 NC de octubre (G1) | Serch | ⏳ listo | Antes de correrlo, en productivo creo la posición fiscal del tipo B y pongo la cuenta 402.01.002 en el diario BON y en BON_SRV (lo mismo que en staging). Lo corro en cuanto me confirmen la fecha; al terminar les mando los 10 enlaces. |
+| 4 | Reapertura y carga en orden (G9) | Jero / Serch | ⏳ | De acuerdo con el orden. Los pasos (1) facturas de Reventa a su mes y (2) centavos los preparo en el flujo de facturación. Para el (3), las 2,864 NC de jul–sep ya pasan la corrida en seco. Les aviso la hora. |
+| 5 | Reclasificación única de los retornos ya validados (G7) | Serch | ✅ | Automática: corre al cargar cada NC, con su fecha. Aplica a 1,048 NC tipo B con retorno: 240 de oct–nov y 808 de jul–sep. |
+| 6 | Activar las NC de Reventa (G5R) | Serch | ✅ | Activadas con las mismas reglas: 6 NC de Reventa en el lote (A, B, cobrada y centavos). La corrida en seco trae 169: 167 para registrar y 2 que esperan factura. |
+| 7 | Cancelar RINV/2026/01731 y registrar MELINC-7782 (G2) | Finanzas / Serch | ⏳ | Al cancelarla, MELINC-7782 (28-sep) entra con la carga de septiembre y su retorno WH/DEV/07291 se reclasifica solo. Ojo: ese retorno trae, además de las 2 cajas del comedor, una bicicleta VINTA ($1,235.86) que no salió en la orden. Esa línea no se reclasifica; hay que revisarla con almacén. |
+| 8 | Corrida en seco sobre todo el universo (G3) | Serch | ✅ | 4,002 NC: **1,098 para registrar** (A 423, B 612, C 63; oct–nov), 2,864 en periodo cerrado (jul–sep), 28 refacturas, 6 en revisión manual y 6 que esperan factura. El barrido de NC sigue corriendo (faltan ~25k órdenes); la reenvío al terminar. |
+| 9 | Cruce de G5 y G10 contra la tabla de facturas de MeLi | Serch | 🟡 | Hecho el cruce (ver "Completitud" abajo). Encontré la causa: el miner de facturas solo consulta órdenes pagadas o cerradas, nunca las canceladas, y la mayoría de las canceladas sí tienen factura y NC de MeLi. Importar es el siguiente paso, en el flujo de facturación, y necesita una definición suya (abajo). |
+| 10 | Órdenes con factura y reembolso sin NC (G4) | Serch | ✅ | Ver "Completitud" abajo. |
+| 11 | Reparto A/B/C de las órdenes con NC y retorno (G7) | Serch | ✅ | 1,078 NC con retorno validado: **1,048 B, 14 A, 0 C**, y 16 sin tipo (11 refacturas, 4 esperan factura, 1 doble egreso). Las 225 que les reporté eran solo las B de oct–nov. Las 14 A no necesitan reclasificación: su costo va a 205.06.003 y el retorno lo abona en la misma cuenta. |
+| 12 | Rehacer el cruce de completitud | Jero | ⏳ | Con la corrida en seco adjunta; la versión final va cuando termine el barrido. |
+| 13 | Barrido histórico previo a junio (G6) | Finanzas / Serch | ⏳ | Lo vemos aparte. 15 órdenes de G4 tienen una factura en Odoo que no es de MeLi; parecen de este grupo. |
+| 14 | Bloquear la emisión manual de MeLi en Odoo 18 | Will / Serch | ⏳ | Pendiente con Will. |
+| 15 | Rehacer los complementos contables desde junio | Finanzas | ⏳ | Después del 4. |
+
+**Completitud (puntos 9 y 10)**
+
+| Grupo | Órdenes | Resultado |
+|-------|---------|-----------|
+| G10 vendidas sin factura | 1,996 | **1,505 tienen CFDI en la tabla de MeLi y no están en Odoo: por importar.** 265: MeLi no facturó. 166: sin registro en la tabla (consultadas todas: 117 tienen factura y NC, es decir, sí hubo reembolso). 60: ya están en Odoo. |
+| G5 reembolso sin factura | 5,403 | **4,880 nunca se consultaron a MeLi** (órdenes canceladas). En una muestra de 200, **76% tiene factura y NC de MeLi** (≈3,700 pares) y el resto no tiene factura. 65 tienen CFDI sin cargar. 458: MeLi no facturó. |
+| G5R Reventa | 4,470 | 151 tienen factura en Odoo (134 ya con NC). 1,665: MeLi no facturó. 2,654 nunca se consultaron; en una muestra de 150, **63% tiene factura y NC** (≈1,700 pares). |
+| G4 con factura sin NC | 142 | 73 NC ya bajadas (reembolsos posteriores al corte). **45 parciales sin NC: MeLi no emite NC en la mayoría de los reembolsos parciales** ($22k; 24 ya cerradas tras 3 consultas). 3 totales aún sin NC. 15 con factura propia (punto 13). 6 sin factura de MeLi cargada (punto 9). |
+
+**Lo que bloquea la importación:** son pares factura + NC de órdenes canceladas, con la SO también cancelada en Odoo, y se netean. Para registrarlos propongo:
+- la factura, sin ligar a la SO (que sigue cancelada);
+- su NC tipo A (sin costo, porque no salió del almacén), conciliadas entre sí;
+- en el mes de cada CFDI.
+
+Necesito su VoBo de ese tratamiento antes de cargar ~5,500 pares; el ajuste del miner para que consulte las canceladas va junto con esa carga.
+
+Dos casos del G2, revisados:
+- **MELINC-3834:** la factura de MeLi (256D470D…) sí está en la tabla de facturas, pero su SO se canceló y la factura ya no está en Odoo. Va con la importación.
+- **MELINC-2195:** la factura vigente 605F8C1D… **sí está en Odoo** (INV/2026/38979). La que falta es la original 596F7056…, que es la que cancela la NC. Propongo registrar el par (factura original + NC, que se netean) sin ligarlo a la SO.
+
+**Necesito de ustedes**
+1. Confirmar la fecha del piloto (3).
+2. VoBo del tratamiento de los pares factura + NC de órdenes canceladas (punto 9).
+3. Reembolsos parciales sin NC de MeLi: ¿los dejamos en el backlog o necesitan un tratamiento contable sin CFDI?
+4. De acuerdo con registrar el par de las refacturas (MELINC-2195 y las otras 27).
+5. La hora de la reapertura (4).
+
+Saludos,
+Serch

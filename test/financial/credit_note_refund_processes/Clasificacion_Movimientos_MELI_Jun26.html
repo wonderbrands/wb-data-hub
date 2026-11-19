@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Clasificación de Movimientos MELI — Liberaciones</title>
+<style>
+  :root{
+    --black:#0d0d0d;
+    --yellow:#FFD400;
+    --yellow-soft:#FFF4B8;
+    --green:#1c9c5c;
+    --green-bg:#e6f7ee;
+    --orange:#d98600;
+    --orange-bg:#fff2df;
+    --gray:#6b7280;
+    --gray-bg:#eef0f2;
+    --red:#c81e2c;
+    --red-bg:#fdecec;
+    --blue:#2451c4;
+    --blue-bg:#e8eefc;
+    --teal:#0f766e;
+    --teal-bg:#e6f7f5;
+    --purple:#7c3aed;
+    --purple-bg:#f1e9fe;
+    --border:#e5e7eb;
+    --text:#1a1a1a;
+    --muted:#6b7280;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:#f5f6f8;
+    color:var(--text);
+  }
+  header{
+    background:var(--black);
+    color:#fff;
+    padding:28px 40px;
+    border-bottom:6px solid var(--yellow);
+  }
+  header .tag{
+    display:inline-block;
+    background:var(--yellow);
+    color:#111;
+    font-weight:700;
+    font-size:12px;
+    letter-spacing:.5px;
+    padding:4px 10px;
+    border-radius:4px;
+    margin-bottom:10px;
+    text-transform:uppercase;
+  }
+  header h1{ margin:0 0 6px 0; font-size:26px; font-weight:700; }
+  header p{ margin:0; color:#c9c9c9; font-size:14px; }
+  .wrap{ max-width:1180px; margin:0 auto; padding:32px 40px 60px; }
+  .cards{ display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:36px; }
+  .card{ background:#fff; border:1px solid var(--border); border-radius:10px; padding:16px 18px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+  .card .label{ font-size:11px; text-transform:uppercase; letter-spacing:.4px; color:var(--muted); font-weight:600; margin-bottom:6px; }
+  .card .value{ font-size:20px; font-weight:700; }
+  .card.final .value{color:var(--green);}
+  .card.prov .value{color:var(--orange);}
+  .card.excl .value{color:var(--gray);}
+
+  h2{ font-size:18px; border-left:4px solid var(--yellow); padding-left:10px; margin:0 0 4px 0; }
+  .section-note{ color:var(--muted); font-size:13px; margin:0 0 18px 14px; }
+  section{margin-bottom:44px;}
+
+  table{ width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--border); border-radius:10px; overflow:hidden; font-size:13px; }
+  thead th{ background:var(--black); color:#fff; text-align:left; padding:10px 12px; font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
+  tbody td{ padding:10px 12px; border-top:1px solid var(--border); vertical-align:top; }
+  tbody tr:nth-child(even){background:#fafafa;}
+  .mov-name{ font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; color:#111; }
+  .cat-name{ font-size:11.5px; color:var(--muted); }
+  .badge{ display:inline-block; padding:3px 9px; border-radius:20px; font-size:10.5px; font-weight:700; white-space:nowrap; }
+  .badge.final{background:var(--green-bg);color:var(--green);}
+  .badge.loss{background:var(--red-bg);color:var(--red);}
+  .badge.prov{background:var(--orange-bg);color:var(--orange);}
+  .badge.excl{background:var(--gray-bg);color:var(--gray);}
+  .badge.favor{background:var(--yellow-soft);color:#7a5c00;}
+  .badge.depende{background:var(--blue-bg);color:var(--blue);}
+  /* Factura/NC/N-A badges */
+  .badge.fc{background:var(--teal-bg);color:var(--teal);}
+  .badge.nc{background:var(--red-bg);color:var(--red);}
+  .badge.na{background:var(--gray-bg);color:var(--gray);}
+  .badge.revisar{background:var(--purple-bg);color:var(--purple);}
+  .badge2{ display:block; margin-top:4px; font-size:9.5px; font-weight:600; color:var(--teal); background:var(--teal-bg); padding:2px 7px; border-radius:10px; white-space:normal; line-height:1.3; }
+
+  .tree{ background:#fff; border:1px solid var(--border); border-radius:10px; padding:28px 24px; }
+  .node{ background:#fff; border:2px solid var(--black); border-radius:8px; padding:10px 14px; font-size:13.5px; font-weight:600; display:inline-block; max-width:680px; }
+  .leaf{ border-radius:8px; padding:10px 14px; font-size:13px; display:inline-block; max-width:680px; line-height:1.55; }
+  .leaf.final{background:var(--green-bg);border:2px solid var(--green);}
+  .leaf.loss{background:var(--red-bg);border:2px solid var(--red);}
+  .leaf.prov{background:var(--orange-bg);border:2px solid var(--orange);}
+  .leaf.excl{background:var(--gray-bg);border:2px solid var(--gray);}
+  .leaf.favor{background:var(--yellow-soft);border:2px solid #b5900a;}
+  .mv{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11px; background:rgba(0,0,0,.06); padding:1px 6px; border-radius:4px; margin:2px 4px 0 0; display:inline-block; }
+  .fcncna{ font-size:11px; font-weight:700; padding:1px 7px; border-radius:20px; margin:2px 4px 0 0; display:inline-block; }
+  .fcncna.fc{background:var(--teal-bg);color:var(--teal);}
+  .fcncna.nc{background:var(--red-bg);color:var(--red);}
+  .fcncna.na{background:var(--gray-bg);color:var(--gray);}
+  .fcncna.revisar{background:var(--purple-bg);color:var(--purple);}
+  .branch{ margin:14px 0 14px 28px; padding-left:20px; border-left:2px dashed #cfd3d8; }
+  .arm-label{ font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; margin-bottom:6px; }
+  .arm-label.yes{color:var(--green);}
+  .arm-label.no{color:#b3390c;}
+
+  .source-tag{ display:inline-block; font-size:10.5px; font-weight:700; letter-spacing:.3px; text-transform:uppercase; padding:2px 8px; border-radius:4px; background:#111; color:#fff; margin-bottom:14px; }
+
+  .legend{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:18px; }
+  .legend-item{ display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--muted); }
+
+  .open-q{ background:var(--purple-bg); border:1.5px solid var(--purple); border-radius:8px; padding:12px 16px; font-size:12.5px; color:#3a1d78; margin-top:8px; }
+  .open-q b{color:var(--purple);}
+
+  footer{ text-align:center; color:var(--muted); font-size:12px; padding:20px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="tag">Somos Reyes / Wonder — Proyecto Facturación</div>
+  <h1>Clasificación de movimientos MELI — Liberaciones</h1>
+  <p>ml_financial_transactions_master · ml_claims · mp_liberaciones · Junio 2026 · cruzado contra doc oficial de MercadoPago y flujos de Facturación/Disputas/Devoluciones (proceso propuesto)</p>
+</header>
+
+<div class="wrap">
+
+  <div class="cards">
+    <div class="card final">
+      <div class="label">Facturan (FC)</div>
+      <div class="value">3 tipos</div>
+    </div>
+    <div class="card">
+      <div class="label">Generan NC</div>
+      <div class="value">6 tipos</div>
+    </div>
+    <div class="card excl">
+      <div class="label">N/A — sin efecto fiscal</div>
+      <div class="value">9 tipos</div>
+    </div>
+    <div class="card prov">
+      <div class="label">Total movimientos mapeados</div>
+      <div class="value">18</div>
+    </div>
+  </div>
+
+  <section>
+    <span class="source-tag">Fuente: somos_reyes.ml_financial_transactions_master + somos_reyes.ml_claims</span>
+    <h2>1. Cuadro de clasificación — los 18 valores originales</h2>
+    <p class="section-note">Estado del movimiento + si corresponde <b>Factura (FC)</b>, <b>Nota de Crédito (NC)</b> o <b>ninguno (N/A)</b>, según los flujos de Facturación/Disputas/Devoluciones (proceso propuesto, mayo 2026), más lo que investigamos de mediation_cancel y chargeback.</p>
+    <div class="legend">
+      <div class="legend-item"><span class="badge fc">FC</span> Se factura</div>
+      <div class="legend-item"><span class="badge nc">NC</span> Se emite Nota de Crédito</div>
+      <div class="legend-item"><span class="badge na">N/A</span> Sin efecto fiscal / sin cambio</div>
+      <div class="legend-item"><span class="badge2" style="margin-top:0;">+ posible Otro Ingreso aparte</span> Puede sumar un segundo movimiento, independiente de la NC — no lo reemplaza ni lo revierte</div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:15%">Movimiento</th>
+          <th style="width:19%">Tabla / campo</th>
+          <th style="width:12%">Estado</th>
+          <th style="width:10%">FC / NC / N-A</th>
+          <th style="width:44%">Qué es y por qué</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mov-name">SETTLEMENT</td>
+          <td class="cat-name">ml_financial_transactions_master (216,315 filas · +$434.7M)</td>
+          <td><span class="badge final">Final</span></td>
+          <td><span class="badge fc">FC</span></td>
+          <td>La venta se confirma y se libera la plata. Flujo Facturación: "Venta confirmada en ML → Factura emitida".</td>
+        </tr>
+        <tr>
+          <td class="mov-name">SETTLEMENT_SHIPPING</td>
+          <td class="cat-name">ml_financial_transactions_master (1,647 filas · +$207K)</td>
+          <td><span class="badge final">Final</span></td>
+          <td><span class="badge fc">FC</span></td>
+          <td>Componente de envío de la misma factura.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">SHIPPING</td>
+          <td class="cat-name">ml_financial_transactions_master (8 filas · -$1.6K)</td>
+          <td><span class="badge final">Final</span></td>
+          <td><span class="badge fc">FC</span></td>
+          <td>Cargo de envío liberado en firme, mismo tratamiento.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">REFUND</td>
+          <td class="cat-name">ml_financial_transactions_master (5,691 filas · -$10.5M)</td>
+          <td><span class="badge loss">Final — pérdida</span></td>
+          <td><span class="badge nc">NC</span></td>
+          <td>Flujo Devoluciones: el trigger "REFUND registrado en ML" siempre termina en NC (CFDI vinculada a la factura original).</td>
+        </tr>
+        <tr>
+          <td class="mov-name">REFUND_SHIPPING</td>
+          <td class="cat-name">ml_financial_transactions_master (73 filas · -$4.1K)</td>
+          <td><span class="badge loss">Final — pérdida</span></td>
+          <td><span class="badge nc">NC</span></td>
+          <td>Mismo trigger que REFUND, sobre el componente de envío.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">CASHBACK</td>
+          <td class="cat-name">ml_financial_transactions_master (2,203 filas · +$382K)</td>
+          <td><span class="badge final">Final</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Lo pone MP de su bolsillo por promociones. No sale de nuestro ingreso, no toca el precio de venta al comprador. No hay CFDI de por medio.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">CASHBACK_CANCEL</td>
+          <td class="cat-name">ml_financial_transactions_master (126 filas · -$2.4K)</td>
+          <td><span class="badge final">Final</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Reversión de lo anterior — mismo motivo, sin efecto fiscal sobre la venta.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">CHARGEBACK</td>
+          <td class="cat-name">ml_financial_transactions_master (11 filas · -$31.5K)</td>
+          <td><span class="badge prov">Revisar signo</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Contracargo iniciado por el banco del comprador, no por MELI — puede deberse a distintos motivos (desconocimiento del cargo, o también no entrega). Hoy no tenemos ese motivo cargado en ninguna tabla, así que queda N/A por default mientras se define con Luigi si algún subconjunto debería llevar NC.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">CHARGEBACK_CANCEL</td>
+          <td class="cat-name">ml_financial_transactions_master (4 filas · +$15.2K)</td>
+          <td><span class="badge favor">Final — a favor</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Reversión del contracargo — el banco revierte la posición o MP nos compensa. Mismo motivo que CHARGEBACK: no sabemos con certeza si corresponde NC, queda N/A por default hasta la definición con Luigi.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">DISPUTE</td>
+          <td class="cat-name">ml_financial_transactions_master (12,019 filas · -$21.8M)</td>
+          <td><span class="badge depende">Depende de is_released</span></td>
+          <td><span class="badge nc">NC</span></td>
+          <td>Reclamo/mediación sobre el pago, resuelto o en curso. Reversa Ingreso + IVA cuando se cierra en contra nuestro (complainant); los abiertos (is_released=0) no tienen movimiento todavía, no hay factura que reversar aún.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">DISPUTE_SHIPPING</td>
+          <td class="cat-name">ml_financial_transactions_master (72 filas · -$7.9K)</td>
+          <td><span class="badge depende">Depende de is_released</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Reclamo o disputa sobre el componente de envío del pago. No reversa el Ingreso de la venta — se trata como un gasto logístico aparte, no como devolución.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">PAYOUTS</td>
+          <td class="cat-name">ml_financial_transactions_master (138 filas · -$286.6M)</td>
+          <td><span class="badge excl">Excluir</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Transferencia de tesorería a banco. No es venta ni gasto, no toca CFDI.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">mediations</td>
+          <td class="cat-name">ml_claims.type (79,379 filas)</td>
+          <td><span class="badge depende">Depende de status</span></td>
+          <td><span class="badge nc">NC</span></td>
+          <td>Reclamo mediado por un representante de ML, iniciado por cualquier motivo (producto no entregado, no como se describía, etc.). Reversa Ingreso + IVA cuando cierra a favor del comprador (status=closed + complainant). Los abiertos (status=opened) no tienen NC todavía.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">returns</td>
+          <td class="cat-name">ml_claims.type (12,018 filas)</td>
+          <td><span class="badge depende">Depende de status</span></td>
+          <td><span class="badge nc">NC</span></td>
+          <td><b>Distinto de fulfillment:</b> acá el comprador ya tiene el producto en mano y decide devolverlo (se arrepintió, no le gustó, etc.) — es un proceso de devolución física normal. Con despacho, recupero de costo a "Devoluciones en tránsito"; sin despacho, a "Mercancías Facturadas No Enviadas". No hay un tercero (MELI) responsable del daño acá, por eso no tiene el segundo movimiento que sí tiene fulfillment.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">fulfillment</td>
+          <td class="cat-name">ml_claims.type (1,132 filas)</td>
+          <td><span class="badge depende">Depende de status</span></td>
+          <td><span class="badge nc">NC</span><span class="badge2">+ posible Otro Ingreso aparte</span></td>
+          <td><b>Distinto de returns:</b> acá el producto nunca llegó a manos del comprador — se dañó o se perdió dentro del centro logístico de MELI, antes de la entrega. Son <b>dos movimientos independientes, no uno solo</b>:<br><br>
+          <b>① La venta con el cliente</b> — si el producto no llegó, corresponde NC sobre la factura original, sin importar qué pase después con nosotros.<br>
+          <b>② El recupero operativo</b> — si además MELI reconoce que la falla fue de su centro y nos compensa el costo del producto, eso es un ingreso nuevo y separado (no está en esta tabla porque no es un evento de NC/FC — es una cuenta de Otros Ingresos aparte). Puede pasar o no pasar; si pasa, no modifica la NC del punto ①.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">cancel_purchase</td>
+          <td class="cat-name">ml_claims.type (33,438 filas)</td>
+          <td><span class="badge loss">Final — pérdida</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Es la etiqueta del motivo, no un movimiento de plata en sí. <b>Si no hubo pago todavía, nunca se emitió factura</b> — no hay nada que reversar, N/A real. <b>Si ya hubo pago</b>, MELI genera el REFUND correspondiente, y esa es la NC — contar cancel_purchase aparte duplicaría la reversión.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">cancel_sale</td>
+          <td class="cat-name">ml_claims.type (4,030 filas)</td>
+          <td><span class="badge loss">Final — pérdida</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Misma lógica que cancel_purchase — sin pago, no hay factura que reversar; con pago, la NC ya la lleva el REFUND asociado, no la etiqueta del claim.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">change</td>
+          <td class="cat-name">ml_claims.type (1 fila)</td>
+          <td><span class="badge prov">Provisorio</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Cambio de producto, no devolución de dinero — la venta sigue en pie. Solo si el cambio implica diferencia de precio correspondería NC parcial por la diferencia. Volumen inmaterial este mes (1 fila).</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <span class="source-tag">Fuente: somos_reyes.mp_liberaciones</span>
+    <h2>2. Detalle fino de reservas y ajustes</h2>
+    <p class="section-note">mp_liberaciones desagrega más que la tabla de arriba — acá vive <b>mediation_cancel</b>, la señal más granular de "a favor nuestro". Nombre exacto tal como aparece en la columna <b>description</b> de la base.</p>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:22%">Movimiento (description)</th>
+          <th style="width:16%">record_type</th>
+          <th style="width:13%">Estado</th>
+          <th style="width:10%">FC / NC / N-A</th>
+          <th style="width:39%">Qué es (en criollo)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mov-name">payment</td><td class="cat-name">release</td>
+          <td><span class="badge final">Final</span></td><td><span class="badge fc">FC</span></td>
+          <td>La plata de la venta ya se liberó a nuestro favor.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">shipping</td><td class="cat-name">release</td>
+          <td><span class="badge final">Final</span></td><td><span class="badge fc">FC</span></td>
+          <td>Costo de envío liberado, mismo tratamiento que la venta.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">shipping_cancel</td><td class="cat-name">release</td>
+          <td><span class="badge final">Final</span></td><td><span class="badge fc">FC</span></td>
+          <td>Reversión de un costo de envío ya cobrado, se mantiene dentro de la misma factura.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">reserve_for_dispute</td><td class="cat-name">release</td>
+          <td><span class="badge prov">Provisorio</span></td><td><span class="badge na">N/A</span></td>
+          <td>Plata congelada por reclamo abierto. No tocar hasta que se resuelva.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">reserve_for_chargeback</td><td class="cat-name">release</td>
+          <td><span class="badge prov">Provisorio</span></td><td><span class="badge na">N/A</span></td>
+          <td>Misma lógica, reclamo es un contracargo bancario.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">reserve_for_refund</td><td class="cat-name">release</td>
+          <td><span class="badge prov">Provisorio</span></td><td><span class="badge na">N/A</span></td>
+          <td>Plata apartada, probable devolución en camino.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">reserve_for_bpp_shipping_return</td><td class="cat-name">release</td>
+          <td><span class="badge prov">Provisorio</span></td><td><span class="badge na">N/A</span></td>
+          <td>Igual que arriba, componente de envío (programa BBP).</td>
+        </tr>
+        <tr>
+          <td class="mov-name">reserve_for_payment</td><td class="cat-name">release</td>
+          <td><span class="badge prov">Provisorio</span></td><td><span class="badge na">N/A</span></td>
+          <td>Retención sobre un pago en revisión, antes de liberarse como payment.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">reserve_for_payout</td><td class="cat-name">release</td>
+          <td><span class="badge prov">Provisorio</span></td><td><span class="badge na">N/A</span></td>
+          <td>Retención ligada a un retiro en proceso.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">reserve_for_debt_payment</td><td class="cat-name">release</td>
+          <td><span class="badge prov">Provisorio</span></td><td><span class="badge na">N/A</span></td>
+          <td>Retención administrativa por deuda con MELI, no ligada a reclamo del comprador.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">mediation</td><td class="cat-name">release</td>
+          <td><span class="badge loss">Final — pérdida</span></td><td><span class="badge nc">NC</span></td>
+          <td>Reclamo resuelto en contra: la plata salió de vuelta al comprador.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">refund</td><td class="cat-name">release</td>
+          <td><span class="badge loss">Final — pérdida</span></td><td><span class="badge nc">NC</span></td>
+          <td>Devolución de dinero al comprador sin mediación previa.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">chargeback</td><td class="cat-name">release</td>
+          <td><span class="badge prov">Revisar signo</span></td><td><span class="badge na">N/A</span></td>
+          <td>N/A — ver nota de CHARGEBACK en la sección 1.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">mediation_cancel</td><td class="cat-name">release</td>
+          <td><span class="badge favor">Final — a favor</span></td><td><span class="badge na">N/A</span></td>
+          <td>Reversión de una mediación que ya había sido resuelta a favor del comprador — se cae el reclamo o se revierte la decisión, y el saldo vuelve a nuestro favor. No confirmado todavía si el comprador también pierde el reembolso original o si esto queda como un movimiento aparte. Volumen bajo (15 filas en junio, +$26K).</td>
+        </tr>
+        <tr>
+          <td class="mov-name">cashback</td><td class="cat-name">release</td>
+          <td><span class="badge final">Final</span></td><td><span class="badge na">N/A</span></td>
+          <td>Promoción de MELI, no ligada a reclamos.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">payout</td><td class="cat-name">release</td>
+          <td><span class="badge excl">Excluir</span></td><td><span class="badge na">N/A</span></td>
+          <td>Retiro a banco, tesorería.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">pre_payout_* / post_payout_* / total</td><td class="cat-name">available_*</td>
+          <td><span class="badge excl">Excluir</span></td><td><span class="badge na">N/A</span></td>
+          <td>Fotos de saldo, no son movimientos nuevos.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <span class="source-tag">Fuente: somos_reyes.ml_claims</span>
+    <h2>3. Capa complementaria — quién ganó el reclamo</h2>
+    <p class="section-note">Simplificado a nivel jugador (resolution_benefited), sin entrar en resolution_reason todavía.</p>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:24%">resolution_benefited</th>
+          <th style="width:18%">Rol</th>
+          <th style="width:13%">Estado</th>
+          <th style="width:10%">FC / NC / N-A</th>
+          <th style="width:35%">Qué significa</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mov-name">['respondent']</td>
+          <td class="cat-name">Nosotros (vendedor)</td>
+          <td><span class="badge favor">A favor</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>Ganamos el reclamo, factura de venta sigue viva.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">['complainant']</td>
+          <td class="cat-name">Comprador</td>
+          <td><span class="badge loss">En contra</span></td>
+          <td><span class="badge nc">NC</span></td>
+          <td>Ganó el comprador, corresponde Nota de Crédito.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">['respondent','complainant']</td>
+          <td class="cat-name">Ambos</td>
+          <td><span class="badge prov">Parcial</span></td>
+          <td><span class="badge nc">NC parcial</span></td>
+          <td>Reembolso parcial — Flujo Disputas rama "Bonificación": NC parcial por el % correspondiente, sin recupero de COGS.</td>
+        </tr>
+        <tr>
+          <td class="mov-name">[] o vacío</td>
+          <td class="cat-name">Sin definir</td>
+          <td><span class="badge prov">Pendiente</span></td>
+          <td><span class="badge na">N/A</span></td>
+          <td>La mayoría de los resolution_reason en este bucket son timeout y return_expired — el comprador no completó el proceso, no hubo movimiento de plata.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. Árbol de decisión</h2>
+    <p class="section-note">Con los nombres reales de mp_liberaciones.description y el desenlace fiscal (FC/NC/N-A) en cada hoja.</p>
+
+    <div class="tree">
+
+      <div class="node">¿Es payout, o una fila pre_payout_* / post_payout_* / total?</div>
+      <div class="branch">
+        <div class="arm-label yes">Sí</div>
+        <div class="leaf excl">
+          <b>Excluir del P&amp;L.</b> Tesorería o snapshot, no revenue.
+          <div style="margin-top:6px;"><span class="fcncna na">N/A</span></div>
+          <span class="mv">payout</span><span class="mv">pre_payout_*</span><span class="mv">post_payout_*</span><span class="mv">total</span>
+        </div>
+      </div>
+
+      <div class="branch">
+        <div class="arm-label no">No</div>
+        <div class="node">¿Es payment, shipping o shipping_cancel?</div>
+        <div class="branch">
+          <div class="arm-label yes">Sí</div>
+          <div class="leaf final">
+            <b>Final.</b> Reconocer revenue / costo normal.
+            <div style="margin-top:6px;"><span class="fcncna fc">FC</span></div>
+            <span class="mv">payment</span><span class="mv">shipping</span><span class="mv">shipping_cancel</span>
+          </div>
+        </div>
+
+        <div class="branch">
+          <div class="arm-label no">No</div>
+          <div class="node">¿Empieza con reserve_for_ ?</div>
+          <div class="branch">
+            <div class="arm-label yes">Sí</div>
+            <div class="leaf prov">
+              <b>Provisorio.</b> No tocar el revenue todavía.
+              <div style="margin-top:6px;"><span class="fcncna na">N/A por ahora</span></div>
+              <span class="mv">reserve_for_dispute</span><span class="mv">reserve_for_chargeback</span><span class="mv">reserve_for_refund</span><span class="mv">reserve_for_bpp_shipping_return</span><span class="mv">reserve_for_payment</span><span class="mv">reserve_for_payout</span><span class="mv">reserve_for_debt_payment</span>
+              <div style="margin-top:8px; font-size:12px; color:#7a5c00;">↳ Cruzar por order_id contra ml_claims.resolution_benefited (sección 3) para saber si ya se resolvió.</div>
+            </div>
+          </div>
+
+          <div class="branch">
+            <div class="arm-label no">No</div>
+            <div class="node">¿Es mediation_cancel?</div>
+            <div class="branch">
+              <div class="arm-label yes">Sí</div>
+              <div class="leaf favor">
+                <b>Final — a favor nuestro.</b> El reclamo que iba camino a devolución se cae o se revierte. No confirmado si el comprador también pierde su reembolso original.
+                <div style="margin-top:6px;"><span class="fcncna na">N/A</span></div>
+                <span class="mv">mediation_cancel</span>
+              </div>
+            </div>
+
+            <div class="branch">
+              <div class="arm-label no">No</div>
+              <div class="node">¿Es mediation, refund o chargeback?</div>
+              <div class="branch">
+                <div class="arm-label yes">Sí</div>
+                <div class="leaf loss">
+                  <b>Final — pérdida real</b> para mediation y refund.
+                  <div style="margin-top:6px;"><span class="fcncna nc">NC</span></div>
+                  <span class="mv">mediation</span><span class="mv">refund</span>
+                  <div style="margin-top:8px; font-size:12px;">Para <span class="mv">chargeback</span>: <span class="fcncna na">N/A</span> — lo inicia el banco del comprador, no MELI; el motivo (desconocimiento del cargo vs. no entrega) no está cargado hoy, N/A por default hasta definir con Luigi.</div>
+                </div>
+              </div>
+              <div class="branch">
+                <div class="arm-label no">No → es cashback</div>
+                <div class="leaf final">
+                  <b>Final — ingreso aparte.</b> No atado a ningún reclamo.
+                  <div style="margin-top:6px;"><span class="fcncna na">N/A</span></div>
+                  <span class="mv">cashback</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:22px; padding-top:16px; border-top:1px solid var(--border);">
+        <div class="arm-label">Fuera de mp_liberaciones</div>
+        <div class="leaf prov" style="margin-top:8px;">
+          <b>returns</b> y <b>fulfillment</b> (de ml_claims) no pasan por este árbol porque viven en otra tabla — van directo por la regla de la sección 1: si el comprador se quedó con la plata (resolution_benefited=complainant) → NC. En fulfillment, si además MELI reconoce el costo del producto, ese recupero es un segundo movimiento aparte (Otro Ingreso), no toca la NC.
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+</div>
+
+<footer>Somos Reyes / Wonder Brands — Proyecto Facturación · ml_financial_transactions_master · ml_claims · mp_liberaciones · Flujos de Facturación/Disputas/Devoluciones (mayo 2026)</footer>
+
+</body>
+</html>
