@@ -25,4 +25,7 @@ RUN pip install --no-cache-dir \
     pandas \
     gspread \
     google-auth \
-    PyPDF2
+    PyPDF2 \
+    cryptography==46.0.7
+# cryptography: firma con la e.firma (FIEL) las peticiones al web service de
+# descarga masiva del SAT (test/.../walmart/_sat_descarga.py).

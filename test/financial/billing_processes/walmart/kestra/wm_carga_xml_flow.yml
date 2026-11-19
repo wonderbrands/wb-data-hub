@@ -1,0 +1,66 @@
+# BORRADOR (rama feat/facturacion-walmart). NO va en flows/ hasta pasar a
+# produccion.
+id: wm_carga_xml_flow
+namespace: wonderbrands.financial.walmart
+description: |
+  Carga el ZIP de XML del SAT (el que hoy descarga Finanzas) a la tabla de
+  control: las filas PENDING_WM_XML con ese UUID pasan a PENDING_WM_LINK y la
+  siguiente corrida de wm_billing_flow las replica en Odoo.
+  Solo escribe MySQL, no Odoo: por eso puede convivir con wm_billing_flow sin
+  romper la exclusion mutua de la facturacion.
+  RESPALDO: la via normal es la descarga masiva del SAT dentro de
+  wm_billing_flow. Este flujo es para cuando el SAT no responda o falte un XML.
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: zip_xml
+    type: FILE
+    displayName: "ZIP con los XML del SAT (CFDI emitidos por Walmart con nuestro RFC)"
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  scripts: "processes/wonderbrands/financial/billing_processes/walmart"
+
+tasks:
+  - id: working_env_walmart_xml
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    inputFiles:
+      xml_walmart.zip: "{{ inputs.zip_xml }}"
+    tasks:
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: carga_xml
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        env:
+          WM_ENTORNO: "prod"
+          PYTHONUNBUFFERED: "1"
+          DB_HOST: "{{ vars.db_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          WM_XML_PATH: "xml_walmart.zip"
+        commands:
+          - python {{ vars.scripts }}/02_wm_xml_loader.py
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {"text": "🚨 Fallo la carga de XML de Walmart · {{ execution.id }}"}

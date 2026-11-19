@@ -1,0 +1,137 @@
+# BORRADOR (rama feat/facturacion-walmart). NO va en flows/ hasta pasar a
+# produccion: main se sincroniza con Kestra cada 15 min.
+# Al promover: copiar los scripts a processes/.../walmart/ y este YAML a
+# flows/wonderbrands/financial/walmart/.
+id: wm_billing_flow
+namespace: wonderbrands.financial.walmart
+description: |
+  Walmart 3P (Team_Walmart): miner (01), XML de los CFDI autofacturados en
+  Walmart por descarga masiva del SAT (02), replica de esos CFDI sin timbrar
+  (03), factura a publico general timbrada por WB (04) y control (05).
+  Respaldo manual del XML: wm_carga_xml_flow (02 con el ZIP de Finanzas).
+  Team_Walmart ya esta excluido del 1a1. Este flujo reemplaza
+  invoice_creation_1a1_local_V18.py e invoice_creation_qtyV18.py.
+
+# =====================================================================
+# EXCLUSION MUTUA (incidente del 26-jul-2026: 549 dobles CFDI).
+# FAIL: la ejecucion nueva falla y avisa; no se encola. Sin retry.
+# =====================================================================
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: start_date
+    type: STRING
+    required: false
+    displayName: "Desde (AAAA-MM-DD). Vacio = dia 1 del mes anterior"
+  - id: end_date
+    type: STRING
+    required: false
+    displayName: "Hasta, exclusivo (AAAA-MM-DD). Vacio = sin tope"
+  - id: max_facturas
+    type: STRING
+    required: false
+    displayName: "Tope de facturas creadas por 03 y por 04 (vacio = sin tope)"
+  - id: emitir_wb
+    type: BOOL
+    defaults: true
+    displayName: "Correr 04 (false = solo miner, replica de CFDI de Walmart y control)"
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  scripts: "processes/wonderbrands/financial/billing_processes/walmart"
+
+tasks:
+  - id: working_env_walmart
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      # Sin retry: reintentar a ciegas un script que timbra puede relanzar
+      # trabajo que ya se hizo. Un fallo se revisa a mano.
+      - id: walmart
+        type: io.kestra.plugin.scripts.shell.Commands
+        timeout: PT6H
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        env:
+          WM_ENTORNO: "prod"
+          PYTHONUNBUFFERED: "1"
+          ODOO_URL: "{{ vars.odoo_url }}"
+          ODOO_DB: "{{ vars.odoo_db }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          DB_HOST: "{{ vars.db_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          SLACK_WEBHOOK: "{{ secret('SLACK_WEBHOOK') }}"
+          KESTRA_EXECUTION_ID: "{{ execution.id }}"
+          WM_START_DATE: "{{ inputs.start_date ?? '' }}"
+          WM_END_DATE: "{{ inputs.end_date ?? '' }}"
+          WM_MAX_FACTURAS: "{{ inputs.max_facturas ?? '' }}"
+          WM_GRACE_DAYS: "5"          # decision pendiente de Finanzas
+          WM_DIAS_CIERRE_MES: "2"     # una corrida por dia: dias 1 y 2
+          WM_FENIX_MAX_HORAS: "48"
+          WM_REPORTE_DIR: "."
+          # e.firma de SRE1410278MA para la descarga masiva del SAT (02).
+          # Secrets en el .env de Kestra del EC2 (ver README_WALMART.md).
+          SAT_FIEL_CER_B64: "{{ secret('SAT_FIEL_CER_B64') }}"
+          SAT_FIEL_KEY_B64: "{{ secret('SAT_FIEL_KEY_B64') }}"
+          SAT_FIEL_PASSWORD: "{{ secret('SAT_FIEL_PASSWORD') }}"
+          WM_SAT_MAX_SOLICITUDES: "10"
+          WM_SAT_MAX_FOLIOS: "20"
+        commands:
+          # 00 corta todo si falla. Si Fenix no esta al dia o la e.firma falla
+          # NO corta: avisa; 04 se niega a emitir y 02 a descargar por su cuenta.
+          - python {{ vars.scripts }}/00_wm_precheck.py
+          - python {{ vars.scripts }}/01_wm_miner.py
+          # 02 nunca corta el flujo: un error del SAT se avisa y se reintenta
+          # en la siguiente corrida.
+          - python {{ vars.scripts }}/02_wm_xml_loader.py
+          - python {{ vars.scripts }}/03_wm_loader_pull.py
+          - |
+            if [ "{{ inputs.emitir_wb }}" = "true" ]; then
+              python {{ vars.scripts }}/04_wm_billing_push.py
+            else
+              echo "emitir_wb=false: 04 no se corre."
+            fi
+          - python {{ vars.scripts }}/05_wm_control.py
+
+triggers:
+  # HORARIO (CDMX). Odoo es el recurso compartido:
+  #   ML 00/06/12/18 · ML Oficiales 03/09/15/21 · Amazon 02:30/15:00
+  #   1a1 04:30/19:30 · alertas 08:00 L-V · cierre Amazon dia 2 09:00
+  # 10:30: entre ML Oficiales 09:00 y ML 12:00. El dia 2 puede encimarse con
+  # el cierre de Amazon (09:00) si este dura mas de 1.5 h: no duplica CFDI
+  # (otro equipo), solo carga Odoo.
+  # Los dias 1 y 2 emite el cierre del mes anterior (fecha = ultimo dia, hora
+  # 23:59:59): a las 10:30 del dia 2 van ~34.5 h de las 72 del SAT.
+  - id: corrida_diaria
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 10 * * *"
+    timezone: America/Mexico_City
+    recoverMissedSchedules: LAST
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *Fallo en el pipeline de Walmart (00-01-02-03-04-05)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecucion:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}\n_Si la causa es CONCURRENCY_LIMIT, otra ejecucion sigue activa: NO relanzar a mano._"
+      }
