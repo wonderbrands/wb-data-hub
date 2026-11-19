@@ -75,10 +75,25 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger('lote_nov')
 
 SOLO_PLAN = os.getenv('LOTE_SOLO_PLAN', '0') == '1'
+# LOTE_CASOS=A,B corre solo esos casos (vacio = todos, A-I). Sirve para repetir
+# un caso sin volver a provocar los que ya pasaron.
+SOLO_CASOS = {c.strip().upper() for c in os.getenv('LOTE_CASOS', '').split(',') if c.strip()}
+TODOS = ('A', 'B', 'C', 'D', 'E1', 'E2', 'F', 'G', 'H', 'I')
+ACTIVOS = [c for c in TODOS if not SOLO_CASOS or c in SOLO_CASOS]
 TS = datetime.now().strftime('%Y%m%d_%H%M')
 SALIDA = os.path.join(_dir, 'lote_auditoria_nov')
 CSV_PATH = os.path.join(SALIDA, f'lote_auditoria_nov_{TS}.csv')
 PREFIJO_MEMO = 'AMZ '
+
+# Se llenan en main() leyendo el espejo:
+#  CANDADO     fecha de cierre contable de la compania. Odoo no deja crear ni
+#              modificar asientos con fecha <= esa (Global / Sales Lock Date).
+#              Ningun caso puede tocar un documento de un periodo cerrado.
+#  ULTIMA_SO / FIN_ESPEJO  ultima SO de la copia y su fecha (la copia se
+#              refresca; no se asume una fecha fija).
+CANDADO = ''
+ULTIMA_SO = 'SO99999999'
+FIN_ESPEJO = '2999-12-31'
 
 
 def cargar_01():
@@ -132,6 +147,26 @@ def facturas_vivas(odoo, so_name):
 
 def so_existe(odoo, so_name):
     return bool(odoo.execute_kw('sale.order', 'search_count', [[('name', '=', so_name)]]))
+
+
+def leer_candado(odoo):
+    """Fecha de cierre mas reciente de las companias (global, ventas, impuestos,
+    candado duro). Se toma la mayor: es la que manda."""
+    campos = odoo.execute_kw('res.company', 'fields_get', [], {'attributes': ['type']})
+    nombres = [c for c in ('fiscalyear_lock_date', 'sale_lock_date', 'tax_lock_date',
+                           'hard_lock_date') if c in campos]
+    fechas = []
+    for comp in odoo.execute_kw('res.company', 'search_read', [[]], {'fields': nombres}):
+        fechas += [str(comp[c]) for c in nombres if comp.get(c)]
+    return max(fechas) if fechas else ''
+
+
+def abiertos(odoo, modelo, ids):
+    """True si ningun documento tiene fecha contable en el periodo cerrado."""
+    if not ids or not CANDADO:
+        return True
+    filas = odoo.execute_kw(modelo, 'read', [ids], {'fields': ['date']})
+    return all(f['date'] and str(f['date']) > CANDADO for f in filas)
 
 
 def fila(db, order_id, tabla=None):
@@ -216,7 +251,8 @@ def elegir_a(db, odoo, mod):
         refunds = [x for x in facturas_vivas(odoo, f['odoo_so_name']) if x['move_type'] == 'out_refund']
         if (len(vivas) == 1 and not refunds and vivas[0]['l10n_mx_edi_cfdi_uuid']
                 and vivas[0]['payment_state'] == 'not_paid'
-                and (vivas[0]['invoice_origin'] or '') == f['odoo_so_name']):
+                and (vivas[0]['invoice_origin'] or '') == f['odoo_so_name']
+                and abiertos(odoo, 'account.move', [vivas[0]['id']])):
             return {**f, 'cancelar': vivas, 'uuid_previo': vivas[0]['l10n_mx_edi_cfdi_uuid']}
     return None
 
@@ -234,7 +270,11 @@ def elegir_b(db, odoo, mod):
                           AND p.mkp_order_id=b.mkp_order_id)
           AND (SELECT COUNT(DISTINCT i.uuid) FROM somos_reyes.amz_b2b_invoices i
                WHERE i.order_id=b.mkp_order_id AND i.receipt_type='I') = 1
-        ORDER BY b.id DESC LIMIT 40""", (MARKETPLACE,))
+          -- la factura vinculada lleva la fecha del CFDI de Amazon: debe caer
+          -- en periodo abierto
+          AND (SELECT MIN(DATE(i.date)) FROM somos_reyes.amz_b2b_invoices i
+               WHERE i.order_id=b.mkp_order_id AND i.receipt_type='I') > %s
+        ORDER BY b.id DESC LIMIT 40""", (MARKETPLACE, CANDADO or '1900-01-01'))
     for f in filas:
         so = mod.buscar_so(odoo, f['odoo_so_name'])
         if not so:
@@ -243,18 +283,22 @@ def elegir_b(db, odoo, mod):
         todas = facturas_vivas(odoo, f['odoo_so_name'])
         if (vivas and all(v['payment_state'] == 'not_paid' for v in vivas)
                 and all(',' not in (v['invoice_origin'] or '') for v in vivas)
-                and not any(x['move_type'] == 'out_refund' for x in todas)):
+                and not any(x['move_type'] == 'out_refund' for x in todas)
+                and abiertos(odoo, 'account.move', [v['id'] for v in vivas])):
             return {**f, 'cancelar': vivas}
     return None
 
 
 def elegir_c(db, odoo, mod):
-    """Business con 2+ CFDI de Amazon (sep-oct), SO en el espejo, sin cobro aplicado."""
+    """Business con 2+ CFDI de Amazon, todos en periodo abierto y anteriores a la
+    copia; SO en el espejo, sin cobro aplicado."""
     filas = q(db, """
         SELECT i.order_id mkp_order_id, COUNT(DISTINCT i.uuid) n_cfdi
         FROM somos_reyes.amz_b2b_invoices i
-        WHERE i.receipt_type='I' AND i.date >= '2026-09-15' AND i.date < '2026-10-12'
-        GROUP BY i.order_id HAVING n_cfdi BETWEEN 2 AND 5 ORDER BY n_cfdi, i.order_id""")
+        WHERE i.receipt_type='I' AND i.date < %s
+        GROUP BY i.order_id
+        HAVING n_cfdi BETWEEN 2 AND 5 AND MIN(DATE(i.date)) > %s
+        ORDER BY n_cfdi, i.order_id""", (FIN_ESPEJO, CANDADO or '1900-01-01'))
     for f in filas:
         so_r = q(db, "SELECT order_id FROM somos_reyes.odoo_master_txns_c "
                      "WHERE marketplace_order_id=%s AND order_id IS NOT NULL LIMIT 1",
@@ -267,9 +311,109 @@ def elegir_c(db, odoo, mod):
             continue
         vivas = mod.facturas_existentes(odoo, so_name, so)
         if (all(v['payment_state'] == 'not_paid' for v in vivas)
-                and all(',' not in (v['invoice_origin'] or '') for v in vivas)):
+                and all(',' not in (v['invoice_origin'] or '') for v in vivas)
+                and abiertos(odoo, 'account.move', [v['id'] for v in vivas])):
             return {**f, 'odoo_so_name': so_name, 'cancelar': vivas}
     return None
+
+
+# --- A y B desde produccion -------------------------------------------------
+# Las filas de *_staging sin cobro son casi todas de septiembre (periodo
+# cerrado). Se toma una orden real de produccion facturada en oct-nov cuya
+# factura sigue SIN PAGAR en la copia, y se copia su fila a staging antes de
+# cancelar (preparar). Produccion solo se lee.
+
+def candidatas_sin_pagar(odoo, sos):
+    """De 'sos', las que tienen en la copia una factura publicada, sin pagar,
+    timbrada y en periodo abierto (filtro barato antes del detalle)."""
+    hay = set()
+    for i in range(0, len(sos), 200):
+        dominio = [('move_type', '=', 'out_invoice'), ('state', '=', 'posted'),
+                   ('payment_state', '=', 'not_paid'), ('invoice_origin', 'in', sos[i:i + 200])]
+        if CANDADO:
+            dominio.append(('date', '>', CANDADO))
+        for m in odoo.execute_kw('account.move', 'search_read', [dominio],
+                                 {'fields': ['invoice_origin']}):
+            hay.add(m['invoice_origin'])
+    return [s for s in sos if s in hay]
+
+
+def elegir_a_prod(db, odoo, mod):
+    """B2C de produccion (no Business) con una sola factura viva sin pagar en la copia."""
+    filas = q(db, f"""
+        SELECT b.mkp_order_id, b.odoo_so_name, b.status FROM finance.mkp_billing_prod b
+        WHERE b.marketplace=%s AND b.status IN ('ALREADY_ODOO_INVOICED','ODOO_INVOICED')
+          AND JSON_UNQUOTE(JSON_EXTRACT(b.raw_json,'$.log_conciliacion.tipo'))='B2C_PUBLICO_GENERAL'
+          AND b.odoo_so_name <= %s
+          AND NOT EXISTS (SELECT 1 FROM {TBL_BILLING} s WHERE s.marketplace=b.marketplace
+                          AND s.mkp_order_id=b.mkp_order_id)
+          AND NOT EXISTS (SELECT 1 FROM {TBL_PAYMENTS} p WHERE p.marketplace=b.marketplace
+                          AND p.mkp_order_id=b.mkp_order_id)
+          AND NOT EXISTS (SELECT 1 FROM somos_reyes.amazon_orders o
+                          WHERE o.AmazonOrderId=b.mkp_order_id AND o.IsBusinessOrder=1)
+        ORDER BY b.id DESC LIMIT 400""", (MARKETPLACE, ULTIMA_SO))
+    por_so = {f['odoo_so_name']: f for f in filas}
+    for so_name in candidatas_sin_pagar(odoo, list(por_so))[:40]:
+        f = por_so[so_name]
+        so = mod.buscar_so(odoo, so_name)
+        if not so:
+            continue
+        vivas = mod.facturas_existentes(odoo, so_name, so)
+        refunds = [x for x in facturas_vivas(odoo, so_name) if x['move_type'] == 'out_refund']
+        if (len(vivas) == 1 and not refunds and vivas[0]['l10n_mx_edi_cfdi_uuid']
+                and vivas[0]['payment_state'] == 'not_paid'
+                and (vivas[0]['invoice_origin'] or '') == so_name
+                and abiertos(odoo, 'account.move', [vivas[0]['id']])):
+            return {**f, 'cancelar': vivas, 'uuid_previo': vivas[0]['l10n_mx_edi_cfdi_uuid'],
+                    'desde_prod': True}
+    return None
+
+
+def elegir_b_prod(db, odoo, mod):
+    """Business de produccion facturada a publico general (es lo de la hoja A6:
+    en produccion queda como B2C o en B2B_FACTURADA_PG), con un solo CFDI de
+    Amazon en periodo abierto y la factura sin pagar en la copia."""
+    filas = q(db, f"""
+        SELECT b.mkp_order_id, b.odoo_so_name, b.status, x.uuid_amz
+        FROM finance.mkp_billing_prod b
+        JOIN (SELECT order_id, MIN(uuid) uuid_amz, COUNT(DISTINCT uuid) n, MIN(DATE(date)) f
+              FROM somos_reyes.amz_b2b_invoices WHERE receipt_type='I' GROUP BY order_id) x
+          ON x.order_id=b.mkp_order_id
+        WHERE b.marketplace=%s
+          AND b.status IN ('ALREADY_ODOO_INVOICED','ODOO_INVOICED','B2B_FACTURADA_PG')
+          AND x.n=1 AND x.f > %s AND b.odoo_so_name <= %s
+          AND NOT EXISTS (SELECT 1 FROM {TBL_BILLING} s WHERE s.marketplace=b.marketplace
+                          AND s.mkp_order_id=b.mkp_order_id)
+          AND NOT EXISTS (SELECT 1 FROM {TBL_PAYMENTS} p WHERE p.marketplace=b.marketplace
+                          AND p.mkp_order_id=b.mkp_order_id)
+        ORDER BY b.id DESC LIMIT 400""", (MARKETPLACE, CANDADO or '1900-01-01', ULTIMA_SO))
+    por_so = {f['odoo_so_name']: f for f in filas}
+    for so_name in candidatas_sin_pagar(odoo, list(por_so))[:40]:
+        f = por_so[so_name]
+        so = mod.buscar_so(odoo, so_name)
+        if not so:
+            continue
+        vivas = mod.facturas_existentes(odoo, so_name, so)
+        todas = facturas_vivas(odoo, so_name)
+        if (vivas and all(v['payment_state'] == 'not_paid' for v in vivas)
+                and all(',' not in (v['invoice_origin'] or '') for v in vivas)
+                and not any(x['move_type'] == 'out_refund' for x in todas)
+                and abiertos(odoo, 'account.move', [v['id'] for v in vivas])):
+            return {**f, 'cancelar': vivas, 'desde_prod': True}
+    return None
+
+
+def copiar_de_prod(db, order_id):
+    """Copia la fila de facturacion de produccion a staging (columnas explicitas)."""
+    return ex(db, f"""INSERT IGNORE INTO {TBL_BILLING}
+                   (marketplace, mkp_order_id, odoo_so_name, cfdi_uuid, total_amount,
+                    xml_data, raw_json, status, retry_count, retry_count_loader, error_log,
+                    processed_at)
+               SELECT marketplace, mkp_order_id, odoo_so_name, cfdi_uuid, total_amount,
+                      xml_data, raw_json, status, retry_count, retry_count_loader, error_log,
+                      processed_at
+               FROM finance.mkp_billing_prod WHERE marketplace=%s AND mkp_order_id=%s""",
+              (MARKETPLACE, order_id))
 
 
 def ordenes_con_cobro(db, ids):
@@ -347,7 +491,7 @@ def elegir_f(db, odoo, journal_id, memo_campo):
         settlement, orden = f['payment_id'].split(':', 1)
         memo = f"{PREFIJO_MEMO}{settlement} / {orden}"
         pagos = pagos_por_memo(odoo, journal_id, memo_campo, memo)
-        if len(pagos) == 1:
+        if len(pagos) == 1 and abiertos(odoo, 'account.payment', [pagos[0]['id']]):
             return {**f, 'memo': memo, 'pago': pagos[0],
                     'promos_antes': promos_vivas(odoo, f['payment_id'])}
     return None
@@ -366,8 +510,8 @@ def elegir_g(db, odoo):
                AND x.mkp_order_id=p.mkp_order_id) = 1
           AND NOT EXISTS (SELECT 1 FROM {TBL_BILLING} s WHERE s.marketplace=p.marketplace
                           AND s.mkp_order_id=p.mkp_order_id)
-          AND b.odoo_so_name < 'SO10330000'
-        ORDER BY p.id LIMIT 400""", (MARKETPLACE,))
+          AND b.odoo_so_name <= %s
+        ORDER BY p.id DESC LIMIT 400""", (MARKETPLACE, ULTIMA_SO))
     por_so = {f['odoo_so_name']: f for f in filas}
     sos = list(por_so)
     for i in range(0, len(sos), 100):
@@ -398,7 +542,20 @@ def preparar(db, odoo, casos):
         c = casos.get(clave)
         if not c:
             continue
-        hechos = [f"{v['name']} [{cancelar_factura(odoo, v['id'])}]" for v in c['cancelar']]
+        hechos = []
+        if c.get('desde_prod'):
+            copiar_de_prod(db, c['mkp_order_id'])
+            hechos.append(f"fila copiada de produccion ({c['status']})")
+        try:
+            for v in c['cancelar']:
+                hechos.append(f"{v['name']} [{cancelar_factura(odoo, v['id'])}]")
+        except xmlrpc.client.Fault as e:
+            # Un caso que no se puede preparar se reporta y no tumba el lote.
+            log.error(f"Caso {clave}: no se pudo preparar ({e.faultString[:200]})")
+            notas[clave] = (f"NO SE PUDO PREPARAR: {e.faultString[:200]}"
+                            f"{' | ya canceladas: ' + ', '.join(hechos) if hechos else ''}")
+            casos[clave] = None
+            continue
         notas[clave] = ('Cancelada(s) en el espejo: ' + ', '.join(hechos)) if hechos else 'Sin factura que cancelar'
     if casos.get('C'):
         c = casos['C']
@@ -479,7 +636,7 @@ def evaluar(db, odoo, casos, notas, extra, memo_campo, journal_id):
                 f"{r['status']}; {', '.join(v['name'] for v in nuevas) or 'sin factura'}; origen {origen}",
                 ok, (r['error_log'] or '')[:200])
     else:
-        agregar('A', 'Reapertura B2C con sustitucion 04', None, '', '', False)
+        agregar('A', 'Reapertura B2C con sustitucion 04', None, '', '', False, notas.get('A', ''))
 
     c = casos.get('B')
     if c:
@@ -492,7 +649,7 @@ def evaluar(db, odoo, casos, notas, extra, memo_campo, journal_id):
                 f"{r['status']}; {', '.join(f'{v['name']} {v['l10n_mx_edi_cfdi_uuid']}' for v in nuevas) or 'sin factura'}",
                 ok, (r['error_log'] or '')[:200])
     else:
-        agregar('B', 'Reapertura Business', None, '', '', False)
+        agregar('B', 'Reapertura Business', None, '', '', False, notas.get('B', ''))
 
     c = casos.get('C')
     if c:
@@ -504,7 +661,7 @@ def evaluar(db, odoo, casos, notas, extra, memo_campo, journal_id):
                 f"{r['status']}; {len(nuevas)} factura(s): {', '.join(v['name'] for v in nuevas)}",
                 ok, (r['error_log'] or '')[:200])
     else:
-        agregar('C', 'Split reevaluado', None, '', '', False)
+        agregar('C', 'Split reevaluado', None, '', '', False, notas.get('C', ''))
 
     c = casos.get('D')
     if c:
@@ -521,7 +678,7 @@ def evaluar(db, odoo, casos, notas, extra, memo_campo, journal_id):
     for clave, que, esperado in (
             ('E1', 'Gracia: B2C comprada hace menos de 6 dias', 'SKIPPED_GRACE'),
             ('E2', 'Gracia: B2C comprada hace 6 dias o mas',
-             'fuera de gracia (en el espejo del 13-oct la SO no existe: NO_SO_IN_ODOO)')):
+             'fuera de gracia (ODOO_INVOICED, o NO_SO_IN_ODOO si la SO no esta en la copia)')):
         c = casos.get(clave)
         if c:
             r = fila(db, c['mkp_order_id'])
@@ -575,6 +732,8 @@ def evaluar(db, odoo, casos, notas, extra, memo_campo, journal_id):
                       'obtenido': f"{sin_so} en la ventana; {n_tabla} filas NO_SO_IN_ODOO sembradas en staging",
                       'resultado': 'OK' if sin_so and n_tabla else 'FALLA', 'detalle': ''})
     alerta = extra.get('alerta')
+    if alerta is None:
+        return filas
     filas.append({'caso': 'I', 'que_prueba': 'Alerta SAT cancelado con asiento publicado',
                   'orden': '', 'so': '', 'preparacion': '', 'esperado': 'la consulta corre sin error',
                   'obtenido': alerta if isinstance(alerta, str) else f"{len(alerta)} documento(s): {'; '.join(alerta[:5])}",
@@ -594,27 +753,35 @@ def escribir_csv(filas):
 
 
 def main():
+    global CANDADO, ULTIMA_SO, FIN_ESPEJO
     candado()
     mod = cargar_01()
     db = get_db_connection()
     odoo = OdooModelProxy(timeout=300)
     ultima = odoo.execute_kw('sale.order', 'search_read', [[]],
                              {'fields': ['name', 'create_date'], 'order': 'id desc', 'limit': 1})
-    log.info(f"Espejo {ODOO_DB}: ultima SO {ultima[0]['name']} creada {ultima[0]['create_date']}")
+    ULTIMA_SO = ultima[0]['name']
+    FIN_ESPEJO = str(ultima[0]['create_date'])[:10]
+    CANDADO = leer_candado(odoo)
+    log.info(f"Espejo {ODOO_DB}: ultima SO {ULTIMA_SO} creada {ultima[0]['create_date']}")
+    log.info(f"Periodo cerrado en el espejo hasta {CANDADO or '(sin candado)'}: "
+             f"ningun caso toca documentos con fecha <= esa")
     journal_id = find_journal_by_account(odoo, ACCOUNT_LIBERACIONES)
     memo_campo = campo_memo(odoo)
 
-    casos = {
-        'A': elegir_a(db, odoo, mod),
-        'B': elegir_b(db, odoo, mod),
-        'C': elegir_c(db, odoo, mod),
-        'D': elegir_d(db),
-        'E1': elegir_gracia(db, 0, 5),
-        'E2': elegir_gracia(db, 6, 9),
-        'F': elegir_f(db, odoo, journal_id, memo_campo),
-        'G': elegir_g(db, odoo),
+    selectores = {
+        'A': lambda: elegir_a(db, odoo, mod) or elegir_a_prod(db, odoo, mod),
+        'B': lambda: elegir_b(db, odoo, mod) or elegir_b_prod(db, odoo, mod),
+        'C': lambda: elegir_c(db, odoo, mod),
+        'D': lambda: elegir_d(db),
+        'E1': lambda: elegir_gracia(db, 0, 5),
+        'E2': lambda: elegir_gracia(db, 6, 9),
+        'F': lambda: elegir_f(db, odoo, journal_id, memo_campo),
+        'G': lambda: elegir_g(db, odoo),
     }
-    if casos['D']:
+    log.info(f"Casos de esta corrida: {', '.join(ACTIVOS)}")
+    casos = {k: sel() for k, sel in selectores.items() if k in ACTIVOS}
+    if casos.get('D'):
         casos['D']['facturas_antes'] = len([v for v in facturas_vivas(odoo, casos['D']['odoo_so_name'])
                                             if v['move_type'] == 'out_invoice']) \
             if so_existe(odoo, casos['D']['odoo_so_name']) else 0
@@ -635,22 +802,26 @@ def main():
         log.info(f"Preparado {k}: {v}")
 
     extra = {}
-    extra['sin_so'] = mod.sembrar_sin_so(db)
-    try:
-        extra['alerta'] = mod.alertar_sat_cancelado_vivo(odoo)
-    except Exception as e:
-        extra['alerta'] = f"ERROR: {e}"
+    if 'H' in ACTIVOS:
+        extra['sin_so'] = mod.sembrar_sin_so(db)
+    if 'I' in ACTIVOS:
+        try:
+            extra['alerta'] = mod.alertar_sat_cancelado_vivo(odoo)
+        except Exception as e:
+            extra['alerta'] = f"ERROR: {e}"
 
     os.makedirs(SALIDA, exist_ok=True)
     ordenes = [c['mkp_order_id'] for k, c in casos.items() if c and k in ('A', 'B', 'C', 'D', 'E1', 'E2')]
     if ordenes:
         correr('01_amz_billing.py', {'AMZ_ORDER_IDS': ','.join(ordenes)},
                os.path.join(SALIDA, f'lote_auditoria_nov_{TS}_01.log'))
-    correr('03_loader_amz_payments.py', {}, os.path.join(SALIDA, f'lote_auditoria_nov_{TS}_03.log'))
+    if 'F' in ACTIVOS or 'G' in ACTIVOS:
+        correr('03_loader_amz_payments.py', {}, os.path.join(SALIDA, f'lote_auditoria_nov_{TS}_03.log'))
 
     db.close()
     db = get_db_connection()
-    filas = evaluar(db, odoo, casos, notas, extra, memo_campo, journal_id)
+    filas = [f for f in evaluar(db, odoo, casos, notas, extra, memo_campo, journal_id)
+             if f['caso'] in ACTIVOS]
     escribir_csv(filas)
     for f in filas:
         log.info(f"{f['caso']:<3} {f['resultado']:<13} {f['obtenido'][:110]}")
