@@ -42,6 +42,13 @@ INVOICE_XML_URL = "https://api.mercadolibre.com/invoices/io/documents/stream/ord
 # Órdenes de reventa (static_tags meli_resale: ML nos compra y revende al cliente). Se facturan a
 # DeRemate y ML solo las expone con transaction_type=resale; sin el parámetro responde 404 para siempre.
 RESALE_PARAMS = {'transaction_type': 'resale'}
+# Respaldo cuando la consulta normal devuelve la NC (CFDI de egreso) en lugar de la factura: pasa en
+# órdenes que MeLi factura y cancela en pocas horas. Solo respaldo: con 'sale' MeLi responde 404 en
+# la mayoría de las órdenes normales (165 de 200 en la muestra del 17-nov).
+SALE_PARAMS = {'transaction_type': 'sale'}
+# Estado para órdenes cuyo único documento disponible es la NC: no se carga nada; va a revisión
+# (flujo de pares de órdenes canceladas) y deja de consultarse en cada corrida.
+STATUS_ONLY_NC = 'ONLY_NC_IN_ML'
 
 
 def xml_to_dict(element):
@@ -71,6 +78,14 @@ def fetch_invoice_xml(order_id, is_resale, headers):
             break
         time.sleep(SLEEP_BETWEEN_CALLS)  # También en 404: el reproceso masivo no debe disparar un 429
     return r
+
+
+def comprobante_type(content):
+    """TipoDeComprobante del CFDI ('I' factura, 'E' nota de crédito) o None si no es XML."""
+    try:
+        return ET.fromstring(content).get('TipoDeComprobante')
+    except ET.ParseError:
+        return None
 
 
 def extract_ml_invoices():
@@ -138,6 +153,8 @@ def extract_ml_invoices():
     http_errors   = 0
     http_by_code  = {}   # código HTTP -> cantidad, para diagnosticar permisos/rate limit
     xml_errors    = 0
+    nc_recovered  = 0   # Llegó la NC y con transaction_type=sale se obtuvo la factura
+    only_nc       = 0   # Solo hay NC disponible: no se carga (ONLY_NC_IN_ML)
     token_expired = False
 
     for o in orders:
@@ -195,6 +212,31 @@ def extract_ml_invoices():
             time.sleep(SLEEP_BETWEEN_CALLS)  # También en error: evita rachas que disparen un 429
             continue
 
+        # ── Solo se carga una FACTURA (TipoDeComprobante 'I') ──
+        # Si MeLi ya emitió la NC, la consulta normal puede devolverla a ella (tipo 'E').
+        # Cargarla como factura deja en Odoo una venta con el UUID de la NC (pasó en 10 órdenes).
+        if comprobante_type(r.content) != 'I':
+            try:
+                r_sale = requests.get(INVOICE_XML_URL.format(order_id=order_id), headers=headers,
+                                      params=SALE_PARAMS, timeout=REQUEST_TIMEOUT)
+            except requests.exceptions.RequestException:
+                net_errors += 1
+                continue
+            if r_sale.status_code == 200 and comprobante_type(r_sale.content) == 'I':
+                r = r_sale
+                nc_recovered += 1
+            else:
+                cursor.execute("""
+                    INSERT INTO finance.mkp_billing_prod
+                    (marketplace, mkp_order_id, status, retry_count)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE status = VALUES(status), retry_count = VALUES(retry_count)
+                """, (MKP_MARKETPLACE, order_id, STATUS_ONLY_NC, retry_count + 1))
+                db.commit()
+                only_nc += 1
+                time.sleep(SLEEP_BETWEEN_CALLS)
+                continue
+
         # ── Parsear XML (Si llegó 200 OK) ──
         try:
             root = ET.fromstring(r.content)
@@ -246,6 +288,7 @@ def extract_ml_invoices():
     log.info(
         f"[{MKP_MARKETPLACE}] Resumen -> Candidatas: {len(orders)} | XMLs extraídos: {inserts_ok} (reventa: {resale_ok}) | "
         f"En espera (404): {waiting_404} | Nunca facturadas por ML: {never_billed} | "
+        f"NC en vez de factura: recuperadas={nc_recovered}, solo NC ({STATUS_ONLY_NC})={only_nc} | "
         f"Errores: {total_errors} (red={net_errors}, http={http_errors} {http_by_code}, xml={xml_errors})"
     )
     cursor.close()
