@@ -43,7 +43,9 @@ y este sync no los toca. No agregues aquí flujos de esos namespaces.
 
 ## Reglas
 
-1. **Carpeta = namespace.** `wonderbrands.financial.odoo` → `flows/wonderbrands/financial/odoo/`.
+1. **Carpeta = namespace.** `wonderbrands.financial.billing_processes.odoo` → `flows/wonderbrands/financial/billing_processes/odoo/`.
+   En `financial` la carpeta repite la ruta del script en `processes/`: `billing_processes/<marketplace>/`
+   o `credit_note_refund_processes/<marketplace>/`.
 2. **Nombre de archivo = `id` del flujo.** `id: coppel_shipping_labels_pipeline` →
    `coppel_shipping_labels_pipeline.yml`.
 3. **Un flujo por archivo**, extensión `.yml`.
@@ -81,7 +83,7 @@ Abrir PR → merge. El cambio llega a Kestra en ≤ 15 min.
 ### Crear un flujo
 
 1. Crear el archivo en la carpeta de su namespace, con nombre = `id`:
-   `flows/wonderbrands/financial/odoo/odoo_mi_nuevo_flow.yml`
+   `flows/wonderbrands/financial/billing_processes/odoo/odoo_mi_nuevo_flow.yml`
 2. Probarlo en el sandbox (ver abajo).
 3. PR → merge.
 
@@ -89,7 +91,7 @@ Plantilla base (patrón de los flujos actuales):
 
 ```yaml
 id: odoo_mi_nuevo_flow
-namespace: wonderbrands.financial.odoo
+namespace: wonderbrands.financial.billing_processes.odoo
 description: "Qué hace este flujo, en una línea"
 
 concurrency:
@@ -122,7 +124,7 @@ tasks:
         env:
           LOG_LEVEL: "INFO"
         commands:
-          - python processes/wonderbrands/financial/odoo/mi_script.py
+          - python processes/wonderbrands/financial/billing_processes/odoo/mi_script.py
 
 triggers:
   - id: cron_diario

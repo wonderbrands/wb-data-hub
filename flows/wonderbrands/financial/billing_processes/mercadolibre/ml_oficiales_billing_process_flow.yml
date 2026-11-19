@@ -1,6 +1,6 @@
-id: ml_billing_process_flow
-namespace: wonderbrands.financial.mercadolibre
-description: "Pipeline Facturación ML (SOMOS-REYES, seller 25523702): Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
+id: ml_oficiales_billing_process_flow
+namespace: wonderbrands.financial.billing_processes.mercadolibre
+description: "Pipeline Facturación ML OFICIALES (SOMOS-REYES OFICIALES, seller 160190870): Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
 
 concurrency:
   limit: 1
@@ -9,8 +9,9 @@ concurrency:
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
-  # marketplace, CxC y fecha de corte se derivan del seller en ml_stores.py
-  ml_seller_id: "25523702"
+  # marketplace (MERCADO_LIBRE_OFICIALES), CxC (105.01.005) y fecha de corte
+  # (2026-09-17 15:56:00 CDMX) se derivan del seller en ml_stores.py
+  ml_seller_id: "160190870"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
@@ -18,10 +19,10 @@ variables:
   db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
 
 tasks:
-  - id: working_env_billing
+  - id: working_env_billing_oficiales
     type: io.kestra.plugin.core.flow.WorkingDirectory
     tasks:
-      
+
       - id: clone_repo
         type: io.kestra.plugin.git.Clone
         url: "{{ vars.repo_url }}"
@@ -29,7 +30,7 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
-      # ── PASO 01: Extracción de XMLs de Mercado Libre a BD ──
+      # ── PASO 01: Extracción de XMLs de Mercado Libre Oficiales a BD ──
       - id: run_miner_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-python:v1
@@ -59,7 +60,7 @@ tasks:
             memory: "768MB"
             memorySwap: "1024MB"
         env:
-          ODOO_URL: "{{ vars.odoo_url }}" 
+          ODOO_URL: "{{ vars.odoo_url }}"
           ODOO_DB: "{{ vars.odoo_db }}"
           ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
           ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
@@ -72,10 +73,11 @@ tasks:
           - python processes/wonderbrands/financial/billing_processes/mercadolibre/02_loader_ml_billing.py
 
 triggers:
-  # Distribución de carga: Se ejecuta cada 6 horas UTC
-  - id: micro_lotes_cada_6_horas 
+  # Cada 6 horas UTC, desfasado 3 h respecto a ml_billing_process_flow (0,6,12,18)
+  # para que los dos loaders no hagan action_post contra Odoo al mismo tiempo.
+  - id: micro_lotes_cada_6_horas
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 0,6,12,18 * * *"
+    cron: "0 3,9,15,21 * * *"
 
 errors:
   - id: slack_alert
@@ -83,6 +85,6 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *¡Fallo en Pipeline de Facturación ML (Scripts 01-02)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
+        "text": "🚨 *¡Fallo en Pipeline de Facturación ML OFICIALES (160190870) (Scripts 01-02)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
       }
 disabled: false

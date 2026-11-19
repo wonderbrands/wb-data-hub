@@ -47,9 +47,18 @@ try:
 except ImportError:
     pass
 
-sys.path.insert(0, os.path.abspath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    '..', '..', '..', 'processes', 'wonderbrands', 'financial', 'billing_processes', 'mercadolibre')))
+# ml_stores.py vive con los procesos productivos de ML (01-04) en
+# processes/wonderbrands/financial/billing_processes/mercadolibre/; se reutiliza desde aquí
+# para no duplicar la configuración por tienda. Primera ruta: desde la copia de processes/
+# (credit_note_refund_processes/mercadolibre -> ../../billing_processes/mercadolibre).
+# Segunda: desde la copia de test/ (apunta a processes/). La que no existe se ignora.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.join(_HERE, '..', '..', 'billing_processes', 'mercadolibre'),
+           os.path.join(_HERE, '..', '..', '..', '..', 'processes', 'wonderbrands', 'financial',
+                        'billing_processes', 'mercadolibre')):
+    if os.path.exists(os.path.join(_p, 'ml_stores.py')):
+        sys.path.insert(0, os.path.abspath(_p))
+        break
 from ml_stores import get_store_config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s',

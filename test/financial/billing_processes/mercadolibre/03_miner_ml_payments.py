@@ -17,7 +17,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Parámetros por variables de entorno ────────────────────────
-# Definidas en flows/wonderbrands/financial/mercadolibre/ml_payments_flow.yml
+# Definidas en flows/wonderbrands/financial/billing_processes/mercadolibre/ml_payments_flow.yml
 # y ml_oficiales_payments_flow.yml (cada flujo mapea su propio secreto a MERCADO_PAGO_TOKEN)
 DB_HOST     = os.getenv("DB_HOST")
 DB_USER     = os.getenv("DB_USER")
