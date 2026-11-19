@@ -30,9 +30,11 @@ de Amazon quedan fuera del alcance de este script. Ese hueco lo cubre
 ===============================================================================
 LAS TRES REGLAS QUE PIDIO FINANZAS
 ===============================================================================
-  1. Distinguir B2B. Se detecta por la existencia real del CFDI en
-     somos_reyes.amz_b2b_invoices, no por la marca IsBusinessOrder: preferimos
-     verificar que el comprobante exista antes que asumir que deberia existir.
+  1. Distinguir B2B. Una orden es Amazon Business si tiene IsBusinessOrder O
+     si Amazon ya emitio su CFDI (somos_reyes.amz_b2b_invoices). Las Business
+     las factura SOLO Amazon (Jero, 8-nov-2026): con CFDI se vincula; sin CFDI
+     queda en B2B_SIN_CFDI y nunca se emite a publico general. Hasta el 8-nov
+     se decidia solo por el CFDI, y 75 Business sin CFDI salieron a PG.
 
   2. Sin restriccion de OUT. Se factura sobre la cantidad PEDIDA, haya
      movimiento de salida o no. La politica de Odoo ya esta en "cantidades
@@ -73,6 +75,9 @@ ESTADOS EN finance.mkp_billing_{staging|prod}
   ALREADY_ODOO_INVOICED  ya tenia factura viva en Odoo (incluye factura global)
   B2B_FACTURADA_PG       B2B con factura viva a publico general: anularla
                          antes de vincular el CFDI de Amazon. Se reevalua.
+  B2B_SIN_CFDI           orden Business (IsBusinessOrder) sin CFDI de Amazon.
+                         No se factura; pasa a PENDING_B2B_LINK cuando Amazon
+                         emita el CFDI. Se reevalua.
   SKIPPED_GRACE          dentro del periodo de gracia
   TOTAL_DIFF             el importe de Odoo no cuadra con el de Amazon. NO se
                          factura; sale en el reporte de Finanzas.
@@ -208,8 +213,12 @@ AMZ_ORDER_IDS = [o.strip() for o in os.getenv('AMZ_ORDER_IDS', '').split(',') if
 CON_ALCANCE = bool(AMZ_SETTLEMENT_ID or AMZ_ORDER_IDS)
 
 # Dias que se le dan al cliente para autofacturar con su RFC antes de que
-# emitamos a publico en general.
-GRACE_DAYS = int(os.getenv('AMZ_GRACE_DAYS', '5'))
+# emitamos a publico en general. Se cuentan desde la COMPRA (PurchaseDate), y
+# la orden ademas tiene que estar cobrada (el miner solo lee ordenes con
+# transaccion). Jero, 9-nov-2026: "al menos 6 dias desde la compra y ya tiene
+# su Shipment". Antes eran 5 dias desde el cobro, y como Amazon cobra con una
+# mediana de 6 dias, la factura salia ~11 dias despues de la compra.
+GRACE_DAYS = int(os.getenv('AMZ_GRACE_DAYS', '6'))
 
 # =============================================================================
 # CIERRE DE MES -- LA VENTA SE FACTURA CON FECHA DE SU MES
@@ -404,10 +413,18 @@ MINER_OVERFETCH = int(os.getenv('AMZ_MINER_OVERFETCH', '3'))
 # se saltean"): SO_DRAFT (fallo la confirmacion), SO_CANCELLED (filas de
 # antes de que se facturaran las SO canceladas), B2B_NO_RECEPTOR (Odoo
 # rechazo el alta del cliente) y B2B_FACTURADA_PG (en cuanto se anule la
-# factura a publico general, la orden se vincula al CFDI de Amazon).
+# factura a publico general, la orden se vincula al CFDI de Amazon) y
+# B2B_SIN_CFDI (en cuanto Amazon emita el CFDI, la orden se vincula).
+#
+# Desde el 17-nov-2026 (auditoria de Finanzas, hojas A2 y A4) tambien:
+#   B2B_SPLIT_MISMATCH  Amazon emite un CFDI por envio, a veces antes de liberar
+#                       todos los envios. Era definitivo y la orden se quedaba
+#                       sin vincular aunque despues cuadrara (SO10384682).
+#   NO_SO_IN_ODOO       en cuanto Yuju crea la SO, la orden se factura.
 REFRESCABLES = ('PENDING_B2B_LINK', 'PENDING_WB_INVOICE', 'SKIPPED_GRACE', 'ERROR',
                 'SO_DRAFT', 'SO_CANCELLED', 'B2B_NO_RECEPTOR', 'B2B_FACTURADA_PG',
-                'ENVIO_SIN_CONFIRMAR')
+                'ENVIO_SIN_CONFIRMAR', 'B2B_SIN_CFDI', 'B2B_SPLIT_MISMATCH',
+                'NO_SO_IN_ODOO')
 
 # Las que el miner regresa a pendiente al refrescarlas (todas menos ERROR, que
 # se reintenta por retry_count_loader y lo revisa una persona).
@@ -993,6 +1010,7 @@ def run_miner(db_conn):
 
     if not rows:
         return {'b2b': 0, 'b2c': 0, 'ya_existian': 0, 'gracia': 0,
+                'business_sin_cfdi': 0,
                 'multi_cfdi': [], 'split_fallido': [], 'refrescadas': 0}
 
     # posted_date viene en hora de CDMX (QUERY_LOTE resta las 6 h).
@@ -1004,6 +1022,7 @@ def run_miner(db_conn):
                  f"{corte_gracia:%Y-%m-%d} se factura sin gracia y con fecha "
                  f"{corte_gracia - timedelta(days=1):%Y-%m-%d} (incluye DEFERRED).")
     res = {'b2b': 0, 'b2c': 0, 'ya_existian': 0, 'gracia': 0,
+           'business_sin_cfdi': 0,
            'multi_cfdi': [], 'split_fallido': [], 'refrescadas': 0}
     w = db_conn.cursor()
     # Cursor aparte, con diccionario, para las consultas de desglose de las
@@ -1055,8 +1074,17 @@ def run_miner(db_conn):
             continue
         es_nueva = ya is None
 
-        tipo = 'B2B' if es_b2b else 'B2C_PUBLICO_GENERAL'
-        status = 'PENDING_B2B_LINK' if es_b2b else 'PENDING_WB_INVOICE'
+        # Orden Business sin CFDI de Amazon: la factura solo Amazon. No se
+        # emite a publico general; se espera el CFDI (Jero, 8-nov-2026).
+        es_business = es_b2b or int(row.get('is_business_order') or 0) == 1
+        tipo = 'B2B' if es_business else 'B2C_PUBLICO_GENERAL'
+        if es_b2b:
+            status = 'PENDING_B2B_LINK'
+        elif es_business:
+            status = 'B2B_SIN_CFDI'
+            res['business_sin_cfdi'] += 1
+        else:
+            status = 'PENDING_WB_INVOICE'
 
         # Referencia de importe. En B2B manda el CFDI que YA emitio Amazon, no
         # nuestra suma de transacciones: el comprobante fiscal existe y su
@@ -1064,6 +1092,7 @@ def run_miner(db_conn):
         # referencia es la suma de las transacciones liberadas.
         n_cfdi = int(row['amz_cfdi_count'] or 0)
         desglose = None
+        motivo_split = None
         if es_b2b:
             importe_ref = a_float(row['amz_cfdi_total'])
             # Cruce independiente sobre la BASE, contra una fuente distinta:
@@ -1093,6 +1122,7 @@ def run_miner(db_conn):
                     w_dict, row['mkp_order_id'])
                 if not desglose:
                     status = 'B2B_SPLIT_MISMATCH'
+                    motivo_split = motivo
                     res['split_fallido'].append(
                         f"{row['mkp_order_id']} ({row['odoo_so_name']}): {motivo}")
                 else:
@@ -1105,15 +1135,16 @@ def run_miner(db_conn):
             importe_ref = a_float(row['cfdi_total'])
 
         # Periodo de gracia: solo aplica a B2C. Si Amazon ya emitio el CFDI no
-        # hay nada que esperar.
-        if not es_b2b and row['posted_date']:
+        # hay nada que esperar. Se cuenta desde la compra; si amazon_orders no
+        # trae PurchaseDate, desde el cobro.
+        if not es_business and row['posted_date']:
             posted = row['posted_date']
             if isinstance(posted, str):
                 posted = datetime.strptime(posted[:19], '%Y-%m-%d %H:%M:%S')
             venta = row.get('purchase_date') or posted
             if isinstance(venta, str):
                 venta = datetime.strptime(venta[:19], '%Y-%m-%d %H:%M:%S')
-            if (hoy - posted).days < GRACE_DAYS \
+            if (hoy - venta).days < GRACE_DAYS \
                     and not (corte_gracia and venta < corte_gracia):
                 status = 'SKIPPED_GRACE'
                 res['gracia'] += 1
@@ -1140,13 +1171,22 @@ def run_miner(db_conn):
               row['amz_cfdi_uuid'], importe_ref,
               construir_raw_json(row, tipo, desglose), status))
         db_conn.commit()
+        if motivo_split:
+            # El motivo quedaba solo en el log de la corrida.
+            w.execute(f"""
+                UPDATE {TBL_BILLING} SET error_log = %s
+                WHERE marketplace = %s AND mkp_order_id = %s
+                  AND status = 'B2B_SPLIT_MISMATCH'
+            """, (f"{motivo_split} Se reevalua en cada corrida.", MARKETPLACE,
+                  row['mkp_order_id']))
+            db_conn.commit()
 
         if not es_nueva:
             # Refrescada, no sembrada: no consume cupo de siembra. El loader
             # la tomara igual, porque busca por status y no por id.
             res['refrescadas'] += 1
             continue
-        if status in ('SKIPPED_GRACE', 'B2B_SPLIT_MISMATCH'):
+        if status in ('SKIPPED_GRACE', 'B2B_SPLIT_MISMATCH', 'B2B_SIN_CFDI'):
             continue
         if es_b2b:
             res['b2b'] += 1
@@ -1156,8 +1196,9 @@ def run_miner(db_conn):
     w.close()
     w_dict.close()
     log.info(f"[MINER] Nuevas -> B2B: {res['b2b']} | B2C: {res['b2c']} | "
-             f"en gracia: {res['gracia']} | refrescadas: {res['refrescadas']} | "
-             f"ya cerradas: {res['ya_existian']}")
+             f"en gracia: {res['gracia']} | Business sin CFDI de Amazon (no se "
+             f"facturan): {res['business_sin_cfdi']} | refrescadas: "
+             f"{res['refrescadas']} | ya cerradas: {res['ya_existian']}")
 
     if res['multi_cfdi']:
         log.info(f"[MINER] {len(res['multi_cfdi'])} orden(es) con varios CFDI "
@@ -1175,8 +1216,95 @@ def run_miner(db_conn):
             f":warning: *{len(res['split_fallido'])} orden(es) de Amazon con "
             f"varios CFDI que no cuadran con sus envios*. No se facturaron: "
             f"repartir mal una orden entre dos comprobantes es un error "
-            f"fiscal. Requieren revision manual.")
+            f"fiscal. Se reevaluan en cada corrida (suele ser un envio que "
+            f"Amazon aun no libera); si persisten varios dias, revisar a mano.")
+
+    if not CON_ALCANCE:
+        res['sin_so'] = sembrar_sin_so(db_conn)
     return res
+
+
+# =============================================================================
+# ORDENES COBRADAS SIN SO EN ODOO (hoja A2 de la auditoria del 8-nov-2026)
+# =============================================================================
+# QUERY_LOTE exige la SO (c.so IS NOT NULL), asi que una orden que Amazon cobro
+# y que Yuju nunca bajo a Odoo no aparecia en ningun lado: ni fila de control
+# ni alerta. Al 8-nov eran 32 (del 3 al 8-oct). Ahora se siembran como
+# NO_SO_IN_ODOO y se avisa por Slack. La SO la crea Yuju, nunca este script.
+# NO_SO_IN_ODOO es refrescable: cuando la SO aparece en el puente, el miner la
+# pasa a pendiente y se factura sola.
+# =============================================================================
+QUERY_SIN_SO = """
+SELECT a.order_id,
+       MIN(DATE_SUB(a.posted_date, INTERVAL 6 HOUR)) AS posted_date,
+       (SELECT MAX(CASE WHEN o.OrderTotalCurrency = 'MXN' AND o.OrderTotalAmount > 0
+                        THEN CAST(o.OrderTotalAmount AS DECIMAL(14,2)) END)
+          FROM somos_reyes.amazon_orders o
+         WHERE o.AmazonOrderId = a.order_id)        AS order_total,
+       (SELECT MAX(s.name) FROM somos_reyes.odoo_new_sale_order_live s
+         WHERE s.channel_order_reference = a.order_id) AS so_en_replica
+FROM somos_reyes.amz_transactions a
+WHERE a.description = 'Order Payment'
+  AND a.transaction_status <> 'DEFERRED'
+  AND a.order_id IS NOT NULL
+  AND DATE(DATE_SUB(a.posted_date, INTERVAL 6 HOUR)) >= %s
+  {FILTRO_FIN}
+  AND NOT EXISTS (SELECT 1 FROM somos_reyes.odoo_master_txns_c c
+                  WHERE c.marketplace_order_id = a.order_id
+                    AND c.order_id IS NOT NULL)
+GROUP BY a.order_id
+"""
+
+
+def sembrar_sin_so(db_conn):
+    """Siembra NO_SO_IN_ODOO para las ordenes cobradas sin SO y avisa de las
+    nuevas. Devuelve cuantas hay en total en la ventana."""
+    params = [AMZ_START_DATE]
+    if AMZ_END_DATE:
+        sql = QUERY_SIN_SO.replace(
+            '{FILTRO_FIN}', 'AND DATE(DATE_SUB(a.posted_date, INTERVAL 6 HOUR)) < %s')
+        params.append(AMZ_END_DATE)
+    else:
+        sql = QUERY_SIN_SO.replace('{FILTRO_FIN}', '')
+    cur = db_conn.cursor(dictionary=True)
+    cur.execute(sql, tuple(params))
+    filas = cur.fetchall()
+
+    nuevas = []
+    for f in filas:
+        nota = "Amazon cobro la orden y no hay SO en Odoo: la crea Yuju."
+        if f['so_en_replica']:
+            nota += (f" La replica odoo_new_sale_order_live si tiene "
+                     f"{f['so_en_replica']}: revisar el puente odoo_master_txns_c.")
+        raw = json.dumps({
+            'log_conciliacion': {'amazon_order_id': f['order_id'], 'odoo_so': None,
+                                 'tipo': None},
+            'amazon': {'posted_date': str(f['posted_date']),
+                       'order_total_cliente': a_float(f['order_total']) or None},
+            'generado_por': '01_amz_billing.py (sembrar_sin_so)',
+            'generado_en': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }, ensure_ascii=False, default=str)
+        # INSERT IGNORE: si la orden ya tiene fila (en cualquier estado) no se toca.
+        cur.execute(f"""
+            INSERT IGNORE INTO {TBL_BILLING}
+                (marketplace, mkp_order_id, odoo_so_name, cfdi_uuid, total_amount,
+                 xml_data, raw_json, status, retry_count, retry_count_loader, error_log)
+            VALUES (%s, %s, NULL, NULL, %s, NULL, %s, 'NO_SO_IN_ODOO', 0, 0, %s)
+        """, (MARKETPLACE, f['order_id'], a_float(f['order_total']), raw, nota))
+        if cur.rowcount:
+            nuevas.append(f"{f['order_id']} ({f['posted_date']:%Y-%m-%d}, "
+                          f"${a_float(f['order_total']):,.2f})")
+    db_conn.commit()
+    cur.close()
+
+    log.info(f"[MINER] Ordenes cobradas sin SO en Odoo: {len(filas)} en la ventana "
+             f"({len(nuevas)} nuevas). Quedan en NO_SO_IN_ODOO hasta que Yuju cree la SO.")
+    if nuevas:
+        notify_slack(
+            f":warning: *{len(nuevas)} orden(es) de Amazon cobradas sin SO en Odoo* "
+            f"(`{KESTRA_EXECUTION_ID}`). Yuju debe crear la SO; en cuanto exista, "
+            f"la orden se factura sola.\n" + '\n'.join(nuevas[:15]))
+    return len(filas)
 
 
 # =============================================================================
@@ -1226,6 +1354,159 @@ def reabrir_b2b_pg(db_conn):
         log.info(f"[LOADER] {cursor.rowcount} B2B con factura a publico general se "
                  f"reevaluan (se vinculan si ya se cancelo la factura).")
     cursor.close()
+
+
+# =============================================================================
+# ORDENES CUYA FACTURA SE CANCELO SIN REEMPLAZO
+# =============================================================================
+# ODOO_INVOICED y ALREADY_ODOO_INVOICED son finales: si despues alguien cancela
+# la factura, nadie vuelve a ver la orden. Casos de la auditoria del 8-nov:
+#   * SO10364915 y SO10364778: cancelada en el saneamiento del 1-3 nov y sin
+#     factura de reemplazo (hoja A1).
+#   * Business facturada a publico general o por el portal (hojas A4 y A6):
+#     Finanzas cancela nuestra factura y el flujo debe vincular el CFDI de
+#     Amazon "en cualquier mes" (flujo v3, paso 3).
+# Cada corrida busca en Odoo las facturas canceladas en los ultimos
+# AMZ_REABRIR_DIAS dias. Si la SO ya no tiene ninguna factura viva, la fila
+# vuelve a pendiente: B2B con datos del CFDI -> PENDING_B2B_LINK; lo demas ->
+# PENDING_WB_INVOICE, y detectar_b2b_tardio() la manda a PENDING_B2B_LINK o a
+# B2B_SIN_CFDI si es Business. La B2C se reemite con relacion de sustitucion
+# (04) con la cancelada: flujo v3, paso 1.
+# =============================================================================
+REABRIR_DIAS = int(os.getenv('AMZ_REABRIR_DIAS', '30'))
+SUSTITUCION = os.getenv('AMZ_SUSTITUCION', '1').strip() == '1'
+ESTADOS_FINALES_REABRIBLES = ('ODOO_INVOICED', 'ALREADY_ODOO_INVOICED')
+
+
+def reabrir_facturas_canceladas(odoo, db_conn):
+    """Devuelve la lista '<SO>: <factura cancelada> -> <estado nuevo>'."""
+    desde = (datetime.utcnow() - timedelta(days=REABRIR_DIAS)).strftime('%Y-%m-%d %H:%M:%S')
+    canceladas = odoo.execute_kw(
+        'account.move', 'search_read',
+        [[('move_type', '=', 'out_invoice'), ('state', '=', 'cancel'),
+          ('write_date', '>=', desde), ('invoice_origin', '!=', False)]],
+        {'fields': ['name', 'invoice_origin', 'l10n_mx_edi_cfdi_uuid'],
+         'order': 'write_date asc, id asc'})
+    por_so = {}
+    for f in canceladas:
+        origen = (f.get('invoice_origin') or '').strip()
+        if origen and ',' not in origen:      # una global no se reabre
+            por_so[origen] = f                # se queda la ultima cancelada
+    if not por_so:
+        return []
+
+    cur = db_conn.cursor(dictionary=True)
+    sos, filas = list(por_so), []
+    for i in range(0, len(sos), 500):
+        lote = sos[i:i + 500]
+        cur.execute(f"""
+            SELECT id, mkp_order_id, odoo_so_name, status, raw_json
+            FROM {TBL_BILLING}
+            WHERE marketplace = %s
+              AND status IN ({', '.join(['%s'] * len(ESTADOS_FINALES_REABRIBLES))})
+              AND odoo_so_name IN ({', '.join(['%s'] * len(lote))})
+        """, (MARKETPLACE, *ESTADOS_FINALES_REABRIBLES, *lote))
+        filas += cur.fetchall()
+    if not filas:
+        cur.close()
+        return []
+
+    # Filtro barato antes del detalle: las SO que ya tienen otra factura 1 a 1
+    # viva (el caso de casi todo el saneamiento del 1-3 nov) no se revisan.
+    con_viva = set()
+    candidatas = [f['odoo_so_name'] for f in filas]
+    for i in range(0, len(candidatas), 500):
+        for m in odoo.execute_kw(
+                'account.move', 'search_read',
+                [[('move_type', '=', 'out_invoice'), ('state', '!=', 'cancel'),
+                  ('invoice_origin', 'in', candidatas[i:i + 500])]],
+                {'fields': ['invoice_origin']}):
+            con_viva.add(m['invoice_origin'])
+
+    reabiertas = []
+    for fila in filas:
+        so_name = fila['odoo_so_name']
+        if so_name in con_viva:
+            continue
+        # Detalle con la misma regla del loader: ref AUTOINV, factura global
+        # ligada a la SO y NC que netean.
+        so = buscar_so(odoo, so_name)
+        if not so:
+            continue
+        netas, _ = netear_con_nc(odoo, so, facturas_existentes(odoo, so_name, so))
+        if netas:
+            continue
+        try:
+            raw = json.loads(fila['raw_json'] or '{}') or {}
+        except (ValueError, TypeError):
+            raw = {}
+        es_b2b = ((raw.get('log_conciliacion') or {}).get('tipo') == 'B2B'
+                  and raw.get('cfdi_amazon_business'))
+        nuevo = 'PENDING_B2B_LINK' if es_b2b else 'PENDING_WB_INVOICE'
+        cancelada = por_so[so_name]
+        uuid_previo = cancelada.get('l10n_mx_edi_cfdi_uuid') or None
+        cur.execute(f"""
+            UPDATE {TBL_BILLING}
+            SET status = %s, retry_count_loader = 0, processed_at = NOW(),
+                raw_json = JSON_SET(COALESCE(raw_json, '{{}}'), '$.sustituye_uuid', %s),
+                error_log = %s
+            WHERE id = %s AND status = %s
+        """, (nuevo, None if es_b2b else uuid_previo,
+              f"REABIERTA {datetime.now():%Y-%m-%d}: {cancelada['name']} se cancelo y "
+              f"la SO no tiene factura viva.", fila['id'], fila['status']))
+        if cur.rowcount:
+            reabiertas.append(f"{so_name}: {cancelada['name']} -> {nuevo}")
+    db_conn.commit()
+    cur.close()
+    if reabiertas:
+        log.warning(f"[LOADER] {len(reabiertas)} orden(es) con la factura cancelada y "
+                    f"sin reemplazo vuelven a pendiente.")
+    return reabiertas
+
+
+# =============================================================================
+# ALERTA: CFDI CANCELADO ANTE EL SAT CON EL ASIENTO PUBLICADO
+# =============================================================================
+# Jero, 17-nov-2026: el cron de Odoo que actualiza el estado SAT no cancela el
+# asiento si el periodo esta bloqueado (except UserError: pass) y no vuelve a
+# revisar el documento. Seis facturas de septiembre quedaron asi (hoja A5).
+# Aviso a nivel compania (todos los equipos, facturas, NC y pagos): solo
+# avisa, no corrige.
+# =============================================================================
+
+def alertar_sat_cancelado_vivo(odoo):
+    """Cuenta los documentos con estado SAT cancelado y asiento publicado y
+    avisa por Slack. Nunca rompe la corrida: si el campo no existe o no se
+    puede buscar, solo lo registra."""
+    try:
+        campos = odoo.execute_kw('account.move', 'fields_get',
+                                 [['l10n_mx_edi_cfdi_sat_state']],
+                                 {'attributes': ['selection']})
+        opciones = (campos.get('l10n_mx_edi_cfdi_sat_state') or {}).get('selection') or []
+        clave = next((k for k, _ in opciones if str(k).startswith('cancel')), None)
+        if not clave:
+            log.warning("[ALERTA SAT] l10n_mx_edi_cfdi_sat_state sin opcion 'cancelado'; "
+                        "no se revisa.")
+            return []
+        dominio = [('l10n_mx_edi_cfdi_sat_state', '=', clave), ('state', '=', 'posted')]
+        total = odoo.execute_kw('account.move', 'search_count', [dominio])
+        if not total:
+            return []
+        docs = odoo.execute_kw('account.move', 'search_read', [dominio],
+                               {'fields': ['name', 'date', 'amount_total'],
+                                'order': 'date asc', 'limit': 15})
+    except Exception as e:
+        log.warning(f"[ALERTA SAT] No se pudo revisar: {e}")
+        return []
+    lista = [f"{d['name']} ({d['date']}, ${a_float(d['amount_total']):,.2f})" for d in docs]
+    log.warning(f"[ALERTA SAT] {total} documento(s) con CFDI cancelado ante el SAT y el "
+                f"asiento publicado: {', '.join(lista)}")
+    notify_slack(
+        f":rotating_light: *{total} documento(s) en Odoo con el CFDI cancelado ante el "
+        f"SAT y el asiento todavia publicado* (todas las areas). El cron no los "
+        f"cancela si el periodo esta bloqueado. Contabilidad: cancelar el asiento.\n"
+        + '\n'.join(lista))
+    return lista
 
 
 def _fetch_por_status(cursor, status, limite, orden):
@@ -1372,6 +1653,34 @@ def detectar_b2b_tardio(db_conn, records):
     """, tuple(ids))
     con_cfdi = dict(cursor.fetchall())
 
+    # Orden Business sin CFDI de Amazon: tampoco se emite a publico general
+    # (Jero, 8-nov-2026). Cubre filas que el miner ya no relee (fuera de su
+    # ventana) o que quedaron PENDING_WB_INVOICE antes de esta regla.
+    sin_cfdi = [r['mkp_order_id'] for r in candidatos
+                if r['mkp_order_id'] not in con_cfdi]
+    business = set()
+    if sin_cfdi:
+        cursor.execute(f"""
+            SELECT AmazonOrderId FROM somos_reyes.amazon_orders
+            WHERE AmazonOrderId IN ({', '.join(['%s'] * len(sin_cfdi))})
+            GROUP BY AmazonOrderId
+            HAVING MAX(IFNULL(IsBusinessOrder, 0)) = 1
+        """, tuple(sin_cfdi))
+        business = {f[0] for f in cursor.fetchall()}
+    if business:
+        for r in candidatos:
+            if r['mkp_order_id'] not in business:
+                continue
+            cursor.execute(f"""
+                UPDATE {TBL_BILLING}
+                SET status = 'B2B_SIN_CFDI', error_log = %s, processed_at = NOW()
+                WHERE id = %s AND status = 'PENDING_WB_INVOICE'
+            """, ('Orden Amazon Business sin CFDI de Amazon: la factura solo '
+                  'Amazon. No se emite a publico general.', r['id']))
+        db_conn.commit()
+        log.warning(f"[LOADER] {len(business)} orden(es) Business sin CFDI de "
+                    f"Amazon estaban como B2C. Pasan a B2B_SIN_CFDI; no se facturan.")
+
     if con_cfdi:
         for r in candidatos:
             uuid = con_cfdi.get(r['mkp_order_id'])
@@ -1390,7 +1699,7 @@ def detectar_b2b_tardio(db_conn, records):
                     f"tienen CFDI vivo de Amazon. Reclasificadas a "
                     f"PENDING_B2B_LINK; no se facturan en esta corrida.")
     cursor.close()
-    return set(con_cfdi.keys())
+    return set(con_cfdi.keys()) | business
 
 
 def buscar_so(odoo, so_name):
@@ -2975,6 +3284,16 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
             stats['mes_anterior_fuera_cierre'].append(f"{so_name} (venta {so['date_order']})")
             log.warning(f"{so_name}: venta de un mes anterior facturada fuera del "
                         f"cierre de mes: sale con fecha de hoy.")
+        # Reemision de una factura cancelada (reabrir_facturas_canceladas):
+        # flujo v3, paso 1, "la nueva lleva relacion de sustitucion con la
+        # cancelada".
+        try:
+            sustituye = (json.loads(record.get('raw_json') or '{}') or {}).get('sustituye_uuid')
+        except (ValueError, TypeError):
+            sustituye = None
+        if sustituye and SUSTITUCION:
+            invoice_vals['l10n_mx_edi_cfdi_origin'] = f"04|{sustituye}"
+            log.info(f"{so_name}: reemision con relacion 04 (sustitucion) de {sustituye}.")
 
     # Los valores de arriba son los de publico en general y solo aplican a
     # B2C. En B2B se sustituyen por los del comprobante real: receptor, uso de
@@ -3251,6 +3570,11 @@ def nuevos_stats(reclasificadas_b2b=0):
 def run_loader(db_conn):
     reset_stuck_processing(db_conn)
     reabrir_b2b_pg(db_conn)
+    # Odoo se abre antes de leer la cola: la reapertura de facturas canceladas
+    # tiene que consultarlo y sus filas entran en esta misma corrida.
+    odoo = OdooModelProxy(timeout=300)
+    alertar_sat_cancelado_vivo(odoo)
+    reabiertas = reabrir_facturas_canceladas(odoo, db_conn)
     records = fetch_pendientes(db_conn)
     if not records:
         log.info("[LOADER] Sin registros pendientes.")
@@ -3266,12 +3590,12 @@ def run_loader(db_conn):
         stats_reclasificadas = len(reclasificadas)
     else:
         stats_reclasificadas = 0
-    odoo = OdooModelProxy(timeout=300)
     account_cxc = get_account_id(odoo, ACCOUNT_AMAZON_CXC)
     catalogos = cargar_catalogos(odoo)
     partner_cache = {}
 
     stats = nuevos_stats(stats_reclasificadas)
+    stats['reabiertas'] = reabiertas
     hechas = stats['cuota']
 
     for idx, record in enumerate(records):
@@ -3364,6 +3688,9 @@ def reportar(stats):
     log.info(f"  Envio sin confirmar (excepcion) : {len(stats['envio_sin_confirmar'])}")
     log.info(f"  B2C con timbrado fallido        : {len(stats['timbrado_fallido'])}")
     log.info(f"  Venta mes anterior fuera cierre : {len(stats['mes_anterior_fuera_cierre'])}")
+    log.info(f"  Reabiertas (factura cancelada)  : {len(stats.get('reabiertas') or [])}")
+    for r in (stats.get('reabiertas') or [])[:20]:
+        log.info(f"    {r}")
     log.info(f"  205.06.003 de las facturas      : "
              f"{', '.join(f'{k} {v}' for k, v in sorted(stats['conciliacion_205'].items())) or '-'}")
     log.info(f"  Sin SO en Odoo                  : {len(stats['sin_so'])}")

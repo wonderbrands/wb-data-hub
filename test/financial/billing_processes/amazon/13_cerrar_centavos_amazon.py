@@ -69,8 +69,10 @@ LIMITE = int(sys.argv[sys.argv.index('--limite') + 1]) if '--limite' in sys.argv
 DESDE = os.getenv('AMZ_SANEO_DESDE', '2026-10-30 00:00:00')
 FECHA_FORZADA = os.getenv('AMZ_FECHA_REDONDEO', '').strip() or None
 JOURNAL_AJUSTES = os.getenv('AMZ_JOURNAL_AJUSTES', '').strip()
-# Un centavo por partida: lo que aprobo Finanzas (igual que 03).
-TOLERANCIA = 0.01
+# Hasta $0.15 por partida: lo que aprobo Finanzas el 8-nov-2026 (igual que 03).
+# Cierra tambien las facturas de la hoja A3 (diferencias de 0.02 a 0.06 contra
+# OrderTotal) que ya tienen el cobro aplicado.
+TOLERANCIA = 0.15
 POR_ASIENTO = 200
 PREFIJO_REF = 'AUTOREDONDEO:'
 CSV_SALIDA = os.path.join(_dir, f"centavos_amazon_{datetime.now():%Y%m%d_%H%M}.csv")
