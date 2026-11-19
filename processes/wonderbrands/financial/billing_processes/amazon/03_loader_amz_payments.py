@@ -24,7 +24,7 @@ El descuadre contra el deposito real son las comisiones de Amazon.
 Dos asientos adicionales (revision del lote 4, oct-2026):
 
   Centavo de redondeo -- dentro del mismo pago, write-off nativo del wizard:
-    105.01.006 contra AMZ_ACCOUNT_REDONDEO por +-0.01. La factura queda
+    105.01.006 contra AMZ_ACCOUNT_REDONDEO hasta +-0.15. La factura queda
     "Pagado" y el pago es exactamente lo liberado.
 
   Promocion pagada por Amazon -- asiento aparte, ref AUTOPROMO:<stl>:<orden>,
@@ -71,7 +71,7 @@ import sys
 import json
 import time as tm
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import xmlrpc.client
 
 logging.basicConfig(level=logging.INFO,
@@ -119,9 +119,12 @@ TOLERANCE = 0.02        # centavos de tolerancia al comparar importes
 # "Pagado" y 102.02.008 recibe exactamente lo que deposita Amazon, que es lo
 # que hace falta para D9 (deposito = suma del diario por settlement).
 #
-# Un centavo POR FACTURA: una orden repartida en 2 facturas puede traer 0.02.
+# Hasta $0.15 POR FACTURA (Jero, 8-nov-2026, hoja A3): 14 facturas de octubre
+# diferian de OrderTotal entre 0.02 y 0.06 (INV/2026/164526: 3,398.02 contra
+# 3,398) porque el precio de la SO no coincide con el que cobro Amazon. Antes
+# era un centavo y esas facturas quedaban abiertas por la diferencia.
 # Sin AMZ_ACCOUNT_REDONDEO la corrida aborta (ver preparar_contexto).
-TOLERANCIA_REDONDEO = 0.01
+TOLERANCIA_REDONDEO = 0.15
 
 # =============================================================================
 # EXCEDENTE: PROMOCIONES PAGADAS POR AMAZON (D3)
@@ -242,7 +245,10 @@ def fetch_pendientes(db_conn):
     cursor.execute(f"""
         SELECT p.id, p.mkp_order_id, p.payment_id,
                p.amount, p.date_released, p.status,
-               b.odoo_so_name, b.raw_json, b.status AS billing_status
+               b.odoo_so_name, b.raw_json, b.status AS billing_status,
+               (SELECT MAX(IFNULL(o.IsBusinessOrder, 0))
+                  FROM somos_reyes.amazon_orders o
+                 WHERE o.AmazonOrderId = p.mkp_order_id) AS is_business
         FROM {TBL_PAYMENTS} p
         LEFT JOIN {TBL_BILLING} b
                ON b.marketplace = p.marketplace
@@ -280,6 +286,82 @@ def claim(db_conn, record_id):
     ganado = cursor.rowcount > 0
     cursor.close()
     return ganado
+
+
+# =============================================================================
+# REAPLICACION DE COBROS QUE CANCELA FINANZAS
+# =============================================================================
+# Acuerdo 2.4 (Jero, 8-nov-2026) y flujo v3, paso 6: "Finanzas cancela el
+# cobro (borrador con nota y cancelar) y el flujo lo reaplica contra la
+# factura vigente". Pasa cuando un cobro quedo sobre una factura que despues
+# se cancelo (B2B a publico general, portal) o sobre una CxC equivocada.
+#
+# La fila de mkp_payments_prod se quedaba en ODOO_PAID y nadie la volvia a
+# tomar. Ahora, al arrancar, se buscan los pagos del diario AMZ cancelados en
+# los ultimos AMZ_REAPLICAR_DIAS dias, se identifica su fila por el memo
+# ("AMZ <settlement> / <orden>", el que pone aplicar_pago) y se regresa a
+# PENDING. Si la orden ya tiene otro pago vivo con el mismo memo (ya se
+# reaplico, o Finanzas solo cancelo uno de varios), no se toca.
+#
+# El asiento AUTOPROMO no se duplica: registrar_promo() lo reconoce por ref.
+# Las reglas de siempre siguen aplicando a la reaplicacion: si la factura
+# vigente no esta en 105.01.006 queda en CXC_INCORRECTA, y si es Business sin
+# CFDI de Amazon vinculado, espera en NO_INVOICE.
+# =============================================================================
+REAPLICAR_DIAS = int(os.getenv('AMZ_REAPLICAR_DIAS', '30'))
+PREFIJO_MEMO = 'AMZ '
+
+
+def reabrir_cobros_cancelados(odoo, db_conn, journal_id):
+    """Regresa a PENDING los cobros cuyo pago cancelo Finanzas en Odoo.
+    Devuelve la lista '<pago> -> <payment_id>' de lo reabierto."""
+    campos = odoo.execute_kw('account.payment', 'fields_get', [],
+                             {'attributes': ['type']})
+    # Odoo 18 guarda el memo en 'memo'; versiones anteriores, en 'ref'.
+    memo = 'memo' if 'memo' in campos else 'ref'
+    desde = (datetime.utcnow() - timedelta(days=REAPLICAR_DIAS)).strftime('%Y-%m-%d %H:%M:%S')
+    cancelados = odoo.execute_kw(
+        'account.payment', 'search_read',
+        [[('journal_id', '=', journal_id), ('state', 'in', ['canceled', 'cancel']),
+          ('write_date', '>=', desde), (memo, '=like', f'{PREFIJO_MEMO}%')]],
+        {'fields': ['name', memo]})
+    if not cancelados:
+        return []
+
+    memos = sorted({p[memo] for p in cancelados if p.get(memo)})
+    vivos = odoo.execute_kw(
+        'account.payment', 'search_read',
+        [[('journal_id', '=', journal_id), ('state', 'not in', ['canceled', 'cancel']),
+          (memo, 'in', memos)]],
+        {'fields': [memo]})
+    con_pago_vivo = {p[memo] for p in vivos}
+
+    reabiertos = []
+    cursor = db_conn.cursor()
+    for p in cancelados:
+        texto = p.get(memo) or ''
+        if texto in con_pago_vivo:
+            continue
+        partes = texto[len(PREFIJO_MEMO):].split(' / ', 1)
+        if len(partes) != 2:
+            continue
+        payment_id = f"{partes[0].strip()}:{partes[1].strip()}"
+        cursor.execute(f"""
+            UPDATE {TBL_PAYMENTS}
+            SET status = 'PENDING', processed_at = NOW(),
+                error_log = %s
+            WHERE marketplace = %s AND payment_id = %s
+              AND status IN ('ODOO_PAID', 'ALREADY_PAID')
+        """, (f"REAPLICAR: {p['name']} cancelado en Odoo; se aplica contra la "
+              f"factura vigente.", MARKETPLACE, payment_id))
+        if cursor.rowcount:
+            reabiertos.append(f"{p['name']} -> {payment_id}")
+    db_conn.commit()
+    cursor.close()
+    if reabiertos:
+        log.info(f"{len(reabiertos)} cobro(s) cancelado(s) por Finanzas regresan a "
+                 f"PENDING para reaplicarse.")
+    return reabiertos
 
 
 def update_payment(db_conn, record_id, status, error_log=None):
@@ -828,14 +910,15 @@ def registrar_promo(odoo, journal_id, cuentas, record, promo, so_name, facturas)
 def repartir_centavos(destino, dif):
     """Cierra todas las facturas destino repartiendo 'dif' de a centavo.
 
-    Devuelve [(factura, monto_pago, redondeo)]. Nunca mas de 0.01 por factura:
-    es lo que aprobo Finanzas.
+    Devuelve [(factura, monto_pago, redondeo)]. Nunca mas de
+    TOLERANCIA_REDONDEO por factura: es lo que aprobo Finanzas. La diferencia
+    se carga a la primera factura y lo que pase del tope, a la siguiente.
     """
-    n = int(round(abs(dif) * 100))
-    signo = 1 if dif > 0 else -1
+    resto = round(dif, 2)
     montos = []
-    for k, inv in enumerate(destino):
-        ajuste = round(signo * 0.01, 2) if k < n else 0.0
+    for inv in destino:
+        ajuste = round(max(-TOLERANCIA_REDONDEO, min(TOLERANCIA_REDONDEO, resto)), 2)
+        resto = round(resto - ajuste, 2)
         saldo = a_float(inv.get('amount_residual'))
         montos.append((inv, round(saldo + ajuste, 2), ajuste))
     return montos
@@ -912,11 +995,26 @@ def procesar(odoo, db_conn, journal_id, record, stats, ctx):
     # Jero, 3-nov: PAMZ/2026/00710). Se espera como NO_INVOICE (se reintenta).
     # PENDING_B2B_LINK igual: la B2B aun no tiene su factura, y la que hubiera
     # en Odoo no es la del CFDI de Amazon.
-    if record.get('billing_status') in ('B2B_FACTURADA_PG', 'PENDING_B2B_LINK'):
+    if record.get('billing_status') in ('B2B_FACTURADA_PG', 'PENDING_B2B_LINK',
+                                        'B2B_SIN_CFDI'):
         update_payment(db_conn, record['id'], 'NO_INVOICE',
                        error_log=(f'{so_name}: {record["billing_status"]}. Se aplica '
                                   f'cuando se vincule el CFDI de Amazon (antes, '
                                   f'cancelar la factura a publico general si existe).'))
+        stats['espera_b2b'].append(so_name)
+        return
+
+    # Orden Amazon Business: la factura solo Amazon (Jero, 8-nov-2026). El
+    # cobro solo va contra la factura del CFDI de Amazon (ODOO_B2B_LINKED). Si
+    # la orden tiene una factura nuestra (publico general o portal), Finanzas
+    # la cancela y el cobro aplicado ahi quedaria colgado. Se espera.
+    if int(record.get('is_business') or 0) == 1 \
+            and record.get('billing_status') != 'ODOO_B2B_LINKED':
+        update_payment(db_conn, record['id'], 'NO_INVOICE',
+                       error_log=(f'{so_name}: orden Amazon Business sin el CFDI de '
+                                  f'Amazon vinculado ({record.get("billing_status")}). '
+                                  f'Se aplica cuando se cancele nuestra factura y se '
+                                  f'vincule el CFDI de Amazon.'))
         stats['espera_b2b'].append(so_name)
         return
 
@@ -1217,6 +1315,11 @@ def procesar(odoo, db_conn, journal_id, record, stats, ctx):
 def run():
     validar_entorno()
     db_conn = get_db_connection()
+    # Odoo se abre antes de leer la cola: primero se reabren los cobros que
+    # Finanzas cancelo, para que entren en esta misma corrida.
+    odoo = OdooModelProxy(timeout=300)
+    journal_id = resolve_journal(odoo)
+    reaplicados = reabrir_cobros_cancelados(odoo, db_conn, journal_id)
     records = fetch_pendientes(db_conn)
 
     if not records:
@@ -1228,8 +1331,6 @@ def run():
     log.info(f"{len(records)} cobro(s) pendientes "
              f"({reintentos} son reintentos de NO_INVOICE).")
 
-    odoo = OdooModelProxy(timeout=300)
-    journal_id = resolve_journal(odoo)
     ctx = preparar_contexto(odoo)
 
     stats = {'aplicados': 0, 'ya_pagadas': 0, 'monto': 0.0,
@@ -1237,7 +1338,8 @@ def run():
              'inciertos': [], 'ajustados': [], 'parciales': [],
              'por_settlement': {}, 'sin_envio': [],
              'promos': [], 'redondeos': [],
-             'cxc_incorrecta': [], 'espera_b2b': []}
+             'cxc_incorrecta': [], 'espera_b2b': [],
+             'reaplicados': reaplicados}
 
     for record in records:
         if not claim(db_conn, record['id']):
@@ -1275,6 +1377,9 @@ def reportar(stats):
     log.info(f"  Reparto sin envio       : {len(stats['sin_envio'])}")
     log.info(f"  CxC incorrecta (aparte) : {len(stats['cxc_incorrecta'])}")
     log.info(f"  B2B esperando su CFDI   : {len(stats['espera_b2b'])}")
+    log.info(f"  Reabiertos (cancelados por Finanzas): {len(stats['reaplicados'])}")
+    for r in stats['reaplicados'][:20]:
+        log.info(f"    {r}")
     log.info(f"  QUEDAN EN COLA          : {stats.get('quedan', 0)}"
              + (f"  <- volver a correr (BATCH_LIMIT={BATCH_LIMIT})"
                 if stats.get('quedan') else ''))
