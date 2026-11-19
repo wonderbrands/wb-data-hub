@@ -23,7 +23,9 @@ if os.path.exists(DOTENV_PATH):
         DOTENV_STATUS = "python-dotenv no está instalado: pip install python-dotenv"
 
 # ml_stores.py vive con los procesos productivos de ML (01-04); se reutiliza desde aquí
-# para no duplicar la configuración por tienda.
+# para no duplicar la configuración por tienda. En processes/ el 05 está junto a
+# ml_stores.py (Python ya busca en la carpeta del script); la ruta de abajo es para la
+# copia de test/, y en processes/ no existe y se ignora. Las dos copias son idénticas.
 sys.path.insert(0, os.path.abspath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     '..', '..', '..', 'processes', 'wonderbrands', 'financial', 'billing_processes', 'mercadolibre')))

@@ -1,13 +1,11 @@
 id: ml_credit_notes_flow
 namespace: wonderbrands.financial.mercadolibre
 description: "Pipeline Notas de Crédito ML (SOMOS-REYES, seller 25523702): Extrae de ML las NC (CFDI E) de órdenes facturadas (05). Arranca al terminar los pagos."
-# APAGADO hasta el pase a producción del flujo de NC: el 05 y el 06 todavía viven en test/
-# y hoy se corren a mano. Al promoverlos a processes/ se quita esta línea.
-disabled: true
-
-# La primera ejecución manual (scan_mode=sweep) es el barrido histórico desde el corte
-# de facturación; las automáticas solo consultan las órdenes que ya tocan según la cola
-# finance.mkp_credit_notes_scan. El 06 (registro en Odoo) se agrega como siguiente paso.
+# Solo el 05 (miner): NO toca Odoo ni emite CFDI; consulta la API de ML y escribe en
+# finance.mkp_credit_notes_prod y en la cola finance.mkp_credit_notes_scan. El barrido
+# histórico ya corrió (11-nov); cada ejecución consulta solo las órdenes que ya tocan.
+# El 06 (registro en Odoo) se sigue corriendo a mano por lotes, con corrida en seco y
+# VoBo de Finanzas; se agrega aquí cuando termine la carga del histórico.
 
 concurrency:
   limit: 1
@@ -58,6 +56,9 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
+          memory:                 # obligatorio (flows/README.md, regla 7); mismo valor que ML
+            memory: "768MB"
+            memorySwap: "1024MB"
         env:
           DB_HOST: "{{ vars.db1_host }}"
           DB_USER: "{{ vars.db_user }}"
@@ -65,14 +66,14 @@ tasks:
           DB_NAME: "{{ vars.db_name }}"
           ML_SELLER_ID: "{{ vars.ml_seller_id }}"
           # Explícitos: en Kestra nunca aplican los LOCAL_* del script
+          NC_TABLE: "finance.mkp_credit_notes_prod"
+          NC_SCAN_TABLE: "finance.mkp_credit_notes_scan"
           PREFLIGHT_ONLY: "false"
           SCAN_MODE: "{{ inputs.scan_mode }}"
           ONLY_ORDER_IDS: "{{ inputs.only_order_ids ?? '' }}"
           MAX_CALLS_PER_RUN: "{{ inputs.max_calls_per_run }}"
         commands:
-          # Fase de pruebas: el script vive en test/. Al pasar a producción se mueve a
-          # processes/wonderbrands/financial/billing_processes/mercadolibre/ junto a 01-04.
-          - python test/financial/credit_note_refund_processes/05_miner_ml_credit_notes.py
+          - python processes/wonderbrands/financial/billing_processes/mercadolibre/05_miner_ml_credit_notes.py
 
 triggers:
   # Se ejecuta automáticamente en cuanto terminan los Pagos ML (así el 06 verá el
