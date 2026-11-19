@@ -17,7 +17,7 @@ Contexto mínimo para operar el flujo y para construir el siguiente (notas de cr
 
 Las copias de trabajo y los scripts de un solo uso (saneamiento 12, centavos 13, reportes) viven en `test/financial/billing_processes/amazon/`. Todo cambio va en las dos copias.
 
-## Flujos de Kestra (`flows/wonderbrands/financial/amazon/`)
+## Flujos de Kestra (`flows/wonderbrands/financial/billing_processes/amazon/`)
 
 | Flujo | Corre | Horario (CDMX) |
 |---|---|---|

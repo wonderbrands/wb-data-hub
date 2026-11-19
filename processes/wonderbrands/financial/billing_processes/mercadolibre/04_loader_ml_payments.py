@@ -15,7 +15,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Parámetros por variables de entorno ────────────────────────
-# Definidas en flows/wonderbrands/financial/mercadolibre/ml_payments_flow.yml
+# Definidas en flows/wonderbrands/financial/billing_processes/mercadolibre/ml_payments_flow.yml
 # y ml_oficiales_payments_flow.yml
 ODOO_URL     = os.getenv("ODOO_URL")
 ODOO_DB       = os.getenv("ODOO_DB")

@@ -41,7 +41,7 @@ class ErrorsAndSummaryFilter(logging.Filter):
 
 
 # ── Parámetros por variables de entorno ────────────────────────
-# Credenciales Odoo (definidas en flows/wonderbrands/financial/mercadolibre/ml_billing_process_flow.yml
+# Credenciales Odoo (definidas en flows/wonderbrands/financial/billing_processes/mercadolibre/ml_billing_process_flow.yml
 # y ml_oficiales_billing_process_flow.yml)
 ODOO_URL      = os.getenv("ODOO_URL")
 ODOO_DB       = os.getenv("ODOO_DB")

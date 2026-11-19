@@ -40,17 +40,21 @@ wb-data-hub/
 │   │   ├── amazon/          _amz_common, 00_precheck, 01, 02, 03, 11, README_AMAZON.md
 │   │   ├── mercadolibre/    01–04, ml_stores.py (dos tiendas)
 │   │   └── odoo/            facturacion_automatica_1a1.py, dispatchs_alerts.py
+│   ├── financial/credit_note_refund_processes/
+│   │   └── mercadolibre/    05 (miner de NC; usa ml_stores.py de billing_processes/mercadolibre)
 │   └── shipping_labels/     guías (otro proyecto; útil por sus patrones)
 ├── test/financial/                        ← ENTORNO DE TRABAJO
 │   ├── billing_processes/[marketplace]/            scripts + .html de Finanzas
-│   └── credit_note_refund_processes/[marketplace]/ .html de Finanzas (devoluciones)
+│   └── credit_note_refund_processes/[marketplace]/ scripts de NC + .html de Finanzas (devoluciones)
 ├── flows/wonderbrands/                    ← YAML de Kestra. main = producción (ver §5)
-│   ├── financial/{amazon,mercadolibre,odoo}/
+│   ├── financial/billing_processes/{amazon,mercadolibre,odoo}/
+│   ├── financial/credit_note_refund_processes/mercadolibre/
 │   ├── shipping_labels/, system/, reports/
 │   └── README.md            reglas de sincronización
 └── docker/, requirements.txt, .venv/
 ```
 
+- **Misma ruta en las tres carpetas:** el script `processes/wonderbrands/financial/<proceso>/<marketplace>/`, su copia en `test/financial/<proceso>/<marketplace>/` y su flujo en `flows/wonderbrands/financial/<proceso>/<marketplace>/`, con namespace `wonderbrands.financial.<proceso>.<marketplace>` (`<proceso>` = `billing_processes` o `credit_note_refund_processes`).
 - `/processes/` es la **copia de producción**. Un script pasa ahí solo cuando está probado, y desde ese momento **todo cambio va en las dos copias** (`test/` y `processes/`, idénticas).
 - Dentro de `/test/` cada marketplace tiene los `.html` de **Finanzas** con flujos, reglas y asientos. Son el requerimiento y **tienen huecos**: detectarlos es parte del trabajo.
 
