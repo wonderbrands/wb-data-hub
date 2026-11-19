@@ -82,13 +82,64 @@ intento. Créalo sólo si migras esos scripts al mismo criterio.
 | `RATES_CONNECTION_ERROR` | Falla de red con la API interna. Se reintenta en la siguiente corrida. |
 | `LABEL_GENERATION_FAILED` | Ninguna guía se generó. |
 | `PARTIAL_LABELS` | Se generaron menos guías que cajas. **Hay guías emitidas sin reportar.** |
-| `ODOO_ORDER_MISSING` | No existe la `sale.order` en Odoo. |
+| `ODOO_ORDER_MISSING` | Odoo respondió y aún no existe la `sale.order` (Yuju no la ha creado). Se reintenta. |
+| `ODOO_LOOKUP_ERROR` | Odoo falló al buscar la `sale.order` (timeout, 502). No se sabe si existe. Se reintenta. |
+| `ODOO_ORDER_DUPLICATED` | Hay más de una `sale.order` vigente (no cancelada) para la orden. Se reintenta; hay que cancelar las sobrantes. |
+| `ODOO_ORDER_CANCELLED` | La orden sólo tiene `sale.order` canceladas. No se genera guía. Se reintenta. |
 | `TIKTOK_PACKAGE_MISSING` | TikTok no tiene paquete y no se pudo crear. |
 | `TIKTOK_PROVIDER_UNRESOLVED` | TikTok no reconoce la paquetería cotizada. **No se genera guía**, para no emitirla sin poder reportarla. |
 | `ADDRESS_INCOMPLETE` / `ORDER_WITHOUT_SKUS` / `ORDER_VALUE_ZERO` | Datos insuficientes. |
 | `POST_LABEL_UPDATE_FAILED` | Guía generada, pero falló la actualización en Odoo o TikTok. |
 | `UNEXPECTED_ERROR` | Excepción no contemplada. |
 | `DRY_RUN` | Simulación: la orden pasó todas las validaciones pero no se generó guía. |
+
+### Cupón de TikTok en el check de pricing
+
+TikTok paga los descuentos de plataforma (cupones), pero `sale_price` (lo que
+Yuju pasa a Odoo) ya los trae restados, así que una orden con cupón podía caer en
+`LIMIT_PRICING_OVERCOME` aunque el precio real no estuviera bajo el priceado.
+
+`check_order_pricing` valida primero con `sale_price`, como siempre. **Solo si
+una línea queda bajo el mínimo** y `original_price − seller_discount −
+platform_discount = sale_price` (tolerancia de $0.01), reintenta con
+`sale_price + platform_discount`. Si falta un campo o no cuadra, no se suma
+nada. No cambia el mínimo, MATI ni el Sheet, ni la regla del 21 %, ni el valor
+declarado a la paquetería.
+
+- **Aprobada por cupón**: la guía sigue su camino normal y la nota ("precio +
+  cupón = total ≥ mínimo") queda en el chatter de la SO, en `error_log` de
+  `tools.shipping_labels` (status `LABELS_GENERATED`) y en el resumen de Kestra.
+- **Sigue bajo el mínimo**: status `LIMIT_PRICING_OVERCOME` y la columna
+  `Reason` de `Guias_automaticas_manuales` agrega por SKU el precio, el mínimo y
+  si hubo cupón: `sin cupón TikTok`, `cupón TikTok $X (con cupón $Y) tampoco
+  alcanza`, `cupón no validado` o `cupón no informado`. CS ya no necesita bajar
+  el reporte de ventas de TikTok.
+
+### Mínimos fijos del Buen Fin (temporal, hasta el 17-nov-2026 23:59:59 CDMX)
+
+Mientras dure el Buen Fin, 17 SKU `-DPT` se validan contra un mínimo fijo
+(`BUEN_FIN_MINIMOS` en `tiktok_bulky_fulfillment.py`) **en lugar de** MATI y del
+Sheet de pricing, en todas las tiendas de TikTok. El mapa también cubre
+`CLASSICFOAM2-S-DPT` y `DLUXEH2-DPT`, que antes caían en `NOT_SKU_PRICED`.
+
+- La regla es la de siempre: precio ≥ mínimo, y si queda bajo el mínimo todavía
+  aplica el reintento con el cupón de TikTok (arriba).
+- Cualquier SKU fuera del mapa conserva el check normal (MATI y luego Sheet).
+- La vigencia se evalúa al momento de **procesar** la orden (`BUEN_FIN_HASTA`,
+  hora CDMX). Pasada esa hora el mapa se ignora solo, sin redeploy; después se
+  puede borrar el bloque y `check_line_pricing`.
+- El log por línea muestra `fuente BUEN_FIN_HARDCODE` cuando se usó el mínimo fijo.
+- No cambian la regla del 21 %, el valor declarado ni el reproceso con VoBo.
+
+### Reproceso con VoBo (pestaña `TikTok` del sheet de reprocesamiento)
+
+TikTok **no** escribe `BLOQUEADA_VALIDACION`: cualquier motivo de la tabla
+anterior deja la fila en `REINTENTO_FALLIDO` y se reintenta en la siguiente
+corrida. `ODOO_LOOKUP_ERROR` y `ODOO_ORDER_MISSING` no gastan intento (la falla
+no es de la orden); el resto sí y pasa a `AGOTADA` al llegar a
+`MAX_REPROCESS_ATTEMPTS`. Las filas que ya estaban en `BLOQUEADA_VALIDACION`
+(de cuando `ODOO_ORDER_MISSING` juntaba todos los casos de Odoo) vuelven a ser
+elegibles sin tocarlas a mano.
 
 ### Columnas de las pestañas
 

@@ -327,8 +327,8 @@ def convert_zpl_to_pdf_bytes(zpl_string: str) -> Optional[bytes]:
     """
     Convierte un string ZPL a bytes de PDF usando la API de Labelary.
     """
-    # 8dpmm = 203dpi, 4x6 in
-    url = "http://api.labelary.com/v1/printers/8dpmm/labels/4x6/"
+    # 8dpmm = 203dpi, 4x8 in: el papel es 4x8; la guía DHL (MyDHL) mide 4x8 y en 4x6 se cortaba
+    url = "http://api.labelary.com/v1/printers/8dpmm/labels/4x8/"
     headers = {"Accept": "application/pdf"}
 
     try:

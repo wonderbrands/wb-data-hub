@@ -118,6 +118,7 @@ _SHOP_DEFINITIONS = [
     {'slug': 'NEON', 'seller_name': 'Neon', 'default_enabled': 'true'},          # próximamente
     {'slug': 'KH', 'seller_name': 'KingsHouse', 'default_enabled': 'true'},
     {'slug': 'NEOND', 'seller_name': 'ColorDreams Home (NEON Deportes)', 'default_enabled': 'true'},
+    {'slug': 'VOLTIO', 'seller_name': 'Voltio', 'default_enabled': 'true'},
 ]
 
 
@@ -327,7 +328,7 @@ API_AUTH = (os.getenv('AUTH_USER'), os.getenv('AUTH_PASS'))
 API_TIMEOUT_RATES = 30
 API_TIMEOUT_LABEL = 45
 
-LABELARY_URL = 'http://api.labelary.com/v1/printers/8dpmm/labels/4x6/'
+LABELARY_URL = 'http://api.labelary.com/v1/printers/8dpmm/labels/4x8/'
 
 
 # ==========================================================================

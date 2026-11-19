@@ -30,6 +30,7 @@ import time
 import unicodedata
 import xmlrpc.client
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
 
 import gspread
@@ -55,9 +56,24 @@ from pricing_check import check_pricing
 from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
 
 # Órdenes con VoBo humano (sheet de reproceso). Se carga en el main.
-VOBO = VoboSheet('TikTok')
-# Motivos de register_manual que son una validación dura de Odoo: no se reintenta.
-VOBO_BLOCKED_REASONS = ('ODOO_ORDER_MISSING',)
+# TikTok ya no escribe BLOQUEADA_VALIDACION: toda falla queda REINTENTO_FALLIDO.
+# `retry_states` vuelve elegibles las filas que quedaron BLOQUEADA_VALIDACION
+# cuando ODOO_ORDER_MISSING juntaba errores de Odoo y SO aún no creadas.
+VOBO = VoboSheet('TikTok', retry_states=(EST_BLOCKED,))
+# Motivos que no son culpa de la orden: se reintentan SIN gastar intento del VoBo.
+VOBO_FREE_RETRY_REASONS = ('ODOO_LOOKUP_ERROR', 'ODOO_ORDER_MISSING')
+
+# Detalle (columna Reason) de cada motivo que devuelve search_sale_order.
+ODOO_PROBLEM_DETAILS = {
+    'ODOO_LOOKUP_ERROR': "Odoo no respondió al buscar la sale.order de la orden TikTok "
+                         "{order_id}. Se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_MISSING': "Aún no existe una sale.order para la orden TikTok {order_id}. "
+                          "Se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_DUPLICATED': "Hay varias sale.order vigentes para la orden TikTok {order_id} "
+                             "({so}). Cancela las sobrantes; se reintenta en la siguiente corrida.",
+    'ODOO_ORDER_CANCELLED': "La sale.order {so} de la orden TikTok {order_id} está cancelada. "
+                            "No se genera guía; se reintenta en la siguiente corrida.",
+}
 
 
 # PyPDF2 sólo se usa para consolidar guías multicaja en un único PDF. Si no
@@ -1087,28 +1103,55 @@ def odoo_execute(models, uid, model: str, method: str, args: list, kwargs=None):
 
 
 def search_sale_order(models, uid, tiktok_order_id: str):
-    """Busca la SO por los campos de referencia de canal. Devuelve (id, name)."""
+    """
+    Busca la SO por los campos de referencia de canal.
+
+    Devuelve (id, name, motivo). `motivo` es None si hay UNA SO vigente; si no:
+      ODOO_LOOKUP_ERROR      Odoo falló y ningún campo encontró la SO (no se sabe si existe).
+      ODOO_ORDER_DUPLICATED  Más de una SO vigente (no cancelada) para la orden.
+      ODOO_ORDER_CANCELLED   Sólo hay SO canceladas.
+      ODOO_ORDER_MISSING     Odoo respondió y no hay SO (Yuju aún no la crea).
+    Las SO canceladas se ignoran si existe otra vigente (Yuju recreó la orden).
+    """
+    lookup_failed = False
     for field in cfg.ODOO_ORDER_REFERENCE_FIELDS:
         try:
             records = odoo_execute(
                 models, uid, 'sale.order', 'search_read',
                 [[(field, '=', tiktok_order_id)]],
-                {'fields': ['id', 'name', 'state'], 'limit': 2},
+                {'fields': ['id', 'name', 'state'], 'limit': 10},
             )
         except Exception as e:
             logger.error(f"Odoo: error buscando SO por {field}={tiktok_order_id}: {e}")
+            lookup_failed = True
             continue
-        if len(records) > 1:
-            logger.error(f"Odoo: varias SO para {field}={tiktok_order_id}. Se requiere revisión.")
-            return None, None
-        if records:
-            logger.info(
-                f"Odoo: SO {records[0]['name']} (id={records[0]['id']}) "
-                f"encontrada por {field}."
+        if not records:
+            continue
+
+        active = [r for r in records if r.get('state') != 'cancel']
+        if len(active) > 1:
+            active_names = ', '.join(str(r['name']) for r in active)
+            logger.error(
+                f"Odoo: varias SO vigentes para {field}={tiktok_order_id} "
+                f"({active_names}). Se requiere revisión."
             )
-            return int(records[0]['id']), str(records[0]['name'])
+            return None, active_names, 'ODOO_ORDER_DUPLICATED'
+        if not active:
+            logger.warning(
+                f"Odoo: la orden TikTok {tiktok_order_id} sólo tiene SO cancelada(s) "
+                f"({', '.join(str(r['name']) for r in records)})."
+            )
+            return int(records[0]['id']), str(records[0]['name']), 'ODOO_ORDER_CANCELLED'
+
+        so = active[0]
+        logger.info(f"Odoo: SO {so['name']} (id={so['id']}) encontrada por {field}.")
+        return int(so['id']), str(so['name']), None
+
+    if lookup_failed:
+        logger.error(f"Odoo: no se pudo confirmar la SO de la orden TikTok {tiktok_order_id}.")
+        return None, None, 'ODOO_LOOKUP_ERROR'
     logger.warning(f"Odoo: no se encontró SO para la orden TikTok {tiktok_order_id}.")
-    return None, None
+    return None, None, 'ODOO_ORDER_MISSING'
 
 
 def update_sale_order_tracking(models, uid, so_id: int, labels: list) -> bool:
@@ -1221,8 +1264,8 @@ def attach_labels_to_odoo(models, uid, so_id: int, so_name: str, labels: list):
 
 
 def post_odoo_chatter(models, uid, so_id: int, so_name: str, order_id: str,
-                      labels: list, shipping_cost: float):
-    """Deja constancia en el chatter de la SO."""
+                      labels: list, shipping_cost: float, coupon_note=None):
+    """Deja constancia en el chatter de la SO (con la nota del cupón de TikTok, si hubo)."""
     trackings = ", ".join(l['tracking_number'] for l in labels)
     body = (
         f"{now_cdmx_str()}. Se generó automáticamente la(s) guía(s) Bulky de TikTok "
@@ -1230,6 +1273,8 @@ def post_odoo_chatter(models, uid, so_id: int, so_name: str, order_id: str,
         f"Guía(s): {trackings} | Carrier: {labels[0]['provider']} | "
         f"Costo de envío: ${shipping_cost:.2f}."
     )
+    if coupon_note:
+        body += f" {coupon_note}."
     try:
         odoo_execute(models, uid, 'sale.order', 'message_post', [[so_id]], {'body': body})
         logger.info(f"Odoo: mensaje publicado en el chatter de {so_name}.")
@@ -1449,7 +1494,7 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
     # POST_LABEL_UPDATE_FAILED llega tras register_success (ya marcada GUIA_GENERADA).
     VOBO.annotate(order_id, odoo_id=ctx.get('so_name'), tienda=ctx.get('seller_name'))
     if motivo != 'DRY_RUN':
-        VOBO.mark(order_id, EST_BLOCKED if motivo in VOBO_BLOCKED_REASONS else EST_FAIL)
+        VOBO.mark(order_id, EST_FAIL, count_attempt=motivo not in VOBO_FREE_RETRY_REASONS)
     logger.warning(f"MANUAL | Orden {order_id} | {motivo}: {detalle}")
     resumen.warning(
         f"MANUAL    | {ctx.get('seller_name', '')} | TikTok {order_id} | "
@@ -1588,8 +1633,10 @@ def register_success(conn, sheet_success, sheet_manual, ctx: dict, labels: list,
             shipping_cost=sku_shipping_cost,
             carrier=main_carrier,
             carrier_service_level=main_service,
-            error_log=None if (tiktok_ok and odoo_ok) else (
+            # Orden aprobada por cupón de TikTok: la nota queda en la tabla de guías.
+            error_log=(ctx.get('coupon_note') or None) if (tiktok_ok and odoo_ok) else (
                 f"Guía generada. TikTok actualizado={tiktok_ok}, Odoo actualizado={odoo_ok}."
+                f"{' ' + ctx['coupon_note'] if ctx.get('coupon_note') else ''}"
             ),
         )
 
@@ -1601,15 +1648,164 @@ _PRICING_SHEET_ROWS = None  # Sheet de fallback: se lee una vez por corrida.
 _PRICING_SHEET_TRIED = False
 
 
-def check_order_pricing(order: dict, conn, sheet_manual: dict) -> list:
+# Tolerancia (centavos) al validar que los descuentos de TikTok cuadran con el precio.
+COUPON_IDENTITY_TOLERANCE = Decimal('0.01')
+
+
+def _to_decimal(value):
+    """Valor de la API -> Decimal. None si falta o no es un número."""
+    if value is None or str(value).strip() == '':
+        return None
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        return None
+
+
+# --- HOTFIX BUEN FIN ---------------------------------------------------------
+# Mínimos fijos (sin cupón) de los SKU -DPT. Mientras dure el Buen Fin SUSTITUYEN
+# al MATI y al Sheet de pricing para estos SKU, en todas las tiendas de TikTok.
+# Pasada BUEN_FIN_HASTA el mapa se ignora solo y todo vuelve al check de siempre;
+# después se puede borrar este bloque y `check_line_pricing`.
+BUEN_FIN_MINIMOS = {
+    'CLASSH2-DPT': Decimal('1699.00'),
+    'CLASSH1-DPT': Decimal('1399.00'),
+    'PLUS2-DPT': Decimal('2299.00'),
+    'CLASSICFOAM2-S-DPT': Decimal('1799.00'),
+    'PLUS4-DPT': Decimal('3399.00'),
+    'PLUS1-DPT': Decimal('1849.00'),
+    'CLASSICFOAM1-DPT': Decimal('1399.00'),
+    'DLUXEH2-DPT': Decimal('2849.00'),
+    'PLUS3-DPT': Decimal('2659.00'),
+    'PROH1-DPT': Decimal('1949.00'),
+    'PLUS4-S-DPT': Decimal('3429.00'),
+    'PLUS3-S-DPT': Decimal('2659.00'),
+    'CP3DREAM80-DPT': Decimal('899.00'),
+    'CLASSICFOAM2-DPT': Decimal('1799.00'),
+    'TOPDREAM2M-DPT': Decimal('899.00'),
+    'MAXH2-DPT': Decimal('1859.00'),
+    'MAXH3-DPT': Decimal('2159.00'),
+}
+# Vigencia en hora CDMX, evaluada al momento de procesar la orden.
+BUEN_FIN_HASTA = datetime(2026, 11, 17, 23, 59, 59, tzinfo=CDMX_TZ)
+BUEN_FIN_SOURCE = 'BUEN_FIN_HARDCODE'
+
+
+def check_line_pricing(sku, price, sale_time, conn, now=None):
+    """
+    Igual que `check_pricing`, salvo que durante el Buen Fin los SKU de
+    BUEN_FIN_MINIMOS se validan contra su mínimo fijo (precio >= mínimo).
+    Cualquier otro SKU, o cualquier momento posterior a BUEN_FIN_HASTA, va
+    directo a `check_pricing` sin cambio alguno.
+    """
+    sku = str(sku or '').strip()
+    now = now or datetime.now(timezone.utc)
+    minimum = BUEN_FIN_MINIMOS.get(sku)
+    if minimum is None or now > BUEN_FIN_HASTA:
+        return check_pricing(
+            sku, price, sale_time, conn,
+            sheet_rows=_PRICING_SHEET_ROWS, channel_id='tiktok',
+        )
+    price_dec = _to_decimal(price)
+    approved = price_dec is not None and price_dec >= minimum
+    return {
+        'approved': approved,
+        'minimum': minimum,
+        'source': BUEN_FIN_SOURCE,
+        'problem': None if approved else 'PRICE_BELOW_MINIMUM',
+    }
+
+
+def get_platform_coupon(line: dict):
+    """
+    Cupón / descuento de plataforma de UNA línea (en TikTok, una pieza).
+
+    TikTok nos paga ese descuento, pero `sale_price` (y por tanto lo que Yuju
+    pasa a Odoo) ya lo trae restado. Devuelve (monto, valido):
+      (None, False)   falta un campo de la línea -> se usa el comportamiento actual.
+      (0, False)      la línea no tiene cupón de plataforma.
+      (monto, True)   original_price - seller_discount - platform_discount
+                      = sale_price: el monto se puede sumar al precio.
+      (monto, False)  hay cupón pero NO cuadra con el precio: no se suma.
+    """
+    original = _to_decimal(line.get('original_price'))
+    seller = _to_decimal(line.get('seller_discount'))
+    platform = _to_decimal(line.get('platform_discount'))
+    sale = _to_decimal(line.get('sale_price'))
+    if None in (original, seller, platform, sale):
+        return None, False
+    if platform <= 0:
+        return Decimal('0'), False
+    cuadra = abs(original - seller - platform - sale) <= COUPON_IDENTITY_TOLERANCE
+    return platform, cuadra
+
+
+def _money(value) -> str:
+    return f"${Decimal(value):,.2f}" if value is not None else "N/D"
+
+
+def _group_texts(texts: list) -> list:
+    """Quita repetidos conservando el orden: 'Nx texto' si se repite (una línea por pieza)."""
+    counts = {}
+    for text in texts:
+        counts[text] = counts.get(text, 0) + 1
+    return [f"{n}x {t}" if n > 1 else t for t, n in counts.items()]
+
+
+def _coupon_text(note: dict) -> str:
+    """Frase sobre el cupón de TikTok de una línea que NO aprobó el pricing."""
+    coupon = note['coupon']
+    if coupon is None:
+        return "cupón TikTok no informado en la orden"
+    if coupon == 0:
+        return "sin cupón TikTok"
+    if not note['coupon_valid']:
+        return (f"cupón TikTok {_money(coupon)} no validado (no cuadra con precio "
+                f"original y descuentos), no se sumó")
+    return (f"cupón TikTok {_money(coupon)} (con cupón {_money(note['sale_price'] + coupon)}) "
+            f"tampoco alcanza")
+
+
+def describe_pricing_failure(notes: list) -> str:
+    """Detalle por SKU de las líneas que quedaron bajo el mínimo (cupón sí/no y cuánto)."""
+    texts = [
+        f"SKU {n['sku']}: precio {_money(n['sale_price'])} < mínimo {_money(n['minimum'])}; "
+        f"{_coupon_text(n)}"
+        for n in notes if n['problem'] == 'PRICE_BELOW_MINIMUM' and n['minimum'] is not None
+    ]
+    return " | ".join(_group_texts(texts))
+
+
+def describe_coupon_rescue(notes: list) -> str:
+    """Nota para orden aprobada SOLO gracias al cupón de TikTok ('' si no aplica)."""
+    texts = [
+        f"SKU {n['sku']}: precio {_money(n['sale_price'])} + cupón TikTok "
+        f"{_money(n['coupon'])} = {_money(n['sale_price'] + n['coupon'])} "
+        f">= mínimo {_money(n['minimum'])}"
+        for n in notes if n['rescued']
+    ]
+    if not texts:
+        return ''
+    return "Pricing aprobado con cupón de TikTok (lo paga TikTok): " + " | ".join(_group_texts(texts))
+
+
+def check_order_pricing(order: dict, conn, sheet_manual: dict):
     """
     Valida el precio de cada línea contra el Priceado (`pricing_check`).
-    Devuelve la lista de (sku, problema); vacía si todas las líneas aprueban.
+
+    Devuelve (problemas, notas):
+      problemas  lista de (sku, problema); vacía si todas las líneas aprueban.
+      notas      una por línea con precio, cupón, mínimo y si el cupón la rescató.
+
+    Primero se valida con el `sale_price` de siempre. SOLO si queda bajo el
+    mínimo (PRICE_BELOW_MINIMUM) y el cupón de plataforma cuadra con el precio
+    original, se reintenta sumándolo: una línea que ya aprobaba no cambia.
     """
     global _PRICING_SHEET_ROWS, _PRICING_SHEET_TRIED
     order_id = order.get('id')
     sale_time = order.get('paid_time') or order.get('create_time')
     problems = []
+    notes = []
     for line in order.get('line_items') or []:
         sku = (line.get('seller_sku') or line.get('sku_id') or '').strip()
         if not sku:
@@ -1631,16 +1827,29 @@ def check_order_pricing(order: dict, conn, sheet_manual: dict) -> list:
                     f"Pricing: conexión al Sheet de pricing FALLIDA: "
                     f"{type(e).__name__}: {e!r}"
                 )
-        result = check_pricing(
-            sku, line.get('sale_price'), sale_time, conn,
-            sheet_rows=_PRICING_SHEET_ROWS, channel_id='tiktok',
-        )
+        result = check_line_pricing(sku, line.get('sale_price'), sale_time, conn)
+        coupon, coupon_valid = get_platform_coupon(line)
+        sale_price = _to_decimal(line.get('sale_price'))
+        rescued = False
+        if (not result['approved'] and result['problem'] == 'PRICE_BELOW_MINIMUM'
+                and coupon_valid):
+            retry = check_line_pricing(sku, sale_price + coupon, sale_time, conn)
+            if retry['approved']:
+                result, rescued = retry, True
+        notes.append({
+            'sku': sku, 'sale_price': sale_price, 'coupon': coupon,
+            'coupon_valid': coupon_valid, 'minimum': result['minimum'],
+            'problem': result['problem'], 'rescued': rescued,
+        })
         detail = (
             f"orden {order_id} | SKU {sku} | precio {line.get('sale_price')} | "
+            f"cupón TikTok {coupon} (válido={coupon_valid}) | "
             f"mínimo {result['minimum']} | fuente {result['source']}"
         )
         if result['approved']:
-            logger.info(f"Pricing OK | {detail}")
+            logger.info(
+                f"Pricing OK{' CON CUPÓN TIKTOK' if rescued else ''} | {detail}"
+            )
         else:
             problem = result['problem']
             logger.warning(
@@ -1648,7 +1857,7 @@ def check_order_pricing(order: dict, conn, sheet_manual: dict) -> list:
                 f"{pricing_check.PROBLEM_DESCRIPTIONS.get(problem, problem)}"
             )
             problems.append((sku, problem))
-    return problems
+    return problems, notes
 
 
 # =============================================================================
@@ -1694,22 +1903,31 @@ def process_order(order, shop, access_token, conn, models, uid,
         return 'manual'
 
     # --- Orden de venta en Odoo -----------------------------------------
-    so_id, so_name = search_sale_order(models, uid, order_id)
+    # Ningún motivo de Odoo bloquea la orden: todos se reintentan en la
+    # siguiente corrida (ver VOBO_FREE_RETRY_REASONS para los intentos del VoBo).
+    so_id, so_name, odoo_problem = search_sale_order(models, uid, order_id)
     ctx['so_name'] = so_name
-    if not so_id:
-        register_manual(conn, sheet_manual, ctx, 'ODOO_ORDER_MISSING',
-                        f"No existe una sale.order asociada a la orden TikTok {order_id}.")
+    if odoo_problem:
+        register_manual(conn, sheet_manual, ctx, odoo_problem,
+                        ODOO_PROBLEM_DETAILS[odoo_problem].format(order_id=order_id, so=so_name))
         return 'manual'
 
     # --- Check de pricing (ANTES de crear paquete, cotizar o generar guía) --
     # Va después de buscar la SO para que el Sheet de manuales lleve el ID Odoo.
     if order_id in VOBO:
         logger.info(f"VoBo: la orden {order_id} tiene VoBo. Se omite el check de pricing.")
-        pricing_problems = []
+        pricing_problems, pricing_notes = [], []
     else:
-        pricing_problems = check_order_pricing(order, conn, sheet_manual)
+        pricing_problems, pricing_notes = check_order_pricing(order, conn, sheet_manual)
+    # Nota de las órdenes aprobadas SOLO por el cupón de TikTok (chatter, BD, resumen).
+    ctx['coupon_note'] = describe_coupon_rescue(pricing_notes) or None
     if pricing_problems:
         pricing_status, pricing_message = pricing_check.resolve_pricing_outcome(pricing_problems)
+        if pricing_status == pricing_check.STATUS_PRICE_MISMATCH:
+            # Cupón sí/no y cuánto, por SKU: CS ya no necesita el reporte de ventas.
+            failure_detail = describe_pricing_failure(pricing_notes)
+            if failure_detail:
+                pricing_message = f"{pricing_message}. {failure_detail}"
         register_manual(conn, sheet_manual, ctx, pricing_status, pricing_message)
         logger.warning(f"Orden {order_id}: pricing no aprobado: {pricing_problems}")
         return 'manual'
@@ -1820,7 +2038,8 @@ def process_order(order, shop, access_token, conn, models, uid,
     # --- Odoo -------------------------------------------------------------
     odoo_ok = update_sale_order_tracking(models, uid, so_id, labels)
     attach_labels_to_odoo(models, uid, so_id, so_name, labels)
-    post_odoo_chatter(models, uid, so_id, so_name, order_id, labels, shipping_cost)
+    post_odoo_chatter(models, uid, so_id, so_name, order_id, labels, shipping_cost,
+                      ctx.get('coupon_note'))
 
     # --- TikTok ------------------------------------------------------------
     # Si la guía terminó siendo de otro carrier que el cotizado, se vuelve a
@@ -1861,6 +2080,7 @@ def process_order(order, shop, access_token, conn, models, uid,
         f"GUIA OK   | {ctx['seller_name']} | TikTok {order_id} | {so_name} | "
         f"{', '.join(l['tracking_number'] for l in labels)} | "
         f"{normalize_provider(generated_carrier)} | ${shipping_cost:.2f} ({cost_ratio:.1%})"
+        f"{' | APROBADA CON CUPON TIKTOK' if ctx.get('coupon_note') else ''}"
     )
     return 'processed'
 

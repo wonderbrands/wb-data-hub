@@ -38,6 +38,9 @@ tasks:
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
+          memory:
+            memory: "512MB"
+            memorySwap: "1024MB"
         # El reintento es seguro: una orden que ya tiene guía queda con
         # label_generated=1 en tools.shipping_labels y se omite en el reintento.
         env:
@@ -68,6 +71,10 @@ tasks:
           TIKTOK_NEON_APP_KEY: "{{ secret('TIKTOK_NEON_APP_KEY') }}"
           TIKTOK_NEON_APP_SECRET: "{{ secret('TIKTOK_NEON_APP_SECRET') }}"
           TIKTOK_NEON_SHOP_CIPHER: "{{ secret('TIKTOK_NEON_SHOP_CIPHER') }}"
+
+          TIKTOK_VOLTIO_APP_KEY: "{{ secret('TIKTOK_VOLTIO_APP_KEY') }}"
+          TIKTOK_VOLTIO_APP_SECRET: "{{ secret('TIKTOK_VOLTIO_APP_SECRET') }}"
+          TIKTOK_VOLTIO_SHOP_CIPHER: "{{ secret('TIKTOK_VOLTIO_SHOP_CIPHER') }}"
 
 
           # NO es BULKY
@@ -116,6 +123,9 @@ tasks:
 
           TIKTOK_NEON_ENABLED: "true"
           TIKTOK_NEON_SELLER_NAME: "Neon"
+
+          TIKTOK_VOLTIO_ENABLED: "true"
+          TIKTOK_VOLTIO_SELLER_NAME: "Voltio"
 
           # --- Tienda FULL: TikTok entrega la guía, no aplica a este flujo ---
           TIKTOK_CDH_ENABLED: "false"
