@@ -42,9 +42,14 @@ inputs:
     type: STRING
     defaults: "2000"
     displayName: "Máximo de cobros que aplica 03 en la corrida"
+  # PAUSA DE COBROS (18-nov-2026, a pedido de Finanzas, correo de Jero del
+  # 17-nov, punto 6): 02 y 03 no corren en las corridas programadas hasta que
+  # se corrija el portal de refacturación (ítem 11 de la auditoría). Un cobro
+  # aplicado a una factura que el portal cancela después queda colgado. Para
+  # reanudar: volver a true por PR. Una corrida manual puede mandar true.
   - id: cobros
     type: BOOL
-    defaults: true
+    defaults: false
     displayName: "Correr 02 y 03 (false = solo facturación)"
   - id: dias_cierre_mes
     type: STRING
