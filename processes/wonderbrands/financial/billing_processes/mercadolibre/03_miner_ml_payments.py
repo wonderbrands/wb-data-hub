@@ -34,6 +34,10 @@ REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT", "10"))
 SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "0.3"))
 # MP devuelve la fecha en UTC-4; horas a sumar para llevarla a UTC 0
 MP_UTC_OFFSET_HOURS = int(os.getenv("MP_UTC_OFFSET_HOURS", "4"))
+# Corte del criterio (b) de abajo (otro pago aprobado sin registrar en una orden que ya tiene
+# cobro): solo pagos creados desde esta fecha. Los anteriores (49 pagos, ~$63k al 18-nov) se
+# aplican en una corrida dirigida con SECOND_PAYMENTS_SINCE=2026-06-01, con el VoBo de Finanzas.
+SECOND_PAYMENTS_SINCE = os.getenv("SECOND_PAYMENTS_SINCE", "2026-11-18")
 
 
 def extract_ml_payments():
@@ -70,7 +74,8 @@ def extract_ml_payments():
     ml_headers = {'Authorization': f'Bearer {ml_token}'}
     mp_headers = {'Authorization': f'Bearer {MP_TOKEN}'}
 
-    # ── 3. Buscar órdenes facturadas sin pago registrado ─────────
+    # ── 3. Buscar órdenes facturadas con cobro por registrar ─────
+    # a) Facturadas sin ningún pago registrado (criterio original).
     cursor.execute("""
         SELECT b.mkp_order_id
         FROM finance.mkp_billing_prod b
@@ -81,8 +86,39 @@ def extract_ml_payments():
           AND b.status IN ('ODOO_INVOICED', 'ALREADY_ODOO_INVOICED')
           AND p.mkp_order_id IS NULL;
     """, (MKP_MARKETPLACE,))
-    orders = cursor.fetchall()
-    log.info(f"[{MKP_MARKETPLACE}] Órdenes pendientes de revisar cobro: {len(orders)}")
+    order_ids = {o['mkp_order_id'] for o in cursor.fetchall()}
+    without_payments = len(order_ids)
+
+    # b) Órdenes con OTRO pago aprobado aún sin registrar. Una orden pagada con dos pagos que se
+    #    liberan en corridas distintas quedaba fuera de (a) en cuanto entraba el primero, y el
+    #    segundo nunca se aplicaba (caso INV/2026/162445). Se parte de ml_order_payments (ETL)
+    #    filtrada por tienda y fecha, y se cruza por lotes contra la facturación (sin EXISTS
+    #    correlacionados: no terminan sobre estas tablas).
+    cursor.execute("""
+        SELECT DISTINCT op.order_id
+        FROM somos_reyes.ml_order_payments op
+        LEFT JOIN finance.mkp_payments_prod p
+          ON p.marketplace = %s AND p.payment_id = op.payment_id
+        WHERE op.seller_id = %s
+          AND op.date_created >= %s
+          AND op.date_created >= %s
+          AND op.pay_status = 'approved'
+          AND p.id IS NULL
+    """, (MKP_MARKETPLACE, ML_SELLER_ID, STORE['billing_start'], SECOND_PAYMENTS_SINCE))
+    with_missing = [str(o['order_id']) for o in cursor.fetchall()]
+    for i in range(0, len(with_missing), 1000):
+        chunk = with_missing[i:i + 1000]
+        cursor.execute(f"""
+            SELECT mkp_order_id FROM finance.mkp_billing_prod
+            WHERE marketplace = %s AND status IN ('ODOO_INVOICED', 'ALREADY_ODOO_INVOICED')
+              AND mkp_order_id IN ({','.join(['%s'] * len(chunk))})
+        """, (MKP_MARKETPLACE, *chunk))
+        order_ids.update(o['mkp_order_id'] for o in cursor.fetchall())
+
+    orders = [{'mkp_order_id': o} for o in sorted(order_ids)]
+    log.info(f"[{MKP_MARKETPLACE}] Órdenes pendientes de revisar cobro: {len(orders)} "
+             f"(sin ningún cobro: {without_payments}; con otro pago por registrar desde "
+             f"{SECOND_PAYMENTS_SINCE}: {len(orders) - without_payments})")
 
     if not orders:
         cursor.close()
