@@ -1,5 +1,5 @@
 id: amz_cierre_mercFacNoEnv_flow
-namespace: wonderbrands.financial.amazon
+namespace: wonderbrands.financial.billing_processes.amazon
 description: |
   Amazon: cierre mensual de la 205.06.003 (Mercancías facturadas - no enviadas).
   Lleva a 501.01.001 las diferencias de costeo y de kits del mes, con conciliación

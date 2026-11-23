@@ -1,5 +1,5 @@
 id: amz_billing_payments_flow
-namespace: wonderbrands.financial.amazon
+namespace: wonderbrands.financial.billing_processes.amazon
 description: |
   Amazon: facturación (01) y cobros (02 → 03). Ver
   processes/wonderbrands/financial/billing_processes/amazon/README_AMAZON.md

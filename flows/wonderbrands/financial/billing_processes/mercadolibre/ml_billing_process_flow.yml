@@ -1,6 +1,6 @@
-id: ml_oficiales_payments_flow
-namespace: wonderbrands.financial.mercadolibre
-description: "Pipeline Pagos ML OFICIALES (SOMOS-REYES OFICIALES, seller 160190870): Extrae cobros liberados de MP (03) y los concilia en Odoo (04). Arranca al terminar la facturación de Oficiales."
+id: ml_billing_process_flow
+namespace: wonderbrands.financial.billing_processes.mercadolibre
+description: "Pipeline Facturación ML (SOMOS-REYES, seller 25523702): Extrae XMLs de ML (01) y los inyecta en Odoo en lotes (02)"
 
 concurrency:
   limit: 1
@@ -9,9 +9,8 @@ concurrency:
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
   branch: "main"
-  # marketplace (MERCADO_LIBRE_OFICIALES) y diario de cobros ('MPO', cuenta 102.02.009)
-  # se derivan del seller en ml_stores.py
-  ml_seller_id: "160190870"
+  # marketplace, CxC y fecha de corte se derivan del seller en ml_stores.py
+  ml_seller_id: "25523702"
   odoo_url: "https://somosreyes.odoo.com"
   odoo_db: "wonderbrands2026-main-28990431"
   db_user: "kestra_bot"
@@ -19,10 +18,10 @@ variables:
   db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
 
 tasks:
-  - id: working_env_payments_oficiales
+  - id: working_env_billing
     type: io.kestra.plugin.core.flow.WorkingDirectory
     tasks:
-
+      
       - id: clone_repo
         type: io.kestra.plugin.git.Clone
         url: "{{ vars.repo_url }}"
@@ -30,8 +29,8 @@ tasks:
         username: "{{ secret('GIT_USER') }}"
         password: "{{ secret('GIT_TOKEN_WB') }}"
 
-      # ── PASO 03: Extracción y validación de cobros liberados (MP Oficiales) ──
-      - id: run_miner_ml_payments
+      # ── PASO 01: Extracción de XMLs de Mercado Libre a BD ──
+      - id: run_miner_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-python:v1
         taskRunner:
@@ -45,14 +44,12 @@ tasks:
           DB_USER: "{{ vars.db_user }}"
           DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
           DB_NAME: "{{ vars.db_name }}"
-          # El script siempre lee MERCADO_PAGO_TOKEN; aquí se le mapea el secreto de Oficiales
-          MERCADO_PAGO_TOKEN: "{{ secret('MERCADO_PAGO_TOKEN_OFICIALES') }}"
           ML_SELLER_ID: "{{ vars.ml_seller_id }}"
         commands:
-          - python processes/wonderbrands/financial/billing_processes/mercadolibre/03_miner_ml_payments.py
+          - python processes/wonderbrands/financial/billing_processes/mercadolibre/01_miner_ml_billing.py
 
-      # ── PASO 04: Aplicación y conciliación nativa de cobros en Odoo (diario MPO) ──
-      - id: run_loader_ml_payments
+      # ── PASO 02: Inyección de Facturas a Odoo (Lotes controlados) ──
+      - id: run_loader_ml_billing
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: wonderbrands-python:v1
         taskRunner:
@@ -62,7 +59,7 @@ tasks:
             memory: "768MB"
             memorySwap: "1024MB"
         env:
-          ODOO_URL: "{{ vars.odoo_url }}"
+          ODOO_URL: "{{ vars.odoo_url }}" 
           ODOO_DB: "{{ vars.odoo_db }}"
           ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
           ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
@@ -72,24 +69,13 @@ tasks:
           DB_NAME: "{{ vars.db_name }}"
           ML_SELLER_ID: "{{ vars.ml_seller_id }}"
         commands:
-          - python processes/wonderbrands/financial/billing_processes/mercadolibre/04_loader_ml_payments.py
+          - python processes/wonderbrands/financial/billing_processes/mercadolibre/02_loader_ml_billing.py
 
 triggers:
-  # Se ejecuta automáticamente en cuanto termina la Facturación ML Oficiales
-  - id: listen_to_billing_flow
-    type: io.kestra.plugin.core.trigger.Flow
-    states:
-      - SUCCESS
-      - WARNING
-    dependsOn:
-      - namespace: wonderbrands.financial.mercadolibre
-        flowId: ml_oficiales_billing_process_flow
-
-  # DISPARADOR DE RESPALDO: barrido a las 5:30 AM UTC (11:30 PM CDMX), 30 min después
-  # del barrido de ml_payments_flow, por si algún cobro se liberó tarde en Mercado Pago.
-  - id: barrido_nocturno_pagos
+  # Distribución de carga: Se ejecuta cada 6 horas UTC
+  - id: micro_lotes_cada_6_horas 
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 5 * * *"
+    cron: "0 0,6,12,18 * * *"
 
 errors:
   - id: slack_alert
@@ -97,6 +83,6 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *¡Fallo en Pipeline de Pagos ML OFICIALES (160190870) (Scripts 03-04)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
+        "text": "🚨 *¡Fallo en Pipeline de Facturación ML (Scripts 01-02)!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
       }
 disabled: false
