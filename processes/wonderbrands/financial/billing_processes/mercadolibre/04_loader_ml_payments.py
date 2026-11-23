@@ -3,6 +3,7 @@ import mysql.connector
 import os
 import logging
 import sys
+from collections import Counter
 from ml_stores import get_store_config
 
 # ── Logging setup ──────────────────────────────────────────────
@@ -36,47 +37,20 @@ MP_ACCOUNT_CODE          = STORE['mp_account_code']
 # l10n_mx_edi.payment.method: 3 = Transferencia
 EDI_PAYMENT_METHOD_ID    = int(os.getenv("EDI_PAYMENT_METHOD_ID", "3"))
 ODOO_TIMEOUT             = int(os.getenv("ODOO_TIMEOUT", "120"))  # Timeout XML-RPC en segundos
-# Tabla de NC de MeLi (06). Si el pago excede el saldo porque una NC ya bajó la factura (disputa o
-# reembolso parcial), el excedente se reversa contra la cuenta del diario MP, como hace el 06.
-NC_TABLE                 = os.getenv("NC_TABLE", "finance.mkp_credit_notes_prod")
-COBRO_REF_PREFIX         = "MLNC-COBRO-PAGO:"   # ref del reverso: uno por pago (idempotente)
-EXCESS_TOLERANCE         = 0.01
-
-
-def call_no_return(models, uid, model, method, args):
-    """reconcile no devuelve valor y XML-RPC falla al responder ('cannot marshal None'),
-    aunque Odoo sí ejecutó la operación. Se confirma después leyendo."""
-    try:
-        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, model, method, args)
-    except xmlrpc.client.Fault as e:
-        if "cannot marshal None" not in str(e):
-            raise
-
-
-def reverse_payment_excess(models, uid, journal, payment_line, excess, payment_id, date):
-    """Debe CxC / Haber cuenta del diario MP por el excedente del pago, conciliado contra el pago.
-    Mismo asiento que el reverso de cobro del 06. Idempotente por ref."""
-    ref = f"{COBRO_REF_PREFIX}{payment_id}"
-    found = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'search',
-                              [[('ref', '=', ref), ('state', '=', 'posted')]], {'limit': 1})
-    if found:
-        move_id = found[0]
-    else:
-        lines = [
-            {'account_id': payment_line['account_id'][0], 'partner_id': payment_line['partner_id'][0],
-             'debit': excess, 'credit': 0.0, 'name': f"Reverso cobro NC ML (pago {payment_id})"},
-            {'account_id': journal['default_account_id'][0], 'partner_id': payment_line['partner_id'][0],
-             'debit': 0.0, 'credit': excess, 'name': f"Reverso cobro NC ML (pago {payment_id})"},
-        ]
-        move_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'create',
-                                    [{'move_type': 'entry', 'journal_id': journal['id'], 'date': date,
-                                      'ref': ref, 'line_ids': [(0, 0, l) for l in lines]}])
-        call_no_return(models, uid, 'account.move', 'action_post', [[move_id]])
-    debit_line = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search',
-                                   [[('move_id', '=', move_id), ('account_id', '=', payment_line['account_id'][0]),
-                                     ('reconciled', '=', False)]])
-    if debit_line:
-        call_no_return(models, uid, 'account.move.line', 'reconcile', [[payment_line['id']] + debit_line])
+# Diferencias de hasta $0.01 entre el pago y el saldo se saldan contra esta cuenta (Finanzas, 21-nov)
+ACCOUNT_CODE_CENTS       = os.getenv("ACCOUNT_CODE_CENTS", "704.23.001")
+CENTS_TOLERANCE          = 0.0101
+# Los pagos en ERROR (502, timeout, factura que llegó después, ...) se reintentan en cada corrida.
+# Antes de crear se busca si el pago ya existe en Odoo: un 502 no dice si Odoo hizo commit.
+RETRY_ERRORS             = os.getenv("RETRY_ERRORS", "true").strip().lower() == "true"
+# Corrida dirigida: solo estos payment_id (separados por coma). Vacío = todos los pendientes.
+ONLY_PAYMENT_IDS         = [p.strip() for p in os.getenv("ONLY_PAYMENT_IDS", "").split(",") if p.strip()]
+# Corrida en seco: no escribe en Odoo ni en MySQL; deja en el log qué haría con cada pago.
+DRY_RUN                  = os.getenv("DRY_RUN", "false").strip().lower() == "true"
+# Periodo cerrado: los pagos con fecha de liberación en o antes de la fecha de bloqueo de Odoo no se
+# aplican; se quedan como están y entran solos cuando Finanzas abra el periodo (reapertura).
+# RELEASED_SINCE (opcional) acota además a pagos liberados desde esa fecha.
+RELEASED_SINCE           = os.getenv("RELEASED_SINCE", "").strip()
 
 
 class TimeoutTransport(xmlrpc.client.SafeTransport):
@@ -91,59 +65,96 @@ class TimeoutTransport(xmlrpc.client.SafeTransport):
         return conn
 
 
-def apply_payment(models, uid, journal, record, has_nc):
+def find_invoice(models, uid, so_name, cfdi_uuid):
+    """Factura publicada de la SO; si no aparece por invoice_origin, por el UUID del CFDI.
+    Devuelve (factura, None) o (None, status)."""
+    opts = {'fields': ['id', 'name', 'amount_residual'], 'limit': 2}
+    inv = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'search_read',
+                            [[('invoice_origin', '=', so_name), ('move_type', '=', 'out_invoice'),
+                              ('state', '=', 'posted')]], opts)
+    if not inv and cfdi_uuid:
+        inv = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'search_read',
+                                [[('l10n_mx_edi_cfdi_uuid', '=ilike', cfdi_uuid), ('move_type', '=', 'out_invoice'),
+                                  ('state', '=', 'posted')]], opts)
+    if len(inv) == 1:
+        return inv[0], None
+    if len(inv) > 1:
+        return None, 'MULTIPLE_INVOICES'
+    # Factura global (invoice_origin con varias SO): fuera del alcance de este flujo (Finanzas, 21-nov)
+    glob = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'search',
+                             [[('invoice_origin', 'ilike', so_name), ('move_type', '=', 'out_invoice'),
+                               ('state', '=', 'posted')]], {'limit': 1})
+    return None, ('GLOBAL_INVOICE' if glob else 'INVOICE_MISSING')
+
+
+def existing_payment(models, uid, memo_field, journal_id, inv_id, amount, date, payment_id):
+    """¿El pago ya está en Odoo? Por el memo 'MP <payment_id>' (pagos creados desde el 23-nov) o, en los
+    anteriores, por diario + fecha + monto y conciliado contra esta factura."""
+    memo = f"MP {payment_id}"
+    cands = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment', 'search_read',
+                              [[('journal_id', '=', journal_id), ('state', '!=', 'canceled'), '|',
+                                (memo_field, '=', memo),
+                                '&', ('date', '=', date), '&', ('amount', '>=', amount - CENTS_TOLERANCE),
+                                ('amount', '<=', amount + CENTS_TOLERANCE)]],
+                              {'fields': ['id', memo_field, 'reconciled_invoice_ids'], 'limit': 500})
+    for c in cands:
+        if c.get(memo_field) == memo or inv_id in c.get('reconciled_invoice_ids', []):
+            return c['id']
+    return None
+
+
+def apply_payment(models, uid, ctx_cfg, record):
     """Aplica un cobro de MP a la factura de su SO. Devuelve (status, nota).
-    Se aplica el BRUTO del pago. Si excede el saldo porque una NC ya bajó la factura, el
-    excedente se reversa contra la cuenta del diario MP (solo si la NC está registrada)."""
-    so_name = record['odoo_so_name']
-    # A) Buscar la Factura Publicada vinculada a la SO
-    inv_search = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'search_read',
-                                   [[('invoice_origin', '=', so_name), ('move_type', '=', 'out_invoice'), ('state', '=', 'posted')]],
-                                   {'fields': ['id', 'name', 'amount_residual'], 'limit': 1})
-    if not inv_search:
-        raise Exception(f"Factura publicada para {so_name} no encontrada.")
-    inv = inv_search[0]
+    Tope al saldo (Finanzas, 21-nov): nunca se aplica más que el saldo de la factura. Lo que sobra
+    (envío pagado por el comprador, pago posterior a una NC, ...) queda sin aplicar y se reporta.
+    Diferencia de hasta $0.01 entre pago y saldo: se salda contra 704.23.001."""
+    inv, missing = find_invoice(models, uid, record['odoo_so_name'], record.get('cfdi_uuid'))
+    if missing:
+        return missing, f"{record['odoo_so_name']} (UUID {record.get('cfdi_uuid') or '-'})"
     amount = float(record['amount'])
+    date = record['date_released'].strftime("%Y-%m-%d")
 
-    # A2) Factura ya saldada: Odoo no deja registrar el pago. No se toca; queda para revisión.
-    if inv['amount_residual'] <= EXCESS_TOLERANCE:
+    dup = existing_payment(models, uid, ctx_cfg['memo_field'], ctx_cfg['journal_id'], inv['id'], amount, date,
+                           record['payment_id'])
+    if dup:
+        return 'ODOO_PAID', f"Ya estaba en Odoo (account.payment {dup}) en {inv['name']}"
+
+    residual = inv['amount_residual']
+    if residual <= CENTS_TOLERANCE:
         return 'INVOICE_SETTLED', f"Factura {inv['name']} sin saldo al aplicar el pago de ${amount:,.2f}"
-    excess = round(amount - inv['amount_residual'], 2)
 
-    # B) Contexto del Wizard (es vital para que Odoo sepa qué factura estamos pagando)
-    wizard_context = {'active_model': 'account.move', 'active_ids': [inv['id']]}
-    # C) Valores del Wizard (account.payment.register)
-    wizard_vals = {
-        'journal_id': journal['id'],
+    vals = {
+        'journal_id': ctx_cfg['journal_id'],
         'amount': amount,
-        'payment_date': record['date_released'].strftime("%Y-%m-%d"),
+        'payment_date': date,
         'l10n_mx_edi_payment_method_id': EDI_PAYMENT_METHOD_ID,
+        'communication': f"MP {record['payment_id']}",
     }
-    # D) Crear el registro del Wizard en Odoo
-    wizard_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment.register', 'create',
-                                  [wizard_vals], {'context': wizard_context})
-    # E) Ejecutar la acción del Wizard: crea el account.payment y concilia de forma nativa.
-    #    Si el pago excede el saldo, el excedente queda como crédito abierto del pago.
-    action = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment.register', 'action_create_payments',
-                               [[wizard_id]], {'context': wizard_context})
-    if excess <= EXCESS_TOLERANCE:
-        return 'ODOO_PAID', None
+    status, note = 'ODOO_PAID', None
+    diff = round(amount - residual, 2)
+    if abs(diff) <= CENTS_TOLERANCE and diff != 0:
+        # Centavos: se aplica el pago completo y la diferencia se salda contra 704.23.001
+        vals.update({'payment_difference_handling': 'reconcile', 'writeoff_account_id': ctx_cfg['acc_cents'],
+                     'writeoff_label': 'Redondeo cobro ML'})
+        note = f"Centavos {diff:+.2f} a {ACCOUNT_CODE_CENTS} en {inv['name']}"
+    elif diff > CENTS_TOLERANCE:
+        vals['amount'] = round(residual, 2)
+        status = 'ODOO_PAID_CAPPED'
+        note = f"Tope al saldo: aplicado ${residual:,.2f} de ${amount:,.2f} a {inv['name']}; sin aplicar ${diff:,.2f}"
 
-    # E2) Excedente: el asistente devuelve la acción del pago creado (res_id cuando es un solo pago)
-    note = f"Excedente ${excess:,.2f} sobre el saldo de {inv['name']}"
-    payment_id_odoo = action.get('res_id') if isinstance(action, dict) else None
-    open_lines = []
-    if payment_id_odoo:
-        pay_move = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment', 'read',
-                                     [[payment_id_odoo]], {'fields': ['move_id']})[0]['move_id'][0]
-        open_lines = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read',
-                                       [[('move_id', '=', pay_move), ('account_type', '=', 'asset_receivable'),
-                                         ('reconciled', '=', False)]],
-                                       {'fields': ['id', 'account_id', 'partner_id', 'amount_residual'], 'limit': 1})
-    if has_nc and open_lines and abs(-open_lines[0]['amount_residual'] - excess) <= EXCESS_TOLERANCE:
-        reverse_payment_excess(models, uid, journal, open_lines[0], excess, record['payment_id'], wizard_vals['payment_date'])
-        return 'ODOO_PAID_NC', note + " (reversado contra la cuenta del diario MP por la NC)"
-    return 'ODOO_PAID_EXCESS', note + (" (sin NC registrada: queda abierto)" if not has_nc else " (no se ubicó la línea del pago)")
+    if DRY_RUN:
+        return status, f"[SECO] {inv['name']} saldo ${residual:,.2f}: " + (note or f"aplicaría ${amount:,.2f}")
+
+    ctx = {'active_model': 'account.move', 'active_ids': [inv['id']]}
+    wizard_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment.register', 'create',
+                                  [vals], {'context': ctx})
+    try:
+        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment.register', 'action_create_payments',
+                          [[wizard_id]], {'context': ctx})
+    except xmlrpc.client.Fault as e:
+        if "cannot marshal None" not in str(e):   # Odoo sí creó el pago; solo falla al responder
+            raise
+    return status, note
 
 
 def load_ml_payments_to_odoo():
@@ -168,17 +179,27 @@ def load_ml_payments_to_odoo():
         log.error(f"Error conectando a BD: {e}")
         raise SystemExit(1)
 
-    cursor.execute("""
-        SELECT p.*, b.odoo_so_name
+    statuses = ['PENDING', 'ERROR'] if RETRY_ERRORS else ['PENDING']
+    where, params = [f"p.status IN ({','.join(['%s'] * len(statuses))})"], [MKP_MARKETPLACE, *statuses]
+    if ONLY_PAYMENT_IDS:
+        where.append(f"p.payment_id IN ({','.join(['%s'] * len(ONLY_PAYMENT_IDS))})")
+        params += ONLY_PAYMENT_IDS
+    if RELEASED_SINCE:
+        where.append("p.date_released >= %s")
+        params.append(RELEASED_SINCE)
+    cursor.execute(f"""
+        SELECT p.*, b.odoo_so_name, b.cfdi_uuid
         FROM finance.mkp_payments_prod p
         JOIN finance.mkp_billing_prod b
           ON b.marketplace = p.marketplace
          AND b.mkp_order_id = p.mkp_order_id
-        WHERE p.marketplace = %s
-          AND p.status = 'PENDING'
-    """, (MKP_MARKETPLACE,))
+        WHERE p.marketplace = %s AND {' AND '.join(where)}
+        ORDER BY p.date_released
+    """, params)
     pending_payments = cursor.fetchall()
-    log.info(f"[{MKP_MARKETPLACE}] Pagos pendientes de aplicar en Odoo: {len(pending_payments)}")
+    log.info(f"[{MKP_MARKETPLACE}] Pagos por aplicar en Odoo: {len(pending_payments)} "
+             f"(reintento de ERROR: {sum(1 for p in pending_payments if p['status'] == 'ERROR')})"
+             + (" — CORRIDA EN SECO" if DRY_RUN else ""))
 
     if not pending_payments:
         cursor.close()
@@ -202,6 +223,19 @@ def load_ml_payments_to_odoo():
         if journal_search and MP_ACCOUNT_CODE:
             expected_account = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.account', 'search',
                                                  [[('code', '=', MP_ACCOUNT_CODE)]], {'limit': 1})
+        acc_cents = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.account', 'search',
+                                      [[('code', '=', ACCOUNT_CODE_CENTS)]], {'limit': 1})
+        # Odoo 18 guarda la referencia del pago en 'memo' (antes 'ref')
+        pay_fields = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.payment', 'fields_get',
+                                       [], {'attributes': ['type']})
+        memo_field = 'memo' if 'memo' in pay_fields else 'ref'
+        comp_fields = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.company', 'fields_get',
+                                        [], {'attributes': ['type']})
+        lock_fields = [f for f in ('fiscalyear_lock_date', 'tax_lock_date', 'sale_lock_date', 'hard_lock_date')
+                       if f in comp_fields]
+        company = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.company', 'search_read',
+                                    [[]], {'fields': lock_fields, 'limit': 1})[0]
+        lock_date = max([company[f] for f in lock_fields if company.get(f)] or [''])
     except Exception as e:
         log.error(f"Error de conexión inicial con Odoo: {e}")
         cursor.close()
@@ -213,8 +247,11 @@ def load_ml_payments_to_odoo():
         cursor.close()
         db.close()
         raise SystemExit(1)
-    journal_id = journal_search[0]['id']
-    journal = {'id': journal_id, 'default_account_id': journal_search[0]['default_account_id']}
+    if not acc_cents:
+        log.error(f"No existe la cuenta de redondeo {ACCOUNT_CODE_CENTS} en Odoo.")
+        cursor.close()
+        db.close()
+        raise SystemExit(1)
 
     # Candado: el diario debe tener como cuenta por defecto la cuenta de la tienda.
     # Evita aplicar cobros de una tienda en la cuenta de banco de otra.
@@ -229,43 +266,38 @@ def load_ml_payments_to_odoo():
             db.close()
             raise SystemExit(1)
 
-    # ── Contadores (los detalles por pago NO se loguean: solo el resumen final) ──
-    applied     = 0
-    not_applied = 0
-    excess_nc   = 0   # Pago mayor al saldo por una NC ya registrada: excedente reversado a la cuenta MP
-    excess_open = 0   # Pago mayor al saldo sin NC registrada: queda abierto para revisión
-    settled     = 0   # Factura ya saldada (p.ej. por la NC): no se crea el pago
+    ctx_cfg = {'journal_id': journal_search[0]['id'], 'acc_cents': acc_cents[0], 'memo_field': memo_field}
 
+    # ── 3. Aplicar (los detalles por pago van a la tabla; al log solo el resumen) ──
+    log.info(f"Fecha de bloqueo en Odoo: {lock_date or 'ninguna'} (los pagos liberados hasta esa fecha esperan la reapertura)")
+    counts, amounts = Counter(), Counter()
     for record in pending_payments:
+        if lock_date and record['date_released'].strftime("%Y-%m-%d") <= lock_date:
+            counts['PERIODO_CERRADO (sin tocar)'] += 1
+            amounts['PERIODO_CERRADO (sin tocar)'] += float(record['amount'])
+            continue
         try:
-            # ¿La NC de la orden ya está registrada en Odoo? (define qué hacer con un excedente del pago)
-            cursor.execute(f"SELECT COUNT(*) AS n FROM {NC_TABLE} WHERE marketplace = %s AND mkp_order_id = %s "
-                           f"AND status LIKE 'ODOO_CREDITED%%'", (MKP_MARKETPLACE, record['mkp_order_id']))
-            has_nc = cursor.fetchone()['n'] > 0
-            status, note = apply_payment(models, uid, journal, record, has_nc)
-
-            cursor.execute("UPDATE finance.mkp_payments_prod SET status = %s, error_log = %s, processed_at = NOW() WHERE id = %s",
-                           (status, note, record['id']))
-            db.commit()
-            if status == 'INVOICE_SETTLED':
-                settled += 1
-                continue
-            applied += 1
-            excess_nc += status == 'ODOO_PAID_NC'
-            excess_open += status == 'ODOO_PAID_EXCESS'
-
+            status, note = apply_payment(models, uid, ctx_cfg, record)
         except Exception as e:
-            db.rollback()
-            cursor.execute("UPDATE finance.mkp_payments_prod SET status = 'ERROR', error_log = %s WHERE id = %s", (str(e), record['id']))
-            db.commit()
-            not_applied += 1
+            status, note = 'ERROR', str(e)[:2000]
+            if not DRY_RUN:
+                db.rollback()
+        counts[status] += 1
+        amounts[status] += float(record['amount'])
+        if DRY_RUN:
+            log.info(f"[SECO] pago {record['payment_id']} orden {record['mkp_order_id']} "
+                     f"${float(record['amount']):,.2f} -> {status} | {note or ''}")
+            continue
+        cursor.execute("UPDATE finance.mkp_payments_prod SET status = %s, error_log = %s, processed_at = NOW() "
+                       "WHERE id = %s", (status, note, record['id']))
+        db.commit()
 
     # ── Resumen único de la corrida ────────────────────────────
-    log.info(
-        f"[{MKP_MARKETPLACE}] Resumen -> Pagos pendientes: {len(pending_payments)} | "
-        f"Aplicados en Odoo: {applied} (excedente reversado por NC: {excess_nc}; excedente abierto: {excess_open}) | "
-        f"Factura ya saldada (INVOICE_SETTLED): {settled} | No aplicados (ERROR): {not_applied}"
-    )
+    log.info(f"[{MKP_MARKETPLACE}] Resumen{' (EN SECO)' if DRY_RUN else ''} -> pagos: {len(pending_payments)} | " +
+             " | ".join(f"{s}: {n} (${amounts[s]:,.2f})" for s, n in counts.most_common()))
+    log.info("  ODOO_PAID_CAPPED = tope al saldo (lo que sobra no se aplica) | INVOICE_SETTLED = factura ya pagada, "
+             "no se aplica | GLOBAL_INVOICE = factura global, fuera del flujo | INVOICE_MISSING = la SO no tiene "
+             "factura publicada en Odoo (revisar) | MULTIPLE_INVOICES = más de una factura para la SO (revisar)")
     cursor.close()
     db.close()
 
