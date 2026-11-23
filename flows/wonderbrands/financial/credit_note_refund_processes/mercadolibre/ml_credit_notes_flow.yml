@@ -7,7 +7,7 @@ description: "Pipeline Notas de Crédito ML (SOMOS-REYES, seller 25523702): extr
 #   MeLi), reclasifica los retornos (MLNC-RET) y reversa el cobro. Las NC de periodos cerrados quedan
 #   en PERIOD_LOCKED y entran solas con la reapertura. No toca las NC manuales del diario MLREM; si MeLi
 #   acredita una orden que ya tiene NC MLREM, la deja en MLREM_DOUBLE_EGRESS para Finanzas.
-#   Se prende (quitar disabled) después de revisar la corrida en seco en productivo.
+#   Activo desde el 23-nov-2026 (corrida en seco en productivo revisada: 2,049 READY oct–nov).
 
 concurrency:
   limit: 1
@@ -86,7 +86,6 @@ tasks:
       # ── PASO 06: Registro de las NC en Odoo (diario MLNC) ──
       - id: run_loader_ml_credit_notes
         type: io.kestra.plugin.scripts.shell.Commands
-        disabled: true            # se prende tras revisar la corrida en seco en productivo
         containerImage: wonderbrands-python:v1
         timeout: PT3H
         taskRunner:
