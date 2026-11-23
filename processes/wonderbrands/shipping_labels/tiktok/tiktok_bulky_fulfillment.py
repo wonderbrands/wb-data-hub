@@ -54,6 +54,12 @@ from _00_shipping_labels_db import (
 import pricing_check
 from pricing_check import check_pricing
 from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
+from _02_automation_run_log import track_run
+
+AUTOMATION_ID = 'tiktok_bulky_labels'  # id en tools.automation_run_log
+# Detalle de la corrida para tools.automation_run_log (se llenan durante la corrida).
+RUN_FAILED_SHOPS = []        # tiendas sin token válido o con error fatal
+RUN_MANUAL_REASONS = {}      # {motivo: nº de órdenes} de las órdenes que quedaron manuales
 
 # Órdenes con VoBo humano (sheet de reproceso). Se carga en el main.
 # TikTok ya no escribe BLOQUEADA_VALIDACION: toda falla queda REINTENTO_FALLIDO.
@@ -1491,6 +1497,7 @@ def register_manual(conn, sheet_manual, ctx: dict, motivo: str, detalle: str,
     forma de repartirlo y se registra el total.
     """
     order_id = ctx['order_id']
+    RUN_MANUAL_REASONS[motivo] = RUN_MANUAL_REASONS.get(motivo, 0) + 1
     # POST_LABEL_UPDATE_FAILED llega tras register_success (ya marcada GUIA_GENERADA).
     VOBO.annotate(order_id, odoo_id=ctx.get('so_name'), tienda=ctx.get('seller_name'))
     if motivo != 'DRY_RUN':
@@ -2096,6 +2103,7 @@ def process_shop(shop, conn, models, uid, sheet_success, sheet_manual, counters)
     if not access_token:
         logger.error(f"[{seller_name}] Sin access token válido. Tienda omitida.")
         counters['shops_failed'] += 1
+        RUN_FAILED_SHOPS.append(seller_name)
         return
 
     orders = filter_bulky_orders(search_awaiting_orders(shop, access_token), seller_name)
@@ -2163,7 +2171,7 @@ def emit_run_summary(counters: dict):
     print("::" + json.dumps({"outputs": counters}) + "::", flush=True)
 
 
-def process_tiktok_bulky_labels():
+def process_tiktok_bulky_labels(run=None):
     logger.info("=== Iniciando: Guías automáticas TikTok Bulky ===")
     if cfg.DRY_RUN:
         logger.warning("MODO DRY_RUN: no se generarán guías ni se escribirá en TikTok/Odoo/BD.")
@@ -2176,17 +2184,20 @@ def process_tiktok_bulky_labels():
     shops = cfg.get_active_shops()
     if not shops:
         logger.error("No hay tiendas Bulky activas con credenciales. Fin del script.")
+        fill_run_log(run, counters, "No hay tiendas Bulky activas con credenciales.")
         return counters
 
     conn = get_db_connection()
     if not conn:
         logger.critical("Sin conexión a MySQL no se pueden leer los tokens. Fin del script.")
+        fill_run_log(run, counters, "Sin conexión a MySQL.")
         return counters
 
     models, uid = connect_to_odoo()
     if not models:
         logger.critical("Sin conexión a Odoo. Fin del script.")
         conn.close()
+        fill_run_log(run, counters, "Sin conexión a Odoo.")
         return counters
 
     gc = authenticate_google_sheets()
@@ -2206,13 +2217,41 @@ def process_tiktok_bulky_labels():
             except Exception as e:
                 logger.exception(f"Error fatal en la tienda {shop['seller_name']}: {e}")
                 counters['shops_failed'] += 1
+                RUN_FAILED_SHOPS.append(shop['seller_name'])
     finally:
         conn.close()
 
     logger.info(f"=== Fin del script === Resumen: {json.dumps(counters, sort_keys=True)}")
     emit_run_summary(counters)
+    fill_run_log(run, counters)
     return counters
 
 
+def fill_run_log(run, counters: dict, fatal_error: str = None):
+    """
+    Pasa los contadores de la corrida al registro de tools.automation_run_log.
+    Con tiendas fallidas la corrida queda PARTIAL (lo resuelve el módulo
+    compartido); con `fatal_error` (no se pudo ni empezar) queda FAILED.
+    """
+    if run is None:
+        return
+    run['orders_seen'] = counters['found']
+    run['orders_ok'] = counters['processed']
+    run['orders_blocked'] = counters['manual']
+    run['failed_shops'] = list(RUN_FAILED_SHOPS)
+    run['summary'] = {
+        'omitidas': counters['skipped'],
+        'tiendas_con_error': counters['shops_failed'],
+        # Guía generada, pero Odoo o TikTok no quedaron actualizados.
+        'post_label_update_failed': RUN_MANUAL_REASONS.get('POST_LABEL_UPDATE_FAILED', 0),
+        'manuales_por_motivo': dict(RUN_MANUAL_REASONS),
+        'dry_run': bool(cfg.DRY_RUN),
+    }
+    if fatal_error:
+        run['status'], run['error_message'] = 'FAILED', fatal_error
+
+
 if __name__ == '__main__':
-    process_tiktok_bulky_labels()
+    # Registra la corrida en tools.automation_run_log (si falla el registro, el script sigue igual).
+    with track_run(AUTOMATION_ID) as run:
+        process_tiktok_bulky_labels(run)

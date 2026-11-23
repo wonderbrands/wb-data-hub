@@ -3,9 +3,12 @@ import os
 # Registro de tiendas de Mercado Libre habilitadas para el proceso de guías.
 # Kestra solo inyecta ML_SELLER_ID; el resto de parámetros se derivan de aquí
 # para evitar combinaciones inconsistentes (ej. seller de Oficiales con control id 1).
+# `automation_id` = id de la corrida en tools.automation_run_log (uno por flujo de Kestra).
 SELLERS = {
-    '25523702': {'seller_name': 'SOMOS-REYES', 'print_control_id': 1},
-    '160190870': {'seller_name': 'SOMOS-REYES OFICIALES', 'print_control_id': 2},
+    '25523702': {'seller_name': 'SOMOS-REYES', 'print_control_id': 1,
+                 'automation_id': 'ml_shipping_labels'},
+    '160190870': {'seller_name': 'SOMOS-REYES OFICIALES', 'print_control_id': 2,
+                  'automation_id': 'ml_oficiales_shipping_labels'},
 }
 
 # Default = tienda original, para que el flow productivo actual siga funcionando sin cambios.

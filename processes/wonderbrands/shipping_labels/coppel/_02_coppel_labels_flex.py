@@ -32,6 +32,9 @@ from _00_shipping_labels_db import (
 import pricing_check
 from pricing_check import check_pricing
 from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
+from _02_automation_run_log import track_run, add, count
+
+AUTOMATION_ID = 'coppel_flex_labels'  # id en tools.automation_run_log
 
 # ------------------------------------------------------------
 
@@ -450,10 +453,12 @@ def attach_file_to_so_attachment(models, db, uid, password, so_id, file_name, fi
 
         if attachment_id:
             logger.info(f"Odoo: ÉXITO. Se adjuntó '{file_name}' al modelo sale.order.attachment para la SO {so_id}.")
+            return True
         else:
             logger.error(f"Odoo: FALLO. No se pudo crear adjunto para la SO {so_id}.")
     except Exception as e:
         logger.error(f"Odoo: FALLO. Error al adjuntar '{file_name}' a la SO {so_id}: {e}")
+    return False
 
 
 def consolidate_and_attach_labels_odoo(models, db, uid, password, so_id, labels: list, so_name: str):
@@ -463,7 +468,7 @@ def consolidate_and_attach_labels_odoo(models, db, uid, password, so_id, labels:
     """
     if not labels:
         logger.warning("Odoo: No hay etiquetas (labels) para consolidar y adjuntar.")
-        return
+        return False
 
     first_label = labels[0]
     file_data_b64 = None
@@ -529,13 +534,14 @@ def consolidate_and_attach_labels_odoo(models, db, uid, password, so_id, labels:
 
         else:
             logger.error("Odoo: Las guías no son ni PDF ni ZPL. No se puede adjuntar.")
-            return
+            return False
 
         # Adjuntar el archivo único (PDF o ZPL.txt)
         if file_data_b64 and file_name:
-            attach_file_to_so_attachment(models, db, uid, password, so_id, file_name, file_data_b64)
+            return attach_file_to_so_attachment(models, db, uid, password, so_id, file_name, file_data_b64)
     except Exception as e:
         logger.error(f"Odoo: Error fatal durante la consolidación de guías: {e}", exc_info=True)
+    return False
 
 
 def insert_log_message_pick(models, db, uid, password, picking_id, so_name: str):
@@ -689,7 +695,7 @@ def post_shipments_to_mirakl(mirakl_headers: dict, order: dict, labels: list, mi
 
     if not labels or not order.get('order_lines'):
         logger.error("Mirakl ST01: No hay guías o order_lines en la lista. No se puede reportar shipment.")
-        return
+        return False
 
     # Mapeo de la cantidad comprada originalmente por SKU
     lines_remaining_qty = {}
@@ -749,9 +755,13 @@ def post_shipments_to_mirakl(mirakl_headers: dict, order: dict, labels: list, mi
                 logger.info(f"Mirakl ST01: {len(success)} shipments creados exitosamente.")
             if errors:
                 logger.error(f"Mirakl ST01: {len(errors)} errores al crear shipments: {json.dumps(errors)}")
+                return False
 
         except Exception as e:
             logger.error(f"Mirakl ST01: Excepción al llamar a /api/shipments: {e}")
+            return False
+
+    return True
 
 
 def upload_documents_to_mirakl(mirakl_headers_auth: dict, order_id: str, labels: list):
@@ -766,6 +776,7 @@ def upload_documents_to_mirakl(mirakl_headers_auth: dict, order_id: str, labels:
     if 'Content-Type' in headers_multipart:
         del headers_multipart['Content-Type']
 
+    all_ok = True
     for label in labels:
         try:
             tracking_number = label['tracking_number']
@@ -797,6 +808,7 @@ def upload_documents_to_mirakl(mirakl_headers_auth: dict, order_id: str, labels:
 
             else:
                 logger.warning(f"Mirakl OR74: Guía {tracking_number} sin archivo (PDF/ZPL). Omitiendo subida.")
+                all_ok = False
                 continue
 
             # --- Preparar payload multipart ---
@@ -813,12 +825,16 @@ def upload_documents_to_mirakl(mirakl_headers_auth: dict, order_id: str, labels:
             response_data = response.json()
             if response_data.get('errors_count', 0) > 0:
                 logger.error(f"Mirakl OR74: Error al subir {file_name}: {response.text}")
+                all_ok = False
             else:
                 logger.info(f"Mirakl OR74: Archivo {file_name} subido exitosamente.")
 
         except Exception as e:
             logger.error(f"Mirakl OR74: Excepción al subir el documento de la guía {label.get('tracking_number')}: {e}")
+            all_ok = False
             # Continuar con la siguiente guía
+
+    return all_ok
 
 
 # --- FUNCIONES DE GOOGLE SHEETS ---
@@ -1175,7 +1191,7 @@ def check_order_pricing(order: dict, conn, gc) -> list:
 
 # --- BUCLE PRINCIPAL REFACTORIZADO ---
 
-def procesar_ordenes_coppel():
+def procesar_ordenes_coppel(run=None):
     logger.info("=== Iniciando Procesamiento Flex Híbrido (100% API) ===")
 
     conn = get_db_connection()
@@ -1183,7 +1199,10 @@ def procesar_ordenes_coppel():
 
 
     gc = authenticate_google_sheets()
-    if not gc: return
+    if not gc:
+        if run is not None:
+            run['status'], run['error_message'] = 'FAILED', "No se pudo autenticar en Google Sheets."
+        return
     logger.info("Conectado a Google Sheets.")
 
     # --- Conexión al Sheet de Logs (SR) ---
@@ -1198,7 +1217,10 @@ def procesar_ordenes_coppel():
 
     #Conexión Odoo
     models, db, uid, password = connect_to_odoo(ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD)
-    if not models: return
+    if not models:
+        if run is not None:
+            run['status'], run['error_message'] = 'FAILED', "No se pudo conectar a Odoo."
+        return
     logger.info("Conectado a Odoo.")
 
     #Headers Mirakl
@@ -1212,10 +1234,15 @@ def procesar_ordenes_coppel():
     MIRAKL_CARRIER_MAP = load_carrier_map_from_json(CARRIER_JSON)
     if not MIRAKL_CARRIER_MAP:
         logger.critical("No se pudo cargar el mapa de carriers de Mirakl. El script no puede continuar.")
+        if run is not None:
+            run['status'], run['error_message'] = 'FAILED', "No se pudo cargar el mapa de carriers de Mirakl."
         return
 
     #Obtener órdenes directo de Mirakl
     orders_to_process = fetch_pending_orders_from_mirakl(headers_mirakl)
+    add(run, 'orders_seen', len(orders_to_process or []))
+    add(run, 'orders_ok', 0)
+    add(run, 'orders_blocked', 0)
     if not orders_to_process:
         logger.info("No hay órdenes SHIPPING pendientes para procesar.")
         if conn: conn.close()
@@ -1239,6 +1266,12 @@ def procesar_ordenes_coppel():
 
         # Función auxiliar para registrar en Sheets y DB evitando el spam
         def smart_log(sheet_name, data):
+            # Registro de la corrida: una orden por pestaña de resultado.
+            count(run, sheet_name)
+            if sheet_name == 'Guias_generadas':
+                add(run, 'orders_ok')
+            elif sheet_name != 'Fulfillment':
+                add(run, 'orders_blocked')
             register_vobo_result(conn, sh_sr, order, sheet_name, data)
             if db_sheet == sheet_name:
                 logger.info(f"  -> Orden {order_id}: Ya registrada en '{sheet_name}'. Evitando spam en Sheets.")
@@ -1393,6 +1426,9 @@ def procesar_ordenes_coppel():
                 continue
             else:
                 reason = f"Error desconocido. {type(best_rates_map)}"
+                logger.error(f"Orden {order_id}: {reason}")
+                add(run, 'orders_blocked')
+                count(run, 'error_desconocido_cotizacion')
                 continue
 
         # --- PASO C: Validar Costo Total ---
@@ -1568,8 +1604,10 @@ def procesar_ordenes_coppel():
 
         # --- PASO E: Actualizar Mirakl (ST01 y OR74) ---
         logger.info(f"Iniciando actualización de Mirakl para la orden {order_id}...")
-        post_shipments_to_mirakl(headers_mirakl, order, labels, MIRAKL_CARRIER_MAP)
-        upload_documents_to_mirakl(headers_mirakl, order_id, labels)
+        mirakl_ok = post_shipments_to_mirakl(headers_mirakl, order, labels, MIRAKL_CARRIER_MAP)
+        mirakl_ok = upload_documents_to_mirakl(headers_mirakl, order_id, labels) and mirakl_ok
+        if not mirakl_ok:
+            count(run, 'post_guia_falla_mirakl')
 
         # --- PASO F: Actualizar Odoo (SO y Picking) ---
         logger.info(f"Iniciando actualización de Odoo para la orden {order_id}...")
@@ -1579,16 +1617,20 @@ def procesar_ordenes_coppel():
             num_packages = len(labels)
             client_reference = full_name
 
-            update_sale_order(models, db, uid, password, so_id, tracking_numbers_str, carrier_odoo_id,
-                              num_packages, client_reference)
+            odoo_ok = update_sale_order(models, db, uid, password, so_id, tracking_numbers_str, carrier_odoo_id,
+                                        num_packages, client_reference)
 
             if picking_id:
-                consolidate_and_attach_labels_odoo(models, db, uid, password, so_id, labels, so_name)
+                odoo_ok = consolidate_and_attach_labels_odoo(models, db, uid, password, so_id, labels, so_name) and odoo_ok
                 insert_log_message_sale(models, db, uid, password, so_id, so_name)
             else:
                 logger.error(f"Odoo: No se encontró PICKING para SO {so_name}. Las guías no fueron adjuntadas.")
+                odoo_ok = False
         else:
             logger.error(f"Odoo: No se encontró SO para MKT Ref {order_id}. No se pudo actualizar Odoo.")
+            odoo_ok = False
+        if not odoo_ok:
+            count(run, 'post_guia_falla_odoo')
 
         # --- PASO G: Actualizar Sheet (Éxito Log SR) ---
         try:
@@ -1645,8 +1687,17 @@ def procesar_ordenes_coppel():
         time.sleep(4)
 
     if conn: conn.close()
+
+    # Guías generadas que no quedaron reflejadas en Mirakl u Odoo, o errores sin
+    # registro en Sheets/BD -> la corrida terminó, pero PARCIAL.
+    if run is not None and run['status'] is None and any(
+            run['summary'].get(k) for k in ('post_guia_falla_mirakl', 'post_guia_falla_odoo',
+                                            'error_desconocido_cotizacion')):
+        run['status'] = 'PARTIAL'
     logger.info("=== Procesamiento finalizado ===")
 
 
 if __name__ == "__main__":
-    procesar_ordenes_coppel()
+    # Registra la corrida en tools.automation_run_log (si falla el registro, el script sigue igual).
+    with track_run(AUTOMATION_ID) as run:
+        procesar_ordenes_coppel(run)
