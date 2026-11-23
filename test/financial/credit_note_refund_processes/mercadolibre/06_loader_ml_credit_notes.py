@@ -118,9 +118,10 @@ if ODOO_TARGET == "test" and NC_TABLE.endswith("_prod") and RUN_MODE in ("orders
 
 # Configuración contable (flujo v2 de Finanzas)
 CLASS_CONFIG = {   # tipo -> (diario, cuenta de ingreso)
-    'A': (os.getenv("JOURNAL_CODE_DEV", "DEV"), os.getenv("ACCOUNT_CODE_A", "402.01.003")),
-    'B': (os.getenv("JOURNAL_CODE_DEV", "DEV"), os.getenv("ACCOUNT_CODE_B", "402.01.001")),
-    'C': (os.getenv("JOURNAL_CODE_BON", "BON"), os.getenv("ACCOUNT_CODE_C", "402.01.002")),
+    # Un solo diario exclusivo de MeLi para las NC (MLNC, serie MELINC). MLDEV y MLBON se archivaron (20-nov).
+    'A': (os.getenv("JOURNAL_CODE_DEV", "MLNC"), os.getenv("ACCOUNT_CODE_A", "402.01.003")),
+    'B': (os.getenv("JOURNAL_CODE_DEV", "MLNC"), os.getenv("ACCOUNT_CODE_B", "402.01.001")),
+    'C': (os.getenv("JOURNAL_CODE_BON", "MLNC"), os.getenv("ACCOUNT_CODE_C", "402.01.002")),
 }
 CLASS_DESC = {'A': 'Cancelación', 'B': 'Devolución', 'C': 'Bonificación'}
 FP_B_NAME           = os.getenv("FP_B_NAME", "ML NC Devolución (tipo B)")   # 205.06.003 -> 107.06.001
@@ -146,7 +147,10 @@ ML_TEAM_NAME      = os.getenv("ML_TEAM_NAME", "Team_MercadoLibre")
 # partir del folio más alto, así que en DEV/BON (compartidos con las NC propias) la siguiente NC
 # manual saldría como MELINC-xxxxx (probado en staging). Activar junto con JOURNAL_CODE_DEV/BON
 # apuntando a los diarios exclusivos de MeLi.
-NC_NAME_FROM_CFDI = os.getenv("NC_NAME_FROM_CFDI", "false").strip().lower() == "true"
+NC_NAME_FROM_CFDI = os.getenv("NC_NAME_FROM_CFDI", "true").strip().lower() == "true"   # MLNC es exclusivo de MeLi
+# Diario de reembolsos fuera de MeLi (Finanzas, 20-nov): NC manuales de Finanzas. El flujo no las toca;
+# si MeLi acredita después la misma orden, la NC de MeLi no se carga (doble egreso) y queda para Finanzas.
+JOURNAL_CODE_REM  = os.getenv("JOURNAL_CODE_REM", "MLREM")
 RETURNS_SINCE     = os.getenv("RETURNS_SINCE", "2026-06-01")
 
 AMOUNT_TOLERANCE  = float(os.getenv("AMOUNT_TOLERANCE", "1.0"))   # tope por factura y casado de unidades
@@ -249,6 +253,8 @@ def load_config(odoo):
             raise RuntimeError(f"Falta la posición fiscal '{FP_B_NAME}' ({ACCOUNT_CODE_FP_SRC} -> {ACCOUNT_CODE_FP_DST})")
         log.warning(f"Falta la posición fiscal '{FP_B_NAME}': el preflight sigue, pero no se puede registrar ninguna NC tipo B")
     cfg['fp_b'] = fp[0] if fp else False
+    rem = odoo.call('account.journal', 'search', [('code', '=', JOURNAL_CODE_REM)], limit=1)
+    cfg['journal_rem'] = rem[0] if rem else False
     for code in (ACCOUNT_CODE_FP_SRC, ACCOUNT_CODE_FP_DST):   # la reclasificación del retorno concilia en ambas
         if not odoo.one('account.account', acc(code), ['reconcile'])['reconcile']:
             raise RuntimeError(f"La cuenta {code} no permite conciliación")
@@ -293,15 +299,21 @@ def load_context(odoo, db, recs):
     keys = [PREFIX + r['cfdi_uuid'] for r in recs]
     refunds = odoo.read('account.move', [('move_type', '=', 'out_refund'), ('state', '!=', 'cancel'),
                                          '|', ('reversed_entry_id', 'in', inv_ids), ('ref', 'in', keys)],
-                        ['id', 'name', 'state', 'ref', 'reversed_entry_id', 'amount_total'])
+                        ['id', 'name', 'state', 'ref', 'reversed_entry_id', 'amount_total', 'journal_id'])
     nc_uuid_moves = odoo.read('account.move', [('l10n_mx_edi_cfdi_uuid', 'in', [r['cfdi_uuid'] for r in recs])],
                               ['id', 'name', 'ref', 'l10n_mx_edi_cfdi_uuid'])
+    # NC manuales de reembolsos fuera de MeLi (diario MLREM) de estas órdenes: doble egreso si MeLi también acredita
+    mlrem = odoo.read('account.move', [('move_type', '=', 'out_refund'), ('state', '=', 'posted'),
+                                       ('journal_id.code', '=', JOURNAL_CODE_REM),
+                                       ('invoice_origin', 'in', [s['name'] for s in sos])], ['name', 'invoice_origin'])
     returns = odoo.read('stock.picking', [('sale_id', 'in', [s['id'] for s in sos]), ('state', '=', 'done'),
                                           ('location_id.usage', '=', 'customer')], ['sale_id', 'name'])   # WH/DEV
     ctx = {'so_by_ref': {s['channel_order_reference']: s for s in sos},
            'inv_by_uuid': {(i['l10n_mx_edi_cfdi_uuid'] or '').upper(): i for i in invs},
            'by_origin': {}, 'lines': {}, 'receivable_acc': {}, 'refunds': refunds, 'nc_uuid_moves': {},
-           'returns': {}, 'evidence': refund_evidence(db, refs)}
+           'returns': {}, 'evidence': refund_evidence(db, refs), 'mlrem': {}}
+    for m in mlrem:
+        ctx['mlrem'].setdefault(m['invoice_origin'], []).append(m['name'])
     for m in nc_uuid_moves:
         ctx['nc_uuid_moves'].setdefault((m['l10n_mx_edi_cfdi_uuid'] or '').upper(), []).append(m)
     for r in refunds:
@@ -359,6 +371,13 @@ def plan_credit_note(rec, ctx, cfg):
         if (move['ref'] or '') != key:
             return {**base, 'status': 'ALREADY_ODOO_CREDITED', 'error': f"El UUID de la NC ya está en Odoo: {move['name']}"}
     inv_refunds = [r for r in ctx['refunds'] if r['reversed_entry_id'] and r['reversed_entry_id'][0] == inv['id']]
+    # NC de MLREM: por su documento origen (la SO) o por estar ligada a la factura (botón "Nota de crédito")
+    rem_ncs = set(ctx['mlrem'].get(so['name'], []) if so else [])
+    rem_ncs |= {r['name'] for r in inv_refunds if r['state'] == 'posted' and cfg.get('journal_rem')
+                and r['journal_id'] and r['journal_id'][0] == cfg['journal_rem']}
+    if rem_ncs:
+        return {**base, 'status': 'MLREM_DOUBLE_EGRESS', 'error': f"Doble egreso: la orden ya tiene NC de reembolso fuera de "
+                                                                 f"MeLi {sorted(rem_ncs)} y MeLi también la acreditó. No se carga; revisa Finanzas"}
     foreign = [r for r in inv_refunds if r['state'] == 'posted' and not r['ref'].startswith(PREFIX)]
     if foreign:
         return {**base, 'status': 'MANUAL_REVIEW', 'error': f"Doble egreso: la factura ya tiene NC de Odoo {[r['name'] for r in foreign]}; "
@@ -478,7 +497,9 @@ def link_returns_to_nc(odoo, cfg, so_id, so_name):
     dst = cfg['acc_fp_dst']
     nc_lines = odoo.read('account.move.line', [('account_id', '=', dst), ('debit', '>', 0), ('reconciled', '=', False),
                                                ('parent_state', '=', 'posted'), ('move_id.move_type', '=', 'out_refund'),
-                                               ('move_id.ref', '=like', PREFIX + '%'), ('move_id.invoice_origin', '=', so_name)],
+                                               '|', ('move_id.ref', '=like', PREFIX + '%'),
+                                               ('move_id.journal_id.code', '=', JOURNAL_CODE_REM),   # NC tipo B de MLREM
+                                               ('move_id.invoice_origin', '=', so_name)],
                          ['id', 'amount_residual'])
     if not nc_lines:
         return []
@@ -735,7 +756,7 @@ STATUS_LABEL = {   # estado del proceso, en el lenguaje del listado para Finanza
     'WAIT_INVOICE_IN_ODOO': 'Espera factura en Odoo', 'UUID_MISMATCH': 'Refactura (relaciona otra factura)',
     'AMOUNT_EXCEEDS_INVOICE': 'Tope (excede la factura)', 'INVOICE_CANCELLED_IN_ODOO': 'Factura cancelada en Odoo',
     'ALREADY_ODOO_CREDITED': 'UUID ya en Odoo (otra NC)', 'TOTAL_DIFF': 'Diferencia de total', 'ERROR': 'Error al planear',
-    'REGISTERED': 'Ya registrada'}
+    'REGISTERED': 'Ya registrada', 'MLREM_DOUBLE_EGRESS': 'Doble egreso con NC fuera de MeLi (MLREM)'}
 CSV_COLUMNS = ['Orden ML', 'Tipo de orden', 'NC Mercado Libre', 'UUID NC', 'Fecha NC (fiscal)', 'Subtotal', 'IVA', 'Total',
                'UUID factura relacionada', 'Estado proceso', 'Código', 'Detalle', 'Tipo NC', 'Diario', 'Cuenta',
                'SO Odoo', 'Factura Odoo', 'Factura cobrada', 'Saldo factura', 'Cobro', 'Retorno WH/DEV validado',

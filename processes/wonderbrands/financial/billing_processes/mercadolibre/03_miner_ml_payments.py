@@ -38,6 +38,28 @@ MP_UTC_OFFSET_HOURS = int(os.getenv("MP_UTC_OFFSET_HOURS", "4"))
 # cobro): solo pagos creados desde esta fecha. Los anteriores (49 pagos, ~$63k al 18-nov) se
 # aplican en una corrida dirigida con SECOND_PAYMENTS_SINCE=2026-06-01, con el VoBo de Finanzas.
 SECOND_PAYMENTS_SINCE = os.getenv("SECOND_PAYMENTS_SINCE", "2026-11-18")
+# Corrida en seco: consulta las APIs pero no registra nada en mkp_payments_prod.
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
+
+
+def invoiced_pack_sibling(cursor, ml_headers, pack_id, order_id):
+    """Orden facturada (ODOO_INVOICED / ALREADY_ODOO_INVOICED) del mismo paquete de MeLi, o None."""
+    if not pack_id:
+        return None
+    r = requests.get(f"https://api.mercadolibre.com/packs/{pack_id}", headers=ml_headers, timeout=REQUEST_TIMEOUT)
+    if r.status_code not in (200, 206):
+        return None
+    siblings = [str(x['id']) for x in r.json().get('orders', []) if str(x['id']) != str(order_id)]
+    if not siblings:
+        return None
+    cursor.execute(f"""
+        SELECT mkp_order_id FROM finance.mkp_billing_prod
+        WHERE marketplace = %s AND status IN ('ODOO_INVOICED', 'ALREADY_ODOO_INVOICED')
+          AND mkp_order_id IN ({','.join(['%s'] * len(siblings))})
+        ORDER BY mkp_order_id LIMIT 1
+    """, (MKP_MARKETPLACE, *siblings))
+    row = cursor.fetchone()
+    return row['mkp_order_id'] if row else None
 
 
 def extract_ml_payments():
@@ -115,10 +137,25 @@ def extract_ml_payments():
         """, (MKP_MARKETPLACE, *chunk))
         order_ids.update(o['mkp_order_id'] for o in cursor.fetchall())
 
-    orders = [{'mkp_order_id': o} for o in sorted(order_ids)]
+    # c) Carritos (Finanzas, 21-nov): Yuju crea UNA SO por paquete (pack) de MeLi y solo una de sus
+    #    órdenes queda facturada; las demás quedan en ORDER_NEVER_IN_ODOO y su pago nunca se aplicaba.
+    #    Se busca la orden facturada del mismo paquete y el pago se registra a nombre de ella.
+    pack_orders = set()
+    for i in range(0, len(with_missing), 1000):
+        chunk = with_missing[i:i + 1000]
+        cursor.execute(f"""
+            SELECT mkp_order_id FROM finance.mkp_billing_prod
+            WHERE marketplace = %s AND status = 'ORDER_NEVER_IN_ODOO'
+              AND mkp_order_id IN ({','.join(['%s'] * len(chunk))})
+        """, (MKP_MARKETPLACE, *chunk))
+        pack_orders.update(o['mkp_order_id'] for o in cursor.fetchall())
+
+    orders = [{'mkp_order_id': o, 'pack': False} for o in sorted(order_ids)]
+    orders += [{'mkp_order_id': o, 'pack': True} for o in sorted(pack_orders)]
     log.info(f"[{MKP_MARKETPLACE}] Órdenes pendientes de revisar cobro: {len(orders)} "
              f"(sin ningún cobro: {without_payments}; con otro pago por registrar desde "
-             f"{SECOND_PAYMENTS_SINCE}: {len(orders) - without_payments})")
+             f"{SECOND_PAYMENTS_SINCE}: {len(order_ids) - without_payments}; "
+             f"de carrito sin SO propia: {len(pack_orders)})")
 
     if not orders:
         cursor.close()
@@ -131,6 +168,8 @@ def extract_ml_payments():
     ml_errors    = 0
     mp_errors    = 0
     other_errors = 0
+    pack_matched = 0   # Órdenes de carrito cuyo pago se registró a nombre de la orden facturada del paquete
+    pack_waiting = 0   # Órdenes de carrito sin orden facturada en su paquete (todavía)
     token_expired = False
 
     for o in orders:
@@ -146,11 +185,23 @@ def extract_ml_payments():
                 log.error("Token de ML expirado (401). Abortando script.")
                 break
 
-            if r_ml.status_code != 200:
+            # 206 (Partial Content) también trae la orden con sus pagos: antes se descartaba
+            # y esos pagos nunca se registraban (31 de 94 sin cobro al 23-nov).
+            if r_ml.status_code not in (200, 206):
                 ml_errors += 1
                 continue
 
-            payments = r_ml.json().get('payments', [])
+            order_json = r_ml.json()
+            payments = order_json.get('payments', [])
+
+            # Carrito: el pago se registra a nombre de la orden facturada del mismo paquete
+            register_as = order_id
+            if o['pack']:
+                register_as = invoiced_pack_sibling(cursor, ml_headers, order_json.get('pack_id'), order_id)
+                if not register_as:
+                    pack_waiting += 1
+                    continue
+                pack_matched += 1
 
             for pay in payments:
                 if pay.get('status') != 'approved':
@@ -183,12 +234,16 @@ def extract_ml_payments():
                 date_rel_utc = date_rel + timedelta(hours=MP_UTC_OFFSET_HOURS)
 
                 # PASO C: Validar si el dinero ya está liberado hoy
-                if date_rel_utc <= datetime.utcnow():
+                if date_rel_utc <= datetime.utcnow() and DRY_RUN:
+                    log.info(f"[SECO] pago {payment_id} orden {order_id} -> se registraría a nombre de "
+                             f"{register_as} por ${data_mp['transaction_amount']:,.2f} (liberado {date_rel:%Y-%m-%d})")
+                    released += 1
+                elif date_rel_utc <= datetime.utcnow():
                     cursor.execute("""
                         INSERT IGNORE INTO finance.mkp_payments_prod
                         (marketplace, mkp_order_id, payment_id, amount, date_released, status)
                         VALUES (%s, %s, %s, %s, %s, 'PENDING')
-                    """, (MKP_MARKETPLACE, order_id, payment_id, data_mp['transaction_amount'], date_rel))
+                    """, (MKP_MARKETPLACE, register_as, payment_id, data_mp['transaction_amount'], date_rel))
                     db.commit()
                     released += cursor.rowcount
                 else:
@@ -205,8 +260,8 @@ def extract_ml_payments():
     # ── Resumen único de la corrida ────────────────────────────
     total_errors = ml_errors + mp_errors + other_errors
     log.info(
-        f"[{MKP_MARKETPLACE}] Resumen -> Órdenes revisadas: {len(orders)} | Pagos liberados: {released} | "
-        f"Pagos no liberados: {not_released} | "
+        f"[{MKP_MARKETPLACE}] Resumen{' (EN SECO)' if DRY_RUN else ''} -> Órdenes revisadas: {len(orders)} | Pagos liberados: {released} | "
+        f"Pagos no liberados: {not_released} | Carritos: {pack_matched} ligados, {pack_waiting} sin orden facturada | "
         f"Errores: {total_errors} (ml={ml_errors}, mp={mp_errors}, otros={other_errors})"
     )
     cursor.close()
