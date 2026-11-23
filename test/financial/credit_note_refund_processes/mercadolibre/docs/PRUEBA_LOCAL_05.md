@@ -1,6 +1,6 @@
 # Prueba local del 05 → tablas `*_staging`
 
-Script: `test/financial/credit_note_refund_processes/05_miner_ml_credit_notes.py`
+Script: `test/financial/credit_note_refund_processes/mercadolibre/05_miner_ml_credit_notes.py`
 
 | Qué toca | Cómo |
 |----------|------|
@@ -15,7 +15,7 @@ Las credenciales se toman solas de `C:\Users\Sergio Gil Guerrero\Documents\Wonde
 
 ## Cómo se configura una corrida
 
-Todo se controla editando el bloque **`PRUEBA LOCAL`** al inicio del script y ejecutándolo (botón Run del IDE, o `python test\financial\credit_note_refund_processes\05_miner_ml_credit_notes.py` desde la raíz del repo):
+Todo se controla editando el bloque **`PRUEBA LOCAL`** al inicio del script y ejecutándolo (botón Run del IDE, o `python test\financial\credit_note_refund_processes\mercadolibre\05_miner_ml_credit_notes.py` desde la raíz del repo):
 
 ```python
 LOCAL_RUN               = "signals"     # preflight | orders | signals | sweep | both

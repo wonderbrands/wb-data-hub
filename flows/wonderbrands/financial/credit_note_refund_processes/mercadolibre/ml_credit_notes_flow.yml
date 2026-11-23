@@ -1,5 +1,5 @@
 id: ml_credit_notes_flow
-namespace: wonderbrands.financial.mercadolibre
+namespace: wonderbrands.financial.credit_note_refund_processes.mercadolibre
 description: "Pipeline Notas de Crédito ML (SOMOS-REYES, seller 25523702): Extrae de ML las NC (CFDI E) de órdenes facturadas (05). Arranca al terminar los pagos."
 # Solo el 05 (miner): NO toca Odoo ni emite CFDI; consulta la API de ML y escribe en
 # finance.mkp_credit_notes_prod y en la cola finance.mkp_credit_notes_scan. El barrido
@@ -73,7 +73,7 @@ tasks:
           ONLY_ORDER_IDS: "{{ inputs.only_order_ids ?? '' }}"
           MAX_CALLS_PER_RUN: "{{ inputs.max_calls_per_run }}"
         commands:
-          - python processes/wonderbrands/financial/billing_processes/mercadolibre/05_miner_ml_credit_notes.py
+          - python processes/wonderbrands/financial/credit_note_refund_processes/mercadolibre/05_miner_ml_credit_notes.py
 
 triggers:
   # Se ejecuta automáticamente en cuanto terminan los Pagos ML (así el 06 verá el
@@ -84,7 +84,7 @@ triggers:
       - SUCCESS
       - WARNING
     dependsOn:
-      - namespace: wonderbrands.financial.mercadolibre
+      - namespace: wonderbrands.financial.billing_processes.mercadolibre
         flowId: ml_payments_flow
 
 errors:
