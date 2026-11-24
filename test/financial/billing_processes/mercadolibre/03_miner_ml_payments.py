@@ -62,6 +62,15 @@ def invoiced_pack_sibling(cursor, ml_headers, pack_id, order_id):
     return row['mkp_order_id'] if row else None
 
 
+def read_ml_token(db, cursor):
+    """Token vigente de la tienda en somos_reyes.tokens (otro flujo lo renueva cada pocas horas).
+    El commit abre una lectura nueva: sin él, la conexión sigue viendo el token del inicio."""
+    db.commit()
+    cursor.execute("SELECT token FROM somos_reyes.tokens WHERE seller_id = %s", (ML_SELLER_ID,))
+    row = cursor.fetchall()
+    return str(row[0]['token']) if row else None
+
+
 def extract_ml_payments():
     # ── Validación de configuración ────────────────────────────
     missing = [k for k, v in {
@@ -84,14 +93,12 @@ def extract_ml_payments():
         raise SystemExit(1)
 
     # ── 2. Obtener Tokens (ML y MP) ──────────────────────────────
-    cursor.execute("SELECT token FROM somos_reyes.tokens WHERE seller_id = %s", (ML_SELLER_ID,))
-    row = cursor.fetchall()
-    if not row:
+    ml_token = read_ml_token(db, cursor)
+    if not ml_token:
         log.error(f"No se encontró token para seller_id={ML_SELLER_ID}")
         cursor.close()
         db.close()
         raise SystemExit(1)
-    ml_token = str(row[0]['token'])
 
     ml_headers = {'Authorization': f'Bearer {ml_token}'}
     mp_headers = {'Authorization': f'Bearer {MP_TOKEN}'}
@@ -150,8 +157,9 @@ def extract_ml_payments():
         """, (MKP_MARKETPLACE, *chunk))
         pack_orders.update(o['mkp_order_id'] for o in cursor.fetchall())
 
-    orders = [{'mkp_order_id': o, 'pack': False} for o in sorted(order_ids)]
-    orders += [{'mkp_order_id': o, 'pack': True} for o in sorted(pack_orders)]
+    # Los carritos van primero: son pocos y, si la corrida se corta (token, error), no se quedan sin revisar.
+    orders = [{'mkp_order_id': o, 'pack': True} for o in sorted(pack_orders)]
+    orders += [{'mkp_order_id': o, 'pack': False} for o in sorted(order_ids)]
     log.info(f"[{MKP_MARKETPLACE}] Órdenes pendientes de revisar cobro: {len(orders)} "
              f"(sin ningún cobro: {without_payments}; con otro pago por registrar desde "
              f"{SECOND_PAYMENTS_SINCE}: {len(order_ids) - without_payments}; "
@@ -179,6 +187,17 @@ def extract_ml_payments():
             # PASO A: Obtener IDs de pagos desde Mercado Libre
             r_ml = requests.get(f"https://api.mercadolibre.com/orders/{order_id}",
                                 headers=ml_headers, timeout=REQUEST_TIMEOUT)
+
+            if r_ml.status_code == 401:
+                # El token vence a media corrida: se relee el renovado y se reintenta una vez.
+                ml_token = read_ml_token(db, cursor) or ml_token
+                ml_headers = {'Authorization': f'Bearer {ml_token}'}
+                r_ml = requests.get(f"https://api.mercadolibre.com/orders/{order_id}",
+                                    headers=ml_headers, timeout=REQUEST_TIMEOUT)
+                if r_ml.status_code == 401:
+                    log.info("[TOKEN] Token de ML renovado desde somos_reyes.tokens: sigue en 401.")
+                else:
+                    log.info("[TOKEN] Token de ML renovado desde somos_reyes.tokens.")
 
             if r_ml.status_code == 401:
                 token_expired = True
