@@ -1,11 +1,13 @@
 id: ml_credit_notes_flow
-namespace: wonderbrands.financial.mercadolibre
-description: "Pipeline Notas de Crédito ML (SOMOS-REYES, seller 25523702): Extrae de ML las NC (CFDI E) de órdenes facturadas (05). Arranca al terminar los pagos."
-# Solo el 05 (miner): NO toca Odoo ni emite CFDI; consulta la API de ML y escribe en
-# finance.mkp_credit_notes_prod y en la cola finance.mkp_credit_notes_scan. El barrido
-# histórico ya corrió (11-nov); cada ejecución consulta solo las órdenes que ya tocan.
-# El 06 (registro en Odoo) se sigue corriendo a mano por lotes, con corrida en seco y
-# VoBo de Finanzas; se agrega aquí cuando termine la carga del histórico.
+namespace: wonderbrands.financial.credit_note_refund_processes.mercadolibre
+description: "Pipeline Notas de Crédito ML (SOMOS-REYES, seller 25523702): extrae de ML las NC (CFDI E) de órdenes facturadas (05) y las registra en Odoo en el diario MLNC (06). Arranca al terminar los pagos."
+# 05 (miner): NO toca Odoo; consulta la API de ML y escribe en finance.mkp_credit_notes_prod y en
+#   la cola finance.mkp_credit_notes_scan.
+# 06 (loader): registra en Odoo productivo las NC PENDING (diario MLNC, sin timbrar: el CFDI es de
+#   MeLi), reclasifica los retornos (MLNC-RET) y reversa el cobro. Las NC de periodos cerrados quedan
+#   en PERIOD_LOCKED y entran solas con la reapertura. No toca las NC manuales del diario MLREM; si MeLi
+#   acredita una orden que ya tiene NC MLREM, la deja en MLREM_DOUBLE_EGRESS para Finanzas.
+#   Activo desde el 23-nov-2026 (corrida en seco en productivo revisada: 2,049 READY oct–nov).
 
 concurrency:
   limit: 1
@@ -26,6 +28,10 @@ inputs:
   - id: max_calls_per_run
     type: INT
     defaults: 20000
+  - id: max_nc_per_run
+    type: INT
+    defaults: 300
+    description: "06: tope de NC a registrar en Odoo por corrida"
 
 variables:
   repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
@@ -35,6 +41,8 @@ variables:
   db_user: "kestra_bot"
   db_name: "finance"
   db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
 
 tasks:
   - id: working_env_credit_notes
@@ -73,7 +81,41 @@ tasks:
           ONLY_ORDER_IDS: "{{ inputs.only_order_ids ?? '' }}"
           MAX_CALLS_PER_RUN: "{{ inputs.max_calls_per_run }}"
         commands:
-          - python processes/wonderbrands/financial/billing_processes/mercadolibre/05_miner_ml_credit_notes.py
+          - python processes/wonderbrands/financial/credit_note_refund_processes/mercadolibre/05_miner_ml_credit_notes.py
+
+      # ── PASO 06: Registro de las NC en Odoo (diario MLNC) ──
+      - id: run_loader_ml_credit_notes
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        timeout: PT3H
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          memory:                 # obligatorio (flows/README.md, regla 7); mismo valor que ML
+            memory: "768MB"
+            memorySwap: "1024MB"
+        env:
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          ML_SELLER_ID: "{{ vars.ml_seller_id }}"
+          ODOO_URL: "{{ vars.odoo_url }}"
+          ODOO_DB: "{{ vars.odoo_db }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          # Explícitos: en Kestra nunca aplican los LOCAL_* del script
+          RUN_MODE: "pending"
+          ODOO_TARGET: "prod"
+          NC_TABLE: "finance.mkp_credit_notes_prod"
+          NC_SCAN_TABLE: "finance.mkp_credit_notes_scan"
+          JOURNAL_CODE_DEV: "MLNC"
+          JOURNAL_CODE_BON: "MLNC"
+          NC_NAME_FROM_CFDI: "true"
+          MAX_NC_PER_RUN: "{{ inputs.max_nc_per_run }}"
+          PREFLIGHT_CSV: "false"
+        commands:
+          - python processes/wonderbrands/financial/credit_note_refund_processes/mercadolibre/06_loader_ml_credit_notes.py
 
 triggers:
   # Se ejecuta automáticamente en cuanto terminan los Pagos ML (así el 06 verá el
@@ -84,7 +126,7 @@ triggers:
       - SUCCESS
       - WARNING
     dependsOn:
-      - namespace: wonderbrands.financial.mercadolibre
+      - namespace: wonderbrands.financial.billing_processes.mercadolibre
         flowId: ml_payments_flow
 
 errors:

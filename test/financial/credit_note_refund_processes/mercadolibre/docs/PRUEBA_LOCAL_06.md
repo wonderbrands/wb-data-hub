@@ -40,7 +40,7 @@
 > - **Revisión manual:** sin reembolso ni disputa en MeLi (posible refactura) y Reventa (`INCLUDE_RESALE=false`).
 > - **Lote v2:** staging `somosreyes-test-06-nov-2026-41423118`, 18 casos + 1 simulado, todos OK (`finanzas/Lote_prueba_NC_ML_v2_staging_2026-11-09.csv`).
 
-Script: `test/financial/credit_note_refund_processes/06_loader_ml_credit_notes.py`
+Script: `test/financial/credit_note_refund_processes/mercadolibre/06_loader_ml_credit_notes.py`
 
 | Qué toca | Cómo |
 |----------|------|

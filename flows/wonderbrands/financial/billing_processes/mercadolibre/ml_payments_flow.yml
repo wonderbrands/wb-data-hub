@@ -1,5 +1,5 @@
 id: ml_payments_flow
-namespace: wonderbrands.financial.mercadolibre
+namespace: wonderbrands.financial.billing_processes.mercadolibre
 description: "Pipeline Pagos ML (SOMOS-REYES, seller 25523702): Extrae cobros liberados de MP (03) y los concilia en Odoo (04). Arranca al terminar la facturación."
 
 concurrency:
@@ -80,7 +80,7 @@ triggers:
       - SUCCESS
       - WARNING
     dependsOn:
-      - namespace: wonderbrands.financial.mercadolibre
+      - namespace: wonderbrands.financial.billing_processes.mercadolibre
         flowId: ml_billing_process_flow
 
   # DISPARADOR DE RESPALDO: Una corrida de barrido a las 5:00 AM UTC (11:00 PM CDMX)

@@ -43,7 +43,7 @@ ml_billing_process_flow (01→02) ─► ml_payments_flow (03→04) ─► ml_cr
 
 Solo escribe en staging; no toca Odoo. Mismo patrón que el 01 (MySQLdb, token por seller, logs de resumen para Kestra, `SystemExit(1)` con 401).
 
-**Ubicación:** en fase de pruebas vive en `test/financial/credit_note_refund_processes/` (en `processes/` no va nada de pruebas). Reutiliza `ml_stores.py` desde `processes/.../mercadolibre/` y el flujo Kestra apunta a la ruta de `test/`. Al pasar a producción se mueve junto a 01–04.
+**Ubicación:** producción en `processes/wonderbrands/financial/credit_note_refund_processes/mercadolibre/` (flujo `wonderbrands.financial.credit_note_refund_processes.mercadolibre.ml_credit_notes_flow`); copia de trabajo idéntica en `test/financial/credit_note_refund_processes/mercadolibre/`. Reutiliza `ml_stores.py` de `processes/wonderbrands/financial/billing_processes/mercadolibre/`.
 
 - **Cola `finance.mkp_credit_notes_scan`**, una fila por orden con factura viva (`ODOO_INVOICED` / `ALREADY_ODOO_INVOICED`):
   - **SWEEP:** *todas* las órdenes facturadas, revisadas a +15, +45 y +90 días desde que entraron a facturación, y luego cerradas. **Esto es el barrido histórico:** en la primera corrida, toda orden de junio a hoy se consulta una vez.
