@@ -25,6 +25,9 @@ from _00_shipping_labels_db import (
     sku_shipping_cost_from_rates,
 )
 from _01_vobo_reprocess import VoboSheet, EST_OK, EST_FAIL, EST_BLOCKED
+from _02_automation_run_log import track_run, add, count
+
+AUTOMATION_ID = 'amz_selfship_labels'  # id en tools.automation_run_log
 
 # --- CONFIGURACIÓN DE ENTORNO ---
 dotenv.load_dotenv()
@@ -541,7 +544,7 @@ def generate_labels(best_rates_map: dict, recipient_data: dict, total_order_valu
 # ==========================================
 # MAIN
 # ==========================================
-def process_amazon_self_ship_labels():
+def process_amazon_self_ship_labels(run=None):
     logger.info("=== Iniciando Script: Generación de Guías Amazon SelfShip===")
     conn = get_db_connection()
     models, uid = connect_to_odoo()
@@ -552,6 +555,7 @@ def process_amazon_self_ship_labels():
     rows = fetch_pending_orders(conn)
     if not rows:
         logger.info("No hay órdenes pendientes.")
+        add(run, 'orders_seen', 0)
         report_vobo_results(conn)
         if conn: conn.close()
         return
@@ -562,6 +566,8 @@ def process_amazon_self_ship_labels():
         order_id = row['amazonorderid']
         if order_id not in orders_grouped: orders_grouped[order_id] = []
         orders_grouped[order_id].append(row)
+
+    add(run, 'orders_seen', len(orders_grouped))
 
     for order_id, order_rows in orders_grouped.items():
 
@@ -577,6 +583,7 @@ def process_amazon_self_ship_labels():
         client_data, paid_by_buyer, shipping_total = get_order_details_from_crawler(conn, order_id)
         if not client_data:
             logger.error(f"No se encontró 'client_data' en crawler para la orden {order_id}. Saltando.")
+            count(run, 'sin_datos_crawler')  # queda pendiente en amz_label_queue; se reintenta
             continue
 
         # --- Limpieza de Datos para API de PaqueteExpress y FedEx ---
@@ -631,6 +638,7 @@ def process_amazon_self_ship_labels():
         best_rates_map = get_best_rates_per_box(payload_rates)
         if not best_rates_map:
             logger.error("No se obtuvieron tarifas. Saltando a la siguiente orden.")
+            count(run, 'sin_tarifas')  # queda pendiente en amz_label_queue; se reintenta
             continue
 
         # --- VALIDACIÓN DEL 21% DEL COSTO TOTAL (REGLA DE NEGOCIO) ---
@@ -675,6 +683,8 @@ def process_amazon_self_ship_labels():
                         f"superando el límite permitido de {LIMIT_RATIO_PERCENTAGE:.0%}."
                     )
                 )
+            add(run, 'orders_blocked')
+            count(run, 'LIMIT_RATIO_OVERCOME')
             continue
 
         logger.info(f"Costo Aprobado: Envío representa el {cost_ratio:.1%} de la orden.")
@@ -708,6 +718,8 @@ def process_amazon_self_ship_labels():
                     carrier_service_level=None,
                     error_log="No se pudo generar ninguna etiqueta para la orden; SKU no soportado por el generador de guías."
                 )
+            add(run, 'orders_blocked')
+            count(run, 'SKU_NOT_SUPPORT')
             continue
 
         # Inyectar en Odoo
@@ -717,6 +729,8 @@ def process_amazon_self_ship_labels():
             # --- Inyectar línea de costo de envío si aplica ---
             if shipping_total > 0:
                 add_shipping_line_to_odoo(models, uid, so_id, so_name, shipping_total)
+
+        add(run, 'orders_ok')
 
         # Mapear de vuelta a la Base de Datos
         logger.info("Mapeando etiquetas generadas a la base de datos...")
@@ -795,4 +809,6 @@ def process_amazon_self_ship_labels():
 
 
 if __name__ == "__main__":
-    process_amazon_self_ship_labels()
+    # Registra la corrida en tools.automation_run_log (si falla el registro, el script sigue igual).
+    with track_run(AUTOMATION_ID) as run:
+        process_amazon_self_ship_labels(run)

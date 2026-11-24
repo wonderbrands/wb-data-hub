@@ -11,6 +11,13 @@ from dateutil.parser import isoparse
 import sys
 from ml_sellers import get_seller_config
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+shared_dir = os.path.join(os.path.dirname(current_dir), '_shared')
+if shared_dir not in sys.path:
+    sys.path.append(shared_dir)
+
+from _02_automation_run_log import track_run, add, count
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', handlers=[
         logging.StreamHandler(sys.stdout)
@@ -22,6 +29,10 @@ SELLER = get_seller_config()
 SELLER_ID = SELLER['seller_id']
 SELLER_NAME = SELLER['seller_name']
 PRINT_CONTROL_ID = SELLER['print_control_id']
+AUTOMATION_ID = SELLER['automation_id']
+
+# Máximo de shipping_id con SLA fallido que se guardan en el summary de la corrida.
+MAX_SLA_FAILED_IDS = 100
 
 def now_cdmx():
     return datetime.now(CDMX)
@@ -196,7 +207,7 @@ def process_sla_concurrent(row, session, override_days, cutoff_time):
         return None
 
 
-def run_etl_hybrid(db, token):
+def run_etl_hybrid(db, token, run=None):
     config = get_override_config(db)
     session = get_requests_session(token)
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
@@ -263,14 +274,21 @@ def run_etl_hybrid(db, token):
 
     #concurrencia en api
     valid_orders = []
+    sla_failed_ids = []  # consulta de SLA fallida: la orden no queda en ninguna tabla en esta corrida
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(process_sla_concurrent, row, session, config['override_days'], config['cutoff_time'])
+        futures = {executor.submit(process_sla_concurrent, row, session, config['override_days'], config['cutoff_time']): row
                    for row in
-                   candidates_to_api]
+                   candidates_to_api}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
                 valid_orders.append(res)
+            else:
+                sla_failed_ids.append(str(futures[future]['shipping_id']))
+
+    if sla_failed_ids:
+        log.warning(f"[{SELLER_NAME}] {len(sla_failed_ids)} orden(es) sin SLA (falló la API de ML); "
+                    f"se reintentan en la próxima corrida. shipping_ids: {', '.join(sla_failed_ids[:20])}")
 
     #Inserción / Actualización en BD
     insert_cursor = db.cursor()
@@ -297,13 +315,26 @@ def run_etl_hybrid(db, token):
     db.commit()
     log.info(f"[{SELLER_NAME}] Proceso ETL completado. {procesadas} órdenes insertadas/actualizadas (Listas o Futuras).")
 
+    # Registro de la corrida (paso 1 de 2): el paso de Odoo la cierra.
+    add(run, 'orders_unregistered', len(sla_failed_ids))
+    count(run, 'sla_candidatas', len(raw_orders))
+    count(run, 'sla_omitidas_cache', skipped_count)
+    count(run, 'sla_consultadas', len(candidates_to_api))
+    count(run, 'sla_registradas', procesadas)
+    count(run, 'sla_fallidas', len(sla_failed_ids))
+    if run is not None and sla_failed_ids:
+        run['summary']['sla_fallidas_shipping_ids'] = sla_failed_ids[:MAX_SLA_FAILED_IDS]
+
 
 if __name__ == "__main__":
     db = None
     try:
-        db = get_db_connection()
-        ml_token = get_ml_token(db)
-        run_etl_hybrid(db, ml_token)
+        # Paso 1 de 2 del flujo: deja la corrida en RUNNING (final=False); la
+        # cierra ml_odoo_injection_labels.py con el mismo run_id (misma ejecución).
+        with track_run(AUTOMATION_ID, final=False) as run:
+            db = get_db_connection()
+            ml_token = get_ml_token(db)
+            run_etl_hybrid(db, ml_token, run)
     except Exception as e:
         log.error(f"[{SELLER_NAME}] Error en ejecución: {e}")
         sys.exit(1)

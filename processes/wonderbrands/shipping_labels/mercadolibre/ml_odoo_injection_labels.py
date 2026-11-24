@@ -12,6 +12,13 @@ import sys
 import time
 from ml_sellers import get_seller_config
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+shared_dir = os.path.join(os.path.dirname(current_dir), '_shared')
+if shared_dir not in sys.path:
+    sys.path.append(shared_dir)
+
+from _02_automation_run_log import track_run, add, count
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', handlers=[
         logging.StreamHandler(sys.stdout)
     ])
@@ -32,6 +39,7 @@ ODOO_PWD = os.getenv('ODOO_PASSWORD')
 SELLER = get_seller_config()
 SELLER_ID = SELLER['seller_id']
 SELLER_NAME = SELLER['seller_name']
+AUTOMATION_ID = SELLER['automation_id']
 
 
 def get_db_connection():
@@ -182,7 +190,7 @@ def get_zpl_in_memory(shipping_id, access_token):
         return None, f"Error descomprimiendo ZPL: {str(e)}"
 
 
-def process_fase_c():
+def process_fase_c(run=None):
     db = get_db_connection()
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
     ml_token = get_ml_token(db)
@@ -200,6 +208,9 @@ def process_fase_c():
     orders = cursor.fetchall()
 
     log.info(f"Se encontraron {len(orders)} órdenes pendientes en Base de Datos.")
+    add(run, 'orders_seen', len(orders))
+    add(run, 'orders_ok', 0)
+    add(run, 'orders_blocked', 0)
 
     procesadas = 0
     errores_criticos = 0
@@ -221,6 +232,8 @@ def process_fase_c():
             if not odoo_search:
                 cursor.execute("UPDATE tools.ml_api_etl_orders SET error_message = 'No encontrada en Odoo' WHERE id = %s",
                                (db_id,))
+                add(run, 'orders_blocked')
+                count(run, 'no_encontrada_en_odoo')
                 continue
 
             so_id = odoo_search[0]['id']
@@ -238,6 +251,8 @@ def process_fase_c():
                     SET odoo_so_name = %s, odoo_pick_status = 'NO_PICK', print_status = 'NO_PICK_IN_ODOO' 
                     WHERE id = %s
                 """, (so_name, db_id))
+                add(run, 'orders_blocked')
+                count(run, 'no_pick_en_odoo')
                 continue
 
             #Verificar si ya tiene adjuntos en Odoo
@@ -252,6 +267,8 @@ def process_fase_c():
                     WHERE id = %s
                 """, (so_name, db_id))
                 db.commit()
+                add(run, 'orders_ok')
+                count(run, 'ya_impresas')
                 continue
 
             # Evaluar si el ZPL ya fue descargado en un intento anterior para evitar error de ML por estatus cambiado
@@ -270,6 +287,8 @@ def process_fase_c():
                     log.error(f"Error ZPL para {so_name}: {msg}")
                     cursor.execute("UPDATE tools.ml_api_etl_orders SET error_message = %s WHERE id = %s", (msg, db_id))
                     db.commit()
+                    add(run, 'orders_blocked')
+                    count(run, 'error_zpl')
                     continue
 
                 # Respaldo inmediato en MySQL para no perder la guía en caso de Bad Gateway en Odoo más adelante
@@ -314,6 +333,7 @@ def process_fase_c():
 
             db.commit()
             procesadas += 1
+            add(run, 'orders_ok')
             log.info(f"ÉXITO: Orden {so_name} ({mkp_ref}) procesada y adjuntada en Odoo.")
 
         except xmlrpc.client.ProtocolError as e:
@@ -339,6 +359,8 @@ def process_fase_c():
 
     db.close()
     log.info(f"[{SELLER_NAME}] Fase C completada. {procesadas} órdenes inyectadas en Odoo.")
+    add(run, 'orders_blocked', errores_criticos)
+    count(run, 'errores_criticos', errores_criticos)
 
     if errores_criticos > 0:
         raise Exception(f"El proceso completó las órdenes posibles, pero {errores_criticos} orden(es) fallaron de manera persistente tras N reintentos.")
@@ -346,7 +368,9 @@ def process_fase_c():
 
 if __name__ == "__main__":
     try:
-        process_fase_c()
+        # Paso 2 de 2 del flujo: cierra la corrida que abrió ml_mix_db_api_sla_orders.py.
+        with track_run(AUTOMATION_ID, resume=True) as run:
+            process_fase_c(run)
     except Exception as e:
         log.error(f"[{SELLER_NAME}] Fallo crítico en proceso de extracción de guías ML: {str(e)}")
         sys.exit(1)
