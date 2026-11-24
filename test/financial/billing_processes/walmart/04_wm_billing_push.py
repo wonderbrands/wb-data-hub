@@ -7,13 +7,22 @@ cliente NO facturo con Walmart: una factura por SO, a publico en general
 
 Toma las filas PENDING_WB_INVOICE. Candados, en orden:
 
-  A. FENIX AL DIA (fail-closed). Si Fenix lleva mas de WM_FENIX_MAX_HORAS sin
-     cargarse no se emite NADA: no sabriamos si Walmart ya facturo y saldria un
-     doble CFDI. Hoy (12-nov-2026) Fenix lleva 10 dias sin cargarse.
-  B. ULTIMA MIRADA A FENIX. Justo antes de emitir se vuelve a consultar Fenix
-     por las ordenes del lote. Si aparece cualquier fila (el cliente pidio
-     factura despues del miner), la orden pasa a RECLASIFICAR y no se emite.
-     Si la consulta falla, se aborta.
+  A. FENIX AL DIA (fail-closed). Si la ultima corrida completa del ETL de la
+     API de Fenix (00b, marca ETL:ULTIMA_CORRIDA) tiene mas de
+     WM_FENIX_MAX_HORAS, no se emite NADA: no sabriamos si el cliente pidio
+     factura a Walmart y saldria un doble CFDI. Ya no depende del crawler.
+  B. ULTIMA MIRADA A FENIX. Justo antes de emitir se buscan, por las ordenes
+     del lote, peticiones de factura de la API (filas PRECFDI / BLOQUEADO de
+     cualquier estado) y filas del crawler. Si aparece cualquiera, la orden
+     pasa a RECLASIFICAR y no se emite. Si la consulta falla, se aborta.
+  B2. CFDI DE WALMART SIN LIGAR. La API de Fenix no lista todas las peticiones
+     (el pedido 600000121084541 tiene CFDI vigente y no sale en la API). Si en
+     el repositorio hay un CFDI de Walmart SIN_LIGAR timbrado entre la venta y
+     WM_B2_DIAS dias despues, con total = precio de una linea x piezas del CFDI
+     (+-0.02) y el mismo UPC que la linea, la orden pasa a RECLASIFICAR: puede
+     ser suyo. Se resuelve cuando ese CFDI se liga (por folio, crawler o
+     Finanzas). El UPC de la linea sale de wm_order_line (API de Walmart), que
+     coincide con el NoIdentificacion del CFDI (232 de 232 en octubre).
   C. GRACIA. El cliente tiene 30 dias para pedir factura a Walmart. Se espera
      WM_GRACE_DAYS desde order_date (decision pendiente de Finanzas; 5 como
      Amazon). En el cierre de mes (dias 1..WM_DIAS_CIERRE_MES) la venta del mes
@@ -48,7 +57,8 @@ from _wm_common import (configurar_log, log, banner, validar_entorno, notify_sla
                         cargar_catalogos, buscar_so, facturas_existentes, resumen_factura,
                         confirmar_so, buscar_por_ref, leer_lineas_so, comando_linea,
                         total_estimado, fijar_cxc, timbrar, conciliar_salida, postear_chatter,
-                        reset_stuck_processing, claim, update_fila, frescura_fenix,
+                        reset_stuck_processing, claim, update_fila, frescura_etl_fenix, MKP_FENIX,
+                        CFDI_SIN_LIGAR, upc_por_linea,
                         ahora_cdmx, inicio_de_mes, en_cierre_de_mes, limite_72h, a_datetime,
                         a_float, lotes, HOY_CORRIDA, DO_STAMPING,
                         TBL_BILLING, MARKETPLACE, IDEMPOTENCY_PREFIX,
@@ -60,6 +70,7 @@ from _wm_common import (configurar_log, log, banner, validar_entorno, notify_sla
 
 GRACE_DAYS = int(os.getenv('WM_GRACE_DAYS', '5'))
 FENIX_MAX_HORAS = float(os.getenv('WM_FENIX_MAX_HORAS', '48'))
+B2_DIAS = int(os.getenv('WM_B2_DIAS', '7'))   # 0 = candado B2 apagado
 
 
 def fetch_pendientes(db):
@@ -93,9 +104,15 @@ def fecha_y_turno(fila):
 
 
 def ordenes_con_fenix(db, pedidos):
-    """Ultima mirada a Fenix. Lanza si falla (fail-closed)."""
+    """Ultima mirada a Fenix: ordenes con peticion de factura en la API (00b) o
+    con fila en el crawler. Lanza si falla (fail-closed)."""
     con_fila = set()
+    buscados = set(pedidos)
     cur = db.cursor()
+    cur.execute(f"""SELECT JSON_UNQUOTE(JSON_EXTRACT(raw_json, '$.orderno')) FROM {TBL_BILLING}
+                    WHERE marketplace = %s AND (mkp_order_id LIKE 'PRECFDI:%%' OR mkp_order_id LIKE 'BLOQUEADO:%%')""",
+                (MKP_FENIX,))
+    con_fila.update(r[0] for r in cur.fetchall() if r[0] in buscados)
     for chunk in lotes(pedidos, 500):
         cur.execute(f"""SELECT DISTINCT pedido FROM somos_reyes.wm_fenix_invoices_report
                         WHERE tipo_documento = 'I' AND pedido IN ({','.join(['%s'] * len(chunk))})""",
@@ -103,6 +120,42 @@ def ordenes_con_fenix(db, pedidos):
         con_fila.update(r[0] for r in cur.fetchall())
     cur.close()
     return con_fila
+
+
+def cfdi_sin_ligar_posible(db, filas):
+    """{id de fila: uuid} de las ordenes del lote para las que hay un CFDI de
+    Walmart SIN_LIGAR que podria ser suyo (B2). Lanza si falla (fail-closed)."""
+    if B2_DIAS <= 0 or not filas:
+        return {}
+    cur = db.cursor()
+    cur.execute(f"""SELECT cfdi_uuid, raw_json FROM {TBL_BILLING}
+                    WHERE marketplace = %s AND mkp_order_id LIKE 'CFDI:%%' AND status = %s""",
+                (MKP_FENIX, CFDI_SIN_LIGAR))
+    sueltos = []
+    for uuid, raw in cur.fetchall():
+        raw = json.loads(raw) if isinstance(raw, (str, bytes)) else (raw or {})
+        if raw.get('fecha'):
+            sueltos.append((uuid, a_datetime(str(raw['fecha']).replace('T', ' ')),
+                            a_float(raw.get('total')), a_float(raw.get('cantidad')) or 1.0,
+                            str(raw.get('upc') or '').lstrip('0')))
+    # UPC de cada linea (API de Walmart): es el NoIdentificacion del CFDI.
+    upcs = upc_por_linea(cur, {l.get('iderp') for f in filas for l in f['raw'].get('lineas', [])}) if sueltos else {}
+    cur.close()
+    posibles = {}
+    for f in filas:
+        venta = a_datetime(f['raw']['order_date'])
+        for l in f['raw'].get('lineas', []):
+            unit = a_float(l.get('price_amount')) / max(int(l.get('quantity') or 1), 1)
+            upc_linea = upcs.get(l.get('iderp'))
+            for uuid, fecha, total, cant, upc in sueltos:
+                if (venta <= fecha <= venta + timedelta(days=B2_DIAS)
+                        and abs(unit * cant - total) <= 0.02
+                        and (not upc_linea or not upc or upc == upc_linea)):
+                    posibles[f['id']] = uuid
+                    break
+            if f['id'] in posibles:
+                break
+    return posibles
 
 
 def procesar(odoo, db, fila, fecha, catalogos, stats):
@@ -277,13 +330,14 @@ def main():
     validar_entorno()
     db = get_db_connection()
 
-    # --- A. Fenix al dia ---
+    # --- A. Fenix al dia (ETL de la API, 00b) ---
     cur = db.cursor()
-    horas = frescura_fenix(cur)
+    horas = frescura_etl_fenix(cur)
     cur.close()
     if horas is None or horas > FENIX_MAX_HORAS:
-        msg = (f"Walmart 04: NO se emitio ninguna factura. Fenix lleva {horas} h sin cargarse "
-               f"(maximo {FENIX_MAX_HORAS} h): no sabemos si Walmart ya facturo.")
+        msg = (f"Walmart 04: NO se emitio ninguna factura. La ultima corrida buena del ETL de la API de "
+               f"Fenix fue hace {horas} h (maximo {FENIX_MAX_HORAS} h): no sabemos si el cliente pidio "
+               f"factura a Walmart.")
         log.error(msg)
         notify_slack(msg)
         db.close()
@@ -310,6 +364,16 @@ def main():
                         'Fenix tiene fila para la orden: el cliente pidio factura a Walmart.')
             stats['reclasificadas'] += 1
     turno = [(f, fecha) for f, fecha in turno if f['mkp_order_id'] not in con_fenix]
+
+    # --- B2. CFDI de Walmart sin ligar que podria ser de la orden ---
+    posibles = cfdi_sin_ligar_posible(db, [f for f, _ in turno])
+    for f, _ in turno:
+        if f['id'] in posibles:
+            update_fila(db, f['id'], ST_RECLASIFICAR,
+                        f"Hay un CFDI de Walmart sin ligar ({posibles[f['id']]}) con el precio de esta orden: "
+                        f"puede ser suyo. Se reevalua cuando se ligue.")
+            stats['cfdi_sin_ligar_posible'] += 1
+    turno = [(f, fecha) for f, fecha in turno if f['id'] not in posibles]
 
     odoo = OdooModelProxy()
     catalogos = cargar_catalogos(odoo)

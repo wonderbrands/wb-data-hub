@@ -5,29 +5,35 @@ Decide, orden por orden, QUIEN factura cada venta de Walmart 3P y la deja en
 finance.mkp_billing_{entorno} con marketplace='WALMART'. Solo lee MySQL; no
 toca Odoo.
 
-Tres fuentes, ninguna sola (CLAUDE.md regla 6):
-  * Que se vendio     FTM type='Order' (una fila por linea de orden).
-  * Quien facturo     Fenix: CFDI que emitio el autofacturador de Walmart con
-                      nuestro RFC. Un CFDI por pieza (cantidad=1 por UUID).
-  * Hay SO            odoo_new_sale_order_live por channel_order_reference
-                      (= customer_order_id) y por FTM.so.
-El XML del CFDI no esta en MySQL: lo carga 02 (ZIP del SAT / Finanzas).
+Fuentes, ninguna sola (CLAUDE.md regla 6):
+  * Que se vendio       FTM type='Order' (una fila por linea de orden).
+  * Pidio factura?      API de Fenix (filas PRECFDI de 00b): la linea tiene
+                        una peticion de factura RECIBIDA, CON_ERROR o NUEVA.
+  * Con que CFDI        CFDI de Walmart del repositorio ya ligados a la linea
+                        (CFDI:<UUID>, XML del SAT, 02) y, si WM_USAR_CRAWLER,
+                        el crawler (wm_fenix_invoices_report). Un CFDI por
+                        pieza (cantidad=1 por UUID).
+  * Hay SO              odoo_new_sale_order_live por channel_order_reference
+                        (= customer_order_id) y por FTM.so.
 
 Clasificacion de cada LINEA (iderp = so_prime_line_sub_line_no):
   piezas con CFDI vigente de Walmart (CON_XML_PDF, tipo I) = q_wm
-    q_wm == cantidad vendida            -> WM   (la timbro Walmart)
-    q_wm == 0 y Fenix no dice nada      -> WB   (la timbramos nosotros)
-    q_wm == 0 y Fenix en ERROR, NUEVO,
-      CANCELANDO, CANCELADO...          -> REVISAR (el cliente pidio factura)
-    0 < q_wm < cantidad                 -> MIXTA
-    q_wm > cantidad                     -> EXCEDENTE (Walmart emitio de mas)
+    q_wm == cantidad vendida                   -> WM   (la timbro Walmart)
+    q_wm < cantidad y peticion RECIBIDA        -> FALTA_UUID (Walmart timbro;
+                                                  falta ligar su CFDI)
+    q_wm == 0 y peticion CON_ERROR/NUEVA/BLOQUEADA,
+      o el crawler en ERROR, NUEVO, CANCELADO  -> REVISAR (el cliente pidio factura)
+    q_wm == 0 y nadie dice nada                -> WB   (la timbramos nosotros)
+    0 < q_wm < cantidad sin peticion           -> MIXTA
+    q_wm > cantidad                            -> EXCEDENTE (Walmart emitio de mas)
   REEMPLAZADO y ERROR junto a un CFDI vigente se ignoran: en los datos los 51
   REEMPLAZADO tienen su sustituto vigente en la misma linea.
 
 Clasificacion de la ORDEN:
-  todas WM  -> una fila por UUID: <orden>:<UUID>  PENDING_WM_XML / _LINK
-  todas WB  -> una fila: <orden>                  PENDING_WB_INVOICE
-  si no     -> una fila: <orden> en espera (ORDEN_MIXTA, WM_CFDI_REVISAR...)
+  todas WM        -> una fila por UUID: <orden>:<UUID>  PENDING_WM_XML / _LINK
+  WM + FALTA_UUID -> una fila: <orden>  PENDING_WM_UUID (02 baja y liga el XML)
+  todas WB        -> una fila: <orden>  PENDING_WB_INVOICE
+  si no           -> una fila: <orden> en espera (ORDEN_MIXTA, WM_CFDI_REVISAR...)
   Antes que todo, la SO: NO_SO, SO_DUPLICADA, SO_OTRO_EQUIPO, SO_CANCELADA.
 
 Las filas en estado final (facturadas, TOTAL_DIFF...) no se tocan. Las que
@@ -51,10 +57,11 @@ if _dir not in sys.path:
 
 from _wm_common import (configurar_log, log, banner, get_db_connection, notify_slack,
                         TBL_BILLING, MARKETPLACE, TEAM_WALMART, REFRESCABLES,
-                        ST_PENDING_WB, ST_PENDING_WM_XML, ST_PENDING_WM_LINK,
+                        ST_PENDING_WB, ST_PENDING_WM_UUID, ST_PENDING_WM_XML, ST_PENDING_WM_LINK,
                         ST_NO_SO, ST_SO_DUPLICADA, ST_SO_OTRO_EQUIPO, ST_SO_CANCELADA,
                         ST_ORDEN_MIXTA, ST_WM_REVISAR, ST_WM_EXCEDENTE, ST_DESCARTADA,
-                        ST_MANUAL_SERIE, SKUS_FACTURA_MANUAL,
+                        ST_MANUAL_SERIE, SKUS_FACTURA_MANUAL, USAR_CRAWLER, PRE_RECIBIDO,
+                        precfdi_por_linea, cfdis_ligados_por_linea,
                         inicio_de_mes, a_float, a_json, normalizar_uuid, lotes)
 
 DRY_RUN = os.getenv('WM_DRY_RUN', '0').strip() in ('1', 'true', 'TRUE')
@@ -91,9 +98,16 @@ def leer_ftm(cur):
 
 
 def leer_fenix(cur, pedidos):
-    """Filas de Fenix por iderp. Solo comprobantes de ingreso (las NC de
-    Walmart, tipo E, van al flujo de devoluciones)."""
+    """CFDI de Walmart por iderp: los del repositorio ya ligados (XML del SAT)
+    mas, si WM_USAR_CRAWLER, los del crawler. Sin duplicar UUID. Solo
+    comprobantes de ingreso (las NC de Walmart, tipo E, van al flujo de
+    devoluciones)."""
     por_linea = defaultdict(list)
+    for iderp, filas in cfdis_ligados_por_linea(cur).items():
+        por_linea[iderp].extend(filas)
+    if not USAR_CRAWLER:
+        return por_linea
+    vistos = {f['uuid'] for fs in por_linea.values() for f in fs}
     for chunk in lotes(pedidos, 500):
         cur.execute(f"""
             SELECT UPPER(uuid) AS uuid, tipo_documento, pedido, iderp, cantidad, subtotal,
@@ -102,6 +116,9 @@ def leer_fenix(cur, pedidos):
             WHERE pedido IN ({','.join(['%s'] * len(chunk))}) AND tipo_documento = 'I'
         """, tuple(chunk))
         for r in cur.fetchall():
+            if r['uuid'] and normalizar_uuid(r['uuid']) in vistos:
+                continue
+            r['origen'] = 'crawler'
             por_linea[r['iderp']].append(r)
     return por_linea
 
@@ -170,17 +187,21 @@ def resolver_so(pedido, lineas, por_ref, por_nombre):
     return so, None
 
 
-def clasificar_linea(linea, filas_fenix):
+def clasificar_linea(linea, filas_fenix, peticiones):
+    """peticiones = estados de la API de Fenix para la linea (RECIBIDO, CON_ERROR...)."""
     vigentes = [f for f in filas_fenix if f['estado_cfdi'] == ESTADO_VIGENTE and f['uuid']]
     q_wm = sum(int(f['cantidad'] or 0) for f in vigentes)
     qty = int(linea['quantity'] or 0)
-    otros = sorted({f['estado_cfdi'] for f in filas_fenix if f['estado_cfdi'] != ESTADO_VIGENTE})
-    if q_wm == 0:
-        return ('REVISAR', otros) if otros else ('WB', [])
-    if q_wm == qty:
-        return 'WM', vigentes
+    otros = sorted({f['estado_cfdi'] for f in filas_fenix if f['estado_cfdi'] != ESTADO_VIGENTE}
+                   | {f"API:{p}" for p in peticiones if p != PRE_RECIBIDO})
     if q_wm > qty:
         return 'EXCEDENTE', vigentes
+    if q_wm == qty and qty > 0:
+        return 'WM', vigentes
+    if PRE_RECIBIDO in peticiones:
+        return 'FALTA_UUID', vigentes
+    if q_wm == 0:
+        return ('REVISAR', otros) if otros else ('WB', [])
     return 'MIXTA', vigentes
 
 
@@ -190,7 +211,7 @@ def linea_para_json(l):
                               'order_status', 'order_date', 'purchase_order_id')}
 
 
-def filas_deseadas(pedido, lineas, fenix, por_ref, por_nombre):
+def filas_deseadas(pedido, lineas, fenix, peticiones, por_ref, por_nombre):
     """Lista de filas (dict) que la tabla de control debe tener para la orden."""
     so, espera = resolver_so(pedido, lineas, por_ref, por_nombre)
     so_name = so['name'] if so else None
@@ -207,15 +228,22 @@ def filas_deseadas(pedido, lineas, fenix, por_ref, por_nombre):
         return {'mkp_order_id': pedido, 'odoo_so_name': so_name, 'cfdi_uuid': None,
                 'total_amount': total, 'status': status, 'error_log': motivo,
                 'raw_json': dict(base_json, tipo=tipo,
-                                 fenix={l['iderp']: fenix.get(l['iderp'], []) for l in lineas})}
+                                 fenix={l['iderp']: fenix.get(l['iderp'], []) for l in lineas},
+                                 peticiones_fenix={l['iderp']: sorted(peticiones.get(l['iderp'], set()))
+                                                   for l in lineas})}
 
     if espera:
         return [fila_orden(espera, f"SO: {espera}", tipo='ESPERA')]
 
     clases = {}
     for l in lineas:
-        clases[l['iderp']] = clasificar_linea(l, fenix.get(l['iderp'], []))
+        clases[l['iderp']] = clasificar_linea(l, fenix.get(l['iderp'], []), peticiones.get(l['iderp'], set()))
     tipos = {c[0] for c in clases.values()}
+
+    if 'FALTA_UUID' in tipos and tipos <= {'WM', 'FALTA_UUID'}:
+        faltan = [k for k, v in clases.items() if v[0] == 'FALTA_UUID']
+        return [fila_orden(ST_PENDING_WM_UUID, f"Walmart facturo; falta ligar el CFDI de: {', '.join(faltan)}"[:900],
+                           tipo='WM')]
 
     if tipos == {'WB'}:
         manuales = sorted({l['sku'] for l in lineas
@@ -249,6 +277,8 @@ def filas_deseadas(pedido, lineas, fenix, por_ref, por_nombre):
         status = ST_ORDEN_MIXTA
     detalle = '; '.join(f"{k}={v[0]}" + (f"({','.join(v[1])})" if v[0] == 'REVISAR' else '')
                         for k, v in clases.items())
+    if 'FALTA_UUID' in tipos and status == ST_ORDEN_MIXTA:
+        detalle = 'Hay lineas facturadas por Walmart (falta ligar su CFDI) y lineas sin peticion: ' + detalle
     return [fila_orden(status, detalle[:900], tipo='ESPERA')]
 
 
@@ -294,16 +324,22 @@ def main():
         return
 
     fenix = leer_fenix(cur, pedidos)
+    peticiones = precfdi_por_linea(cur)
     so_names = sorted({l['so'] for v in ordenes.values() for l in v if l['so']})
     por_ref, por_nombre = leer_sos(cur, pedidos, so_names)
     existentes = leer_filas_existentes(cur)
-    log.info(f"Fenix: {sum(len(v) for v in fenix.values())} filas | "
+    origenes = Counter(f.get('origen') for v in fenix.values() for f in v)
+    log.info(f"CFDI de Walmart por linea: {dict(origenes)} (crawler {'SI' if USAR_CRAWLER else 'NO'}) | "
+             f"lineas con peticion en la API de Fenix: {len(peticiones)} | "
              f"SO en replica: {len(por_nombre)} | filas de control previas: "
              f"{sum(len(v) for v in existentes.values())}")
+    if not peticiones:
+        log.warning('No hay filas de la API de Fenix (00b no ha corrido): la clasificacion depende solo del '
+                    'crawler. 04 no emitira sin la marca del ETL.')
 
     deseadas = []
     for pedido in pedidos:
-        deseadas.extend(filas_deseadas(pedido, ordenes[pedido], fenix, por_ref, por_nombre))
+        deseadas.extend(filas_deseadas(pedido, ordenes[pedido], fenix, peticiones, por_ref, por_nombre))
 
     # Filas abiertas de estas ordenes que ya no corresponden.
     claves = {f['mkp_order_id'] for f in deseadas}
@@ -346,11 +382,11 @@ def main():
     db.close()
     log.info(f"Escritas {len(deseadas)} fila(s); {len(descartar)} descartada(s).")
 
-    espera = sum(n for s, n in resumen.items()
-                 if s not in (ST_PENDING_WB, ST_PENDING_WM_XML, ST_PENDING_WM_LINK))
+    normales = (ST_PENDING_WB, ST_PENDING_WM_UUID, ST_PENDING_WM_XML, ST_PENDING_WM_LINK)
+    espera = sum(n for s, n in resumen.items() if s not in normales)
     if espera:
         notify_slack(f"Walmart miner: {espera} orden(es) en espera de revision "
-                     f"({', '.join(f'{s}={n}' for s, n in resumen.items() if s not in (ST_PENDING_WB, ST_PENDING_WM_XML, ST_PENDING_WM_LINK))}).")
+                     f"({', '.join(f'{s}={n}' for s, n in resumen.items() if s not in normales)}).")
 
 
 if __name__ == '__main__':

@@ -26,16 +26,31 @@ Datos de Walmart (somos_reyes), medidos el 10/12-nov-2026:
         de Walmart con nuestro RFC. UN CFDI POR PIEZA: cada UUID vigente es
         una fila con cantidad=1 y una linea de 5 piezas trae 5 UUID.
         iderp = so_prime_line_sub_line_no de FTM.
+        La llena el crawler de Data, a mano: es OPCIONAL (WM_USAR_CRAWLER).
+
+Fuente propia (23-nov-2026), en la misma tabla de control con
+marketplace = 'WALMART_FENIX' (no pisa la tabla del crawler):
+    PRECFDI:<cfdiid>  peticion de factura del cliente (API de Fenix, 00b)
+    CFDI:<UUID>       CFDI que timbro Fenix, con su XML (descarga del SAT, 02)
+La API dice QUE linea pidio factura (cfdiid, invoiceno: los mismos que el
+crawler llama identificador e invoice) pero NO da el UUID; el SAT da el XML.
+Ligar un CFDI con su peticion sin el crawler: camino rapido, folio con el
+pedido y tramos de folio (ver ligar_cfdis). Lo que no se liga sin duda queda
+SIN_LIGAR.
+    wm_order_line (API de Walmart, al dia)   UPC de cada linea: es el
+        NoIdentificacion del CFDI de Walmart.
 """
 
 import os
 import sys
 import json
 import base64
+import bisect
 import logging
 import urllib.request
 import xmlrpc.client
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -108,6 +123,7 @@ TOLERANCIA_CUADRE_CFDI = 0.05
 #
 # Pendientes que toma un loader
 ST_PENDING_WB = 'PENDING_WB_INVOICE'     # la emite WB (04)
+ST_PENDING_WM_UUID = 'PENDING_WM_UUID'   # Walmart facturo (API de Fenix) y falta ligar su CFDI (02)
 ST_PENDING_WM_XML = 'PENDING_WM_XML'     # CFDI de Walmart, falta su XML (02)
 ST_PENDING_WM_LINK = 'PENDING_WM_LINK'   # CFDI de Walmart con XML: se replica (03)
 ST_PROCESSING = 'PROCESSING'
@@ -142,13 +158,54 @@ ST_ALREADY = 'ALREADY_ODOO_INVOICED'      # ya tenia factura (proceso manual, gl
 ST_DESCARTADA = 'DESCARTADA'              # la fila ya no aplica (cambio la clasificacion)
 ST_TOTAL_DIFF = 'TOTAL_DIFF'              # no cuadra contra Walmart: revisa Finanzas
 ST_XML_INVALIDO = 'XML_INVALIDO'          # el XML no es de esta fila o no es nuestro
+ST_WM_NO_VIGENTE = 'WM_CFDI_NO_VIGENTE'   # el SAT dice que el CFDI de Walmart ya no esta vigente
 ST_ERROR = 'ERROR'                        # se reintenta hasta 3 veces (retry_count_loader)
 
 # Las que el miner puede reescribir en cada corrida. El resto queda cerrado.
-REFRESCABLES = (ST_PENDING_WB, ST_PENDING_WM_XML, ST_PENDING_WM_LINK,
+REFRESCABLES = (ST_PENDING_WB, ST_PENDING_WM_UUID, ST_PENDING_WM_XML, ST_PENDING_WM_LINK,
                 ST_NO_SO, ST_SO_DUPLICADA, ST_SO_OTRO_EQUIPO, ST_SO_CANCELADA,
                 ST_ORDEN_MIXTA, ST_WM_REVISAR, ST_WM_EXCEDENTE, ST_DOBLE_CFDI,
                 ST_RECLASIFICAR, ST_MANUAL_SERIE, ST_BORRADOR_AJENO)
+
+
+# =============================================================================
+# FUENTE PROPIA DE FENIX (marketplace = 'WALMART_FENIX')
+# =============================================================================
+
+MKP_FENIX = 'WALMART_FENIX'
+CLAVE_ETL = 'ETL:ULTIMA_CORRIDA'   # marca de la ultima corrida completa de 00b
+
+# Filas PRECFDI:<cfdiid> (peticiones de factura). Un pre-CFDI puede salir en
+# dos listas; gana la de mayor prioridad.
+PRE_RECIBIDO, PRE_CON_ERROR, PRE_NUEVO, PRE_BLOQUEADO = 'RECIBIDO', 'CON_ERROR', 'NUEVO', 'BLOQUEADO'
+PRIORIDAD_PRE = {PRE_RECIBIDO: 3, PRE_CON_ERROR: 2, PRE_NUEVO: 1, PRE_BLOQUEADO: 0}
+
+# Filas CFDI:<UUID> (CFDI timbrados por Fenix, con XML del SAT)
+CFDI_SIN_LIGAR, CFDI_LIGADO = 'SIN_LIGAR', 'LIGADO'
+
+# Como se reconoce un CFDI timbrado por Fenix dentro de todo lo que emite la
+# empresa (medido en la descarga del SAT del 30-31 oct: 13,306 CFDI, solo 7
+# con esta combinacion; los nuestros son CVD110412TF6 'INV/2026/', Mercado
+# Libre TLE011122SC2 y Amazon EME000602QR9). El certificado es uno propio de
+# la empresa para Walmart (OU=Walmart).
+PAC_FENIX = os.getenv('WM_PAC_FENIX', 'ICA050422AA6').strip().upper()
+SERIE_FENIX = os.getenv('WM_SERIE_FENIX', 'FI').strip().upper()
+
+# El crawler de Data (wm_fenix_invoices_report) es opcional: si esta al dia,
+# da el UUID de cada linea; si no, se usa la fuente propia.
+USAR_CRAWLER = os.getenv('WM_USAR_CRAWLER', '1').strip() in ('1', 'true', 'TRUE')
+
+# Ligado CFDI -> peticion sin el crawler (ver ligar_cfdis). Validado contra el
+# crawler con los 232 CFDI de octubre-2026: 203 ligados, 0 errores.
+#  - Camino rapido: peticion entre VENTANA_MIN antes del timbrado y el
+#    timbrado, precio exacto, mismo UPC y una sola orden posible (110).
+#  - Folio con el pedido: algunos CFDI traen el pedido al inicio del Folio (3).
+#  - Tramo de folios: el Folio de la serie FI crece en el mismo orden que el
+#    cfdiid de la peticion (0 inversiones en octubre). Los CFDI sin ligar entre
+#    dos ya ligados solo pueden ser de las peticiones con cfdiid entre las de
+#    esos dos; se emparejan en orden y solo si hay UNA manera de hacerlo (90).
+VENTANA_LIGADO_MIN = int(os.getenv('WM_VENTANA_LIGADO_MIN', '30'))
+TOLERANCIA_PRECIO_LIGADO = 0.02
 
 STUCK_PROCESSING_MIN_AGE_HOURS = 6
 
@@ -351,6 +408,8 @@ def leer_cfdi(xml_bytes):
     impuestos = root.find('cfdi:Impuestos', ns)
     return {
         'uuid': normalizar_uuid(timbre.get('UUID')),
+        'pac': (timbre.get('RfcProvCertif') or '').strip().upper(),
+        'fecha_timbrado': timbre.get('FechaTimbrado'),
         'fecha': root.get('Fecha'),
         'serie': root.get('Serie'),
         'folio': root.get('Folio'),
@@ -373,6 +432,16 @@ def leer_cfdi(xml_bytes):
 
 def leer_cfdi_b64(xml_b64):
     return leer_cfdi(base64.b64decode(xml_b64))
+
+
+def es_cfdi_walmart(cfdi):
+    """CFDI de ingreso que timbro Fenix (el autofacturador de Walmart) a nuestro nombre."""
+    return (cfdi['emisor_rfc'] == RFC_EMISOR and cfdi['tipo'] == 'I'
+            and cfdi.get('pac') == PAC_FENIX and (cfdi.get('serie') or '').upper() == SERIE_FENIX)
+
+
+def cantidad_cfdi(cfdi):
+    return sum(c['cantidad'] for c in cfdi['conceptos']) or 1.0
 
 
 # =============================================================================
@@ -816,3 +885,310 @@ def frescura_ftm(cursor):
                       FROM somos_reyes.wm_financial_transactions_master""")
     fila = cursor.fetchone()
     return None if not fila or fila[0] is None else round(fila[0] / 60.0, 1)
+
+
+# =============================================================================
+# FUENTE PROPIA DE FENIX: lecturas, repositorio de CFDI y ligado
+# =============================================================================
+
+def frescura_etl_fenix(cursor):
+    """Horas desde la ultima corrida COMPLETA del ETL de la API de Fenix (00b)."""
+    cursor.execute(f"""SELECT TIMESTAMPDIFF(MINUTE, processed_at, NOW()) FROM {TBL_BILLING}
+                       WHERE marketplace = %s AND mkp_order_id = %s""", (MKP_FENIX, CLAVE_ETL))
+    fila = cursor.fetchone()
+    if not fila:
+        return None
+    valor = fila[0] if not isinstance(fila, dict) else next(iter(fila.values()))
+    return None if valor is None else round(valor / 60.0, 1)
+
+
+def _raw(valor):
+    return json.loads(valor) if isinstance(valor, (str, bytes)) else (valor or {})
+
+
+def precfdi_por_linea(cursor):
+    """{iderp: {estados}} de las peticiones de factura vistas en la API de Fenix."""
+    cursor.execute(f"""SELECT status, raw_json FROM {TBL_BILLING}
+                       WHERE marketplace = %s AND (mkp_order_id LIKE 'PRECFDI:%%'
+                                                   OR mkp_order_id LIKE 'BLOQUEADO:%%')""", (MKP_FENIX,))
+    por_linea = {}
+    for fila in cursor.fetchall():
+        status, raw = (fila['status'], fila['raw_json']) if isinstance(fila, dict) else fila
+        iderp = _raw(raw).get('iderp')
+        if iderp:
+            por_linea.setdefault(iderp, set()).add(status)
+    return por_linea
+
+
+def cfdis_ligados_por_linea(cursor):
+    """{iderp: [fila]} de los CFDI de Walmart del repositorio ya ligados a una linea.
+    La fila tiene la forma de una de wm_fenix_invoices_report, para que el miner
+    las trate igual."""
+    cursor.execute(f"""SELECT cfdi_uuid, total_amount, raw_json FROM {TBL_BILLING}
+                       WHERE marketplace = %s AND mkp_order_id LIKE 'CFDI:%%' AND status = %s""",
+                   (MKP_FENIX, CFDI_LIGADO))
+    por_linea = {}
+    for fila in cursor.fetchall():
+        uuid, total, raw = ((fila['cfdi_uuid'], fila['total_amount'], fila['raw_json'])
+                            if isinstance(fila, dict) else fila)
+        raw = _raw(raw)
+        if not raw.get('iderp'):
+            continue
+        por_linea.setdefault(raw['iderp'], []).append({
+            'uuid': normalizar_uuid(uuid), 'tipo_documento': 'I', 'pedido': raw.get('orden'),
+            'iderp': raw['iderp'], 'cantidad': int(round(a_float(raw.get('cantidad')) or 1)),
+            'subtotal': None, 'descuento': None, 'total_factura': a_float(total),
+            'estado_cfdi': 'CON_XML_PDF', 'rfc_receptor': raw.get('receptor_rfc'),
+            'fecha_creacion': (raw.get('fecha') or '').replace('T', ' '),
+            'origen': f"SAT/{raw.get('metodo')}"})
+    return por_linea
+
+
+def resumen_cfdi(cfdi):
+    return {'fecha': cfdi['fecha'], 'total': cfdi['total'], 'cantidad': cantidad_cfdi(cfdi),
+            'receptor_rfc': cfdi['receptor_rfc'], 'receptor_nombre': cfdi['receptor_nombre'],
+            'serie': cfdi['serie'], 'folio': cfdi['folio'],
+            'upc': cfdi['conceptos'][0]['no_identificacion'] if cfdi['conceptos'] else None}
+
+
+def guardar_cfdis_walmart(db, cfdis, dry_run=False):
+    """Repositorio de CFDI de Walmart: inserta una fila CFDI:<UUID> por cada
+    (xml_bytes, cfdi) que no exista. Una fila ya ligada no se toca."""
+    if dry_run or not cfdis:
+        return
+    cur = db.cursor()
+    for bloque in lotes(cfdis, 200):
+        cur.executemany(f"""
+            INSERT INTO {TBL_BILLING} (marketplace, mkp_order_id, cfdi_uuid, total_amount, xml_data,
+                                       raw_json, status, retry_count, retry_count_loader, processed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0, NOW())
+            ON DUPLICATE KEY UPDATE xml_data = COALESCE(xml_data, VALUES(xml_data))
+        """, [(MKP_FENIX, f"CFDI:{c['uuid']}", c['uuid'], round(c['total'], 2),
+               base64.b64encode(x).decode('ascii'), a_json(resumen_cfdi(c)), CFDI_SIN_LIGAR)
+              for x, c in bloque])
+        db.commit()
+    cur.close()
+
+
+def _lineas_ftm(cursor, iderps):
+    """{iderp: (precio_unitario, cantidad)} de FTM."""
+    res = {}
+    for chunk in lotes(sorted(iderps), 500):
+        cursor.execute(f"""
+            SELECT so_prime_line_sub_line_no, price_amount, quantity
+            FROM somos_reyes.wm_financial_transactions_master
+            WHERE type = 'Order' AND so_prime_line_sub_line_no IN ({','.join(['%s'] * len(chunk))})
+        """, tuple(chunk))
+        for k, precio, qty in cursor.fetchall():
+            q = max(int(qty or 1), 1)
+            res[k] = (a_float(precio) / q, q)
+    return res
+
+
+def upc_por_linea(cursor, iderps):
+    """{iderp: UPC sin ceros a la izquierda} de wm_order_line (API de Walmart).
+    Es el NoIdentificacion del CFDI de Walmart (232 de 232 en octubre-2026)."""
+    res = {}
+    for chunk in lotes(sorted(i for i in iderps if i), 500):
+        cursor.execute(f"""
+            SELECT so_prime_line_sub_line_no, upc FROM somos_reyes.wm_order_line
+            WHERE so_prime_line_sub_line_no IN ({','.join(['%s'] * len(chunk))}) AND upc IS NOT NULL AND upc <> ''
+        """, tuple(chunk))
+        for k, upc in cursor.fetchall():
+            res[k] = str(upc).strip().lstrip('0')
+    return res
+
+
+def _folio_secuencial(raw):
+    """Folio numerico de la serie de Fenix, o None (otra serie o folio con el pedido)."""
+    folio = str(raw.get('folio') or '').strip()
+    if str(raw.get('serie') or '').strip().upper() != SERIE_FENIX or not folio.isdigit() or len(folio) > 9:
+        return None
+    return int(folio)
+
+
+def _emparejar_en_orden(cfdis, peticiones, cuadra):
+    """Empareja cada CFDI (en orden de folio) con una peticion (en orden de
+    cfdiid) sin cruzarse. Devuelve la lista de pares solo si hay UNA manera de
+    hacerlo en la que todos los pares cuadren; si hay cero o varias, None.
+
+    formas[i][j] = cuantas maneras hay de emparejar cfdis[i:] con
+    peticiones[j:] (con tope 2: solo importa si es una o mas de una)."""
+    n, m = len(cfdis), len(peticiones)
+    if n == 0 or m < n:
+        return None
+    ok = [[cuadra(peticiones[j], cfdis[i]) for j in range(m)] for i in range(n)]
+    formas = [[0] * (m + 1) for _ in range(n + 1)]
+    formas[n] = [1] * (m + 1)
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            formas[i][j] = min(2, formas[i][j + 1] + (formas[i + 1][j + 1] if ok[i][j] else 0))
+    if formas[0][0] != 1:
+        return None
+    pares, i = [], 0
+    for j in range(m):
+        if i < n and ok[i][j] and formas[i + 1][j + 1] == 1 and formas[i][j + 1] == 0:
+            pares.append((cfdis[i], peticiones[j]))
+            i += 1
+    return pares if i == n else None
+
+
+def ligar_cfdis(db, dry_run=False):
+    """Liga cada CFDI:<UUID> SIN_LIGAR con su linea de Walmart (iderp) y su
+    peticion (cfdiid). Una linea no recibe mas CFDI que piezas vendidas y una
+    peticion no recibe mas de un CFDI. Un par "cuadra" si precio unitario de
+    FTM x cantidad del XML = total (+-0.02), el UPC del XML es el de la linea
+    (wm_order_line) y la peticion es anterior al timbrado.
+
+    1. Crawler (si WM_USAR_CRAWLER y trae el UUID): liga exacta.
+    2. Folio que empieza con el numero de pedido: una sola orden posible.
+    3. Camino rapido: peticion RECIBIDO entre 0 y VENTANA_LIGADO_MIN minutos
+       antes de la Fecha del XML y una sola orden posible.
+    4. Tramo de folios: los CFDI sin ligar entre dos CFDI ligados (por folio)
+       se emparejan, en orden, con las peticiones libres cuyo cfdiid esta entre
+       los de esos dos; solo si hay una sola manera. Se repite mientras ligue.
+    Lo demas queda SIN_LIGAR (no se adivina: un CFDI pegado a la orden
+    equivocada no se corrige despues). Devuelve un Counter."""
+    stats = Counter()
+    cur = db.cursor()
+    cur.execute(f"""SELECT id, cfdi_uuid, raw_json, status FROM {TBL_BILLING}
+                    WHERE marketplace = %s AND mkp_order_id LIKE 'CFDI:%%'""", (MKP_FENIX,))
+    filas, usos, usados = {}, Counter(), set()
+    for rid, uuid, raw, status in cur.fetchall():
+        raw = _raw(raw)
+        uuid = normalizar_uuid(uuid)
+        filas[uuid] = {'id': rid, 'raw': raw, 'status': status}
+        if status == CFDI_LIGADO and raw.get('iderp'):
+            usos[raw['iderp']] += int(round(a_float(raw.get('cantidad')) or 1))
+            if raw.get('cfdiid'):
+                usados.add(int(raw['cfdiid']))
+    sueltos = [u for u, f in filas.items() if f['status'] == CFDI_SIN_LIGAR]
+    if not sueltos:
+        cur.close()
+        return stats
+
+    ligas = {}
+
+    def ligar(uuid, iderp, orden, cfdiid, metodo):
+        ligas[uuid] = {'iderp': iderp, 'orden': orden, 'cfdiid': cfdiid, 'metodo': metodo}
+        usos[iderp] += int(round(a_float(filas[uuid]['raw'].get('cantidad')) or 1))
+        if cfdiid:
+            usados.add(int(cfdiid))
+
+    if USAR_CRAWLER:
+        for chunk in lotes(sueltos, 500):
+            cur.execute(f"""SELECT UPPER(uuid), iderp, pedido, identificador FROM somos_reyes.wm_fenix_invoices_report
+                            WHERE tipo_documento = 'I' AND UPPER(uuid) IN ({','.join(['%s'] * len(chunk))})""",
+                        tuple(chunk))
+            for u, iderp, pedido, ident in cur.fetchall():
+                ligar(normalizar_uuid(u), iderp, str(pedido), int(ident) if ident else None, 'crawler')
+
+    cur.execute(f"""SELECT raw_json FROM {TBL_BILLING}
+                    WHERE marketplace = %s AND mkp_order_id LIKE 'PRECFDI:%%' AND status = %s""",
+                (MKP_FENIX, PRE_RECIBIDO))
+    pres = []
+    for (raw,) in cur.fetchall():
+        raw = _raw(raw)
+        if raw.get('cfdiid') and raw.get('iderp'):
+            pres.append({'cfdiid': int(raw['cfdiid']), 'iderp': raw['iderp'], 'orden': str(raw.get('orderno')),
+                         't': a_datetime(raw['peticion_cdmx']) if raw.get('peticion_cdmx') else None})
+    pres.sort(key=lambda p: p['cfdiid'])
+    # Anclas ya ligadas en corridas anteriores, por cfdiid (para los tramos)
+    for f in filas.values():
+        if f['status'] == CFDI_LIGADO and f['raw'].get('cfdiid'):
+            f['cfdiid'] = int(f['raw']['cfdiid'])
+    ftm = _lineas_ftm(cur, {p['iderp'] for p in pres})
+    upcs = upc_por_linea(cur, {p['iderp'] for p in pres})
+
+    datos = {}
+    for u in sueltos:
+        raw = filas[u]['raw']
+        try:
+            fecha = datetime.fromisoformat(str(raw['fecha'])[:19])
+        except (KeyError, ValueError):
+            stats['sin_ligar_sin_fecha'] += 1
+            continue
+        datos[u] = {'uuid': u, 'fecha': fecha, 'cant': a_float(raw.get('cantidad')) or 1.0,
+                    'total': a_float(raw.get('total')), 'upc': str(raw.get('upc') or '').strip().lstrip('0'),
+                    'folio': str(raw.get('folio') or '').strip()}
+
+    def cuadra(p, c):
+        k = p['iderp']
+        return (p['cfdiid'] not in usados and k in ftm
+                and (p['t'] is None or p['t'] <= c['fecha'])
+                and abs(ftm[k][0] * c['cant'] - c['total']) <= TOLERANCIA_PRECIO_LIGADO
+                and usos[k] + c['cant'] <= ftm[k][1]
+                and (not upcs.get(k) or not c['upc'] or upcs[k] == c['upc']))
+
+    def unica_orden(c, cand, metodo, elegir):
+        if len({p['orden'] for p in cand}) == 1:
+            p = elegir(cand)
+            ligar(c['uuid'], p['iderp'], p['orden'], p['cfdiid'], metodo)
+
+    # 2. Folio con el pedido al inicio
+    for c in datos.values():
+        if c['uuid'] not in ligas and len(c['folio']) >= 15:
+            unica_orden(c, [p for p in pres if c['folio'].startswith(p['orden']) and cuadra(p, c)],
+                        'folio_pedido', lambda cand: min(cand, key=lambda q: q['cfdiid']))
+    # 3. Camino rapido
+    ventana = timedelta(minutes=VENTANA_LIGADO_MIN)
+    for c in sorted(datos.values(), key=lambda d: d['fecha']):
+        if c['uuid'] not in ligas:
+            unica_orden(c, [p for p in pres if p['t'] and timedelta(0) <= c['fecha'] - p['t'] <= ventana
+                            and cuadra(p, c)],
+                        'api_ventana', lambda cand: max(cand, key=lambda q: q['t']))
+    # 4. Tramos de folio entre anclas
+    ids = [p['cfdiid'] for p in pres]
+    cambio = True
+    while cambio:
+        cambio = False
+        secuencia = []   # (folio, uuid, cfdiid del ancla o None)
+        for u, f in filas.items():
+            folio = _folio_secuencial(f['raw'])
+            if folio is None:
+                continue
+            if u in ligas:
+                if ligas[u]['cfdiid']:
+                    secuencia.append((folio, u, ligas[u]['cfdiid']))
+            elif f['status'] == CFDI_LIGADO:
+                if f.get('cfdiid'):
+                    secuencia.append((folio, u, f['cfdiid']))
+            elif u in datos:
+                secuencia.append((folio, u, None))
+        secuencia.sort()
+        anclas = [i for i, s in enumerate(secuencia) if s[2]]
+        for i1, i2 in zip(anclas, anclas[1:]):
+            tramo = [datos[s[1]] for s in secuencia[i1 + 1:i2] if s[1] not in ligas]
+            lo, hi = secuencia[i1][2], secuencia[i2][2]
+            if not tramo or hi <= lo:
+                continue
+            libres = [p for p in pres[bisect.bisect_right(ids, lo):bisect.bisect_left(ids, hi)]
+                      if p['cfdiid'] not in usados]
+            pares = _emparejar_en_orden(tramo, libres, cuadra)
+            if not pares:
+                continue
+            # cuadra() se evaluo par por par: confirmar que juntos no rebasan las piezas de una linea
+            piezas = Counter()
+            for c, p in pares:
+                piezas[p['iderp']] += c['cant']
+            if any(usos[k] + n > ftm[k][1] for k, n in piezas.items()):
+                continue
+            for c, p in pares:
+                ligar(c['uuid'], p['iderp'], p['orden'], p['cfdiid'], 'folio_tramo')
+            cambio = True
+
+    for u in sueltos:
+        if u not in ligas:
+            stats['sin_ligar'] += 1
+    for u, l in ligas.items():
+        stats[f"ligado_{l['metodo']}"] += 1
+        if dry_run:
+            continue
+        f = filas[u]
+        f['raw'].update(l, ligado_en=f"{ahora_cdmx():%Y-%m-%d %H:%M:%S}")
+        cur.execute(f"""UPDATE {TBL_BILLING} SET status = %s, raw_json = %s, processed_at = NOW()
+                        WHERE id = %s AND status = %s""", (CFDI_LIGADO, a_json(f['raw']), f['id'], CFDI_SIN_LIGAR))
+    if not dry_run:
+        db.commit()
+    cur.close()
+    return stats

@@ -43,7 +43,7 @@ tasks:
 
       - id: carga_xml
         type: io.kestra.plugin.scripts.shell.Commands
-        containerImage: wonderbrands-python:v1
+        containerImage: wonderbrands-python:v2.0
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER

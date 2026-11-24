@@ -12,16 +12,32 @@ DOS FUENTES
   ZIP (respaldo)     WM_XML_PATH = carpeta o .zip con los XML que descarga
                      Finanzas. Si la variable viene llena, se usa el ZIP y no
                      se llama al SAT.
-En los dos casos el XML va directo a mkp_billing.xml_data de la fila del
-UUID. Los XML que no son de una fila pendiente se descartan: no se guarda un
-repositorio intermedio.
+REPOSITORIO DE CFDI DE WALMART. Todo XML timbrado por Fenix (PAC
+ICA050422AA6, serie FI, nuestro RFC, tipo I) se guarda como fila CFDI:<UUID>
+con marketplace='WALMART_FENIX', este o no pendiente. Despues:
+  * las filas PENDING_WM_XML toman su XML del repositorio por UUID;
+  * ligar_cfdis() liga los CFDI sueltos con su linea (crawler si lo hay;
+    sin el: camino rapido, folio con el pedido y tramos de folio contra las
+    peticiones de la API de Fenix). El miner (segunda pasada en el flujo)
+    convierte esas ligas en filas <orden>:<UUID>.
+El resto de lo que emite la empresa (Mercado Libre, Amazon, publico general)
+se descarta.
 
 COMO SE PIDE AL SAT (asincrono: lo que se pide hoy se descarga en otra corrida)
   1. Avanzar lo pedido antes: verificar las solicitudes abiertas y descargar
      sus paquetes.
-  2. Pedir por DIA: para cada dia con CFDI de Walmart pendientes (fecha de
-     Fenix), una solicitud de CFDI EMITIDOS, tipo I, vigentes, de 00:00:00 a
-     23:59:59. Solo dias ya cerrados (anteriores a hoy en CDMX).
+  2. Pedir por DIA: una solicitud de CFDI EMITIDOS, tipo I, vigentes, de
+     00:00:00 a 23:59:59, para cada dia con
+       - CFDI de Walmart con UUID conocido y sin XML (fecha del crawler), o
+       - ordenes PENDING_WM_UUID: el dia de la peticion de factura (API de
+         Fenix) y los WM_SAT_DIAS_TRAS_PETICION siguientes, y
+       - BARRIDO: cada uno de los ultimos WM_SAT_DIAS_BARRIDO dias, haya o no
+         pendientes. Asi todo CFDI de Fenix llega al repositorio al dia
+         siguiente aunque la API no tenga su peticion (pasa: el pedido
+         600000121084541 tiene CFDI vigente y no sale en ninguna lista de la
+         API). 04 no timbra una orden si hay un CFDI de Walmart sin ligar que
+         podria ser suyo.
+     Solo dias ya cerrados (anteriores a hoy en CDMX).
   3. Pedir por FOLIO lo que siga faltando despues de descargar su dia (por
      ejemplo, un CFDI timbrado cerca de medianoche con la fecha de Fenix en el
      dia vecino).
@@ -44,6 +60,8 @@ Variables:
   SAT_FIEL_CER_PATH / _B64, SAT_FIEL_KEY_PATH / _B64, SAT_FIEL_PASSWORD
   WM_SAT_MAX_SOLICITUDES     solicitudes nuevas por dia en una corrida (10)
   WM_SAT_MAX_FOLIOS          solicitudes por folio en una corrida (20)
+  WM_SAT_DIAS_TRAS_PETICION  dias despues de la peticion de factura que se piden (1)
+  WM_SAT_DIAS_BARRIDO        ultimos dias cerrados que se piden siempre (7; 0 = sin barrido)
   WM_DRY_RUN=1               no escribe ni llama al SAT; dice que haria
 """
 
@@ -62,14 +80,17 @@ if _dir not in sys.path:
     sys.path.append(_dir)
 
 from _wm_common import (configurar_log, log, banner, get_db_connection, leer_cfdi, notify_slack,
-                        a_json, ahora_cdmx, TBL_BILLING, MARKETPLACE, RFC_EMISOR,
-                        ST_PENDING_WM_XML, ST_PENDING_WM_LINK, lotes)
+                        a_json, ahora_cdmx, a_datetime, TBL_BILLING, MARKETPLACE, RFC_EMISOR,
+                        ST_PENDING_WM_XML, ST_PENDING_WM_LINK, ST_PENDING_WM_UUID, lotes,
+                        MKP_FENIX, PRE_RECIBIDO, es_cfdi_walmart, guardar_cfdis_walmart, ligar_cfdis)
 import _sat_descarga as sat
 
 DRY_RUN = os.getenv('WM_DRY_RUN', '0').strip() in ('1', 'true', 'TRUE')
 WM_XML_PATH = os.getenv('WM_XML_PATH', '').strip()
 MAX_SOLICITUDES = int(os.getenv('WM_SAT_MAX_SOLICITUDES', '10'))
 MAX_FOLIOS = int(os.getenv('WM_SAT_MAX_FOLIOS', '20'))
+DIAS_TRAS_PETICION = int(os.getenv('WM_SAT_DIAS_TRAS_PETICION', '1'))
+DIAS_BARRIDO = int(os.getenv('WM_SAT_DIAS_BARRIDO', '7'))
 
 MKP_SAT = 'SAT_DESCARGA'
 SAT_SOLICITADA, SAT_TERMINADA, SAT_DESCARGADA = 'SOLICITADA', 'TERMINADA', 'DESCARGADA'
@@ -115,8 +136,9 @@ def xml_de_carpeta(ruta, solo_uuids=None):
 
 
 def aplicar_xmls(db, xmls, stats):
-    """Guarda cada XML de Walmart en su fila PENDING_WM_XML. Devuelve los UUID cargados."""
-    validos = {}
+    """Guarda en el repositorio cada CFDI timbrado por Fenix y pone el XML en
+    su fila PENDING_WM_XML si la hay. Devuelve los UUID cargados a filas."""
+    validos, repositorio = {}, []
     for nombre, contenido in xmls:
         stats['xml_leidos'] += 1
         try:
@@ -128,7 +150,11 @@ def aplicar_xmls(db, xmls, stats):
         if cfdi['emisor_rfc'] != RFC_EMISOR or cfdi['tipo'] != 'I':
             stats['xml_no_aplican'] += 1
             continue
+        if es_cfdi_walmart(cfdi) and cfdi['uuid'] not in validos:
+            repositorio.append((contenido, cfdi))
         validos.setdefault(cfdi['uuid'], contenido)
+    stats['xml_de_walmart_al_repositorio'] += len(repositorio)
+    guardar_cfdis_walmart(db, repositorio, dry_run=DRY_RUN)
 
     cur = db.cursor()
     pendientes = {}
@@ -204,6 +230,44 @@ def pendientes_por_dia(db):
             por_dia.setdefault(fecha[:10], set()).add(uuid.upper())
     cur.close()
     return por_dia
+
+
+def dias_por_peticion(db):
+    """Dias a pedir para las ordenes PENDING_WM_UUID: el de cada peticion de
+    factura RECIBIDA (API de Fenix) y los DIAS_TRAS_PETICION siguientes."""
+    cur = db.cursor()
+    cur.execute(f"SELECT mkp_order_id FROM {TBL_BILLING} WHERE marketplace = %s AND status = %s",
+                (MARKETPLACE, ST_PENDING_WM_UUID))
+    pedidos = {r[0] for r in cur.fetchall()}
+    dias = set()
+    if pedidos:
+        cur.execute(f"""SELECT raw_json FROM {TBL_BILLING}
+                        WHERE marketplace = %s AND mkp_order_id LIKE 'PRECFDI:%%' AND status = %s""",
+                    (MKP_FENIX, PRE_RECIBIDO))
+        for (raw,) in cur.fetchall():
+            raw = json.loads(raw) if isinstance(raw, (str, bytes)) else (raw or {})
+            if raw.get('orderno') in pedidos and raw.get('peticion_cdmx'):
+                d = a_datetime(raw['peticion_cdmx'])
+                for i in range(DIAS_TRAS_PETICION + 1):
+                    dias.add(f"{d + timedelta(days=i):%Y-%m-%d}")
+    cur.close()
+    return dias
+
+
+def llenar_desde_repositorio(db, stats):
+    """Las filas PENDING_WM_XML cuyo UUID ya esta en el repositorio toman de ahi su XML."""
+    if DRY_RUN:
+        return
+    cur = db.cursor()
+    cur.execute(f"""
+        UPDATE {TBL_BILLING} b
+        JOIN {TBL_BILLING} r ON r.marketplace = %s AND r.mkp_order_id = CONCAT('CFDI:', b.cfdi_uuid)
+        SET b.xml_data = r.xml_data, b.status = %s, b.processed_at = NOW(), b.error_log = NULL
+        WHERE b.marketplace = %s AND b.status = %s AND r.xml_data IS NOT NULL
+    """, (MKP_FENIX, ST_PENDING_WM_LINK, MARKETPLACE, ST_PENDING_WM_XML))
+    stats['xml_desde_repositorio'] += cur.rowcount
+    db.commit()
+    cur.close()
 
 
 def puede_pedirse(fila):
@@ -294,10 +358,10 @@ def pedir(db, sesion, clave, fila, funcion, stats):
         log.warning(f"{clave}: el SAT no acepto la solicitud: {r['cod_estatus']} {r['mensaje']}")
 
 
-def pedir_dias(db, sesion, solicitudes, por_dia, stats):
+def pedir_dias(db, sesion, solicitudes, dias, stats):
     hoy = f"{ahora_cdmx():%Y-%m-%d}"
     nuevas = 0
-    for dia in sorted(por_dia):
+    for dia in sorted(dias):
         if dia >= hoy or nuevas >= MAX_SOLICITUDES:
             continue
         clave = f"EMITIDOS:{dia}"
@@ -349,8 +413,15 @@ def modo_sat(db, stats):
     if not DRY_RUN:
         avanzar_abiertas(db, sesion, solicitudes, stats)
     por_dia = pendientes_por_dia(db)
-    log.info(f"CFDI de Walmart sin XML: {sum(len(v) for v in por_dia.values())} en {len(por_dia)} dia(s)")
-    pedir_dias(db, sesion, solicitudes, por_dia, stats)
+    dias_pet = dias_por_peticion(db)
+    hoy = ahora_cdmx()
+    barrido = {f"{hoy - timedelta(days=i):%Y-%m-%d}" for i in range(1, DIAS_BARRIDO + 1)}
+    log.info(f"CFDI de Walmart sin XML: {sum(len(v) for v in por_dia.values())} en {len(por_dia)} dia(s) | "
+             f"dias por peticiones sin ligar (PENDING_WM_UUID): {len(dias_pet)} | barrido: {len(barrido)} dia(s)")
+    # Primero el barrido (lo mas reciente protege a 04), luego lo demas.
+    pedir_dias(db, sesion, solicitudes, barrido, stats)
+    solicitudes = leer_solicitudes(db) if not DRY_RUN else solicitudes
+    pedir_dias(db, sesion, solicitudes, set(por_dia) | dias_pet, stats)
     pedir_folios(db, sesion, solicitudes, por_dia, stats)
 
 
@@ -360,16 +431,21 @@ def main():
     db = get_db_connection()
     stats = Counter()
     try:
+        llenar_desde_repositorio(db, stats)
         if WM_XML_PATH:
             if not os.path.exists(WM_XML_PATH):
                 raise Exception(f"No existe WM_XML_PATH={WM_XML_PATH}")
             pendientes = {u for us in pendientes_por_dia(db).values() for u in us}
             log.info(f"CFDI de Walmart esperando XML: {len(pendientes)}")
-            origen = (xml_de_carpeta(WM_XML_PATH, pendientes) if os.path.isdir(WM_XML_PATH)
-                      else xml_de_zip(WM_XML_PATH))
+            # Se leen todos los XML (no solo los pendientes): los de Walmart
+            # van al repositorio para ligarlos.
+            origen = xml_de_carpeta(WM_XML_PATH) if os.path.isdir(WM_XML_PATH) else xml_de_zip(WM_XML_PATH)
             aplicar_xmls(db, origen, stats)
         else:
             modo_sat(db, stats)
+        ligas = ligar_cfdis(db, dry_run=DRY_RUN)
+        for k, v in ligas.items():
+            stats[f"repositorio_{k}"] += v
     except Exception as e:
         # No se corta el flujo: 03 replica lo que ya tiene XML y 04 emite lo suyo.
         log.exception('02 fallo')

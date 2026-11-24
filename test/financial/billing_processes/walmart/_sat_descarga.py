@@ -371,3 +371,34 @@ class SesionSAT:
         if not self._token or datetime.now(timezone.utc) - self._desde > timedelta(minutes=4):
             self._token, self._desde = autenticar(self.fiel), datetime.now(timezone.utc)
         return self._token
+
+
+# =============================================================================
+# ESTADO DE UN CFDI (servicio publico, sin e.firma)
+# =============================================================================
+# El mismo que usa el codigo QR de las facturas impresas. Responde Vigente,
+# Cancelado o No Encontrado (un CFDI recien timbrado puede tardar en aparecer).
+
+URL_CONSULTA = 'https://consultaqr.facturaelectronica.sat.gob.mx/ConsultaCFDIService.svc'
+ACCION_CONSULTA = 'http://tempuri.org/IConsultaCFDIService/Consulta'
+
+
+def consultar_estado(rfc_emisor, rfc_receptor, total, uuid):
+    """{'estado': 'Vigente'|'Cancelado'|'No Encontrado', 'codigo': ..., 'es_cancelable': ...,
+    'estatus_cancelacion': ...}. Lanza ErrorSAT si el servicio no responde."""
+    expresion = f"?re={rfc_emisor}&rr={rfc_receptor}&tt={float(total):.6f}&id={uuid}"
+    sobre = ('<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+             '<Consulta xmlns="http://tempuri.org/"><expresionImpresa>' + escape(expresion) +
+             '</expresionImpresa></Consulta></s:Body></s:Envelope>')
+    req = urllib.request.Request(URL_CONSULTA, data=sobre.encode('utf-8'), method='POST',
+                                 headers={'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': ACCION_CONSULTA})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            texto = r.read().decode('utf-8', 'replace')
+    except Exception as e:
+        raise ErrorSAT(f"Consulta de estado de {uuid}: {e}")
+    campos = dict(re.findall(r'<a:(CodigoEstatus|Estado|EsCancelable|EstatusCancelacion)>([^<]*)<', texto))
+    if 'Estado' not in campos:
+        raise ErrorSAT(f"Consulta de estado de {uuid}: respuesta sin Estado")
+    return {'estado': campos.get('Estado'), 'codigo': campos.get('CodigoEstatus'),
+            'es_cancelable': campos.get('EsCancelable'), 'estatus_cancelacion': campos.get('EstatusCancelacion')}

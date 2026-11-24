@@ -10,8 +10,9 @@ Revisa:
      Team_Walmart (nombre exacto).
   3. Que las transacciones de Walmart (FTM) esten al dia. Sin FTM no hay
      universo de venta: se aborta.
-  4. Que Fenix este al dia. Si no lo esta NO se aborta (03 puede replicar los
-     CFDI que ya tienen XML), pero 04 no va a emitir nada: se avisa.
+  4. Que esten las credenciales de la API de Fenix (00b). Sin ellas no se
+     aborta (03 puede replicar), pero 04 no emitira: se avisa. La frescura del
+     crawler (wm_fenix_invoices_report) solo se informa: es opcional.
   5. Que la e.firma (si esta configurada) abra, sea de SRE1410278MA y este
      vigente. Si falla tampoco se aborta: solo 02 se queda sin descargar.
 """
@@ -25,10 +26,10 @@ if _dir not in sys.path:
 
 from _wm_common import (configurar_log, log, banner, validar_entorno, notify_slack,
                         get_db_connection, OdooModelProxy, cargar_catalogos,
-                        frescura_ftm, frescura_fenix)
+                        frescura_ftm, frescura_fenix, USAR_CRAWLER)
+import _fenix_api as fenix
 
 FTM_MAX_HORAS = float(os.getenv('WM_FTM_MAX_HORAS', '36'))
-FENIX_MAX_HORAS = float(os.getenv('WM_FENIX_MAX_HORAS', '48'))
 
 
 def main():
@@ -74,14 +75,15 @@ def main():
     db.close()
 
     log.info(f"FTM: ultima actualizacion hace {h_ftm} h (maximo {FTM_MAX_HORAS})")
-    log.info(f"Fenix: ultima carga hace {h_fenix} h (maximo {FENIX_MAX_HORAS})")
+    log.info(f"Crawler de Fenix (opcional, {'en uso' if USAR_CRAWLER else 'apagado'}): "
+             f"ultima carga hace {h_fenix} h")
 
     if h_ftm is None or h_ftm > FTM_MAX_HORAS:
         errores.append(f"FTM sin actualizar hace {h_ftm} h: sin universo de venta confiable.")
 
-    if h_fenix is None or h_fenix > FENIX_MAX_HORAS:
-        aviso = (f"Walmart: Fenix lleva {h_fenix} h sin cargarse. 04 NO emitira "
-                 f"facturas de WB hasta que se actualice (no sabemos si Walmart ya facturo).")
+    if not fenix.credenciales_configuradas():
+        aviso = ('Walmart: faltan FENIX_WALMART_USER / FENIX_WALMART_PASSWORD. 00b no consultara la API de '
+                 'Fenix y 04 NO emitira facturas de WB.')
         log.warning(aviso)
         notify_slack(aviso)
 

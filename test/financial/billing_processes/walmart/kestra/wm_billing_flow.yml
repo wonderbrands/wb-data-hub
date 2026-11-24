@@ -5,9 +5,11 @@
 id: wm_billing_flow
 namespace: wonderbrands.financial.walmart
 description: |
-  Walmart 3P (Team_Walmart): miner (01), XML de los CFDI autofacturados en
-  Walmart por descarga masiva del SAT (02), replica de esos CFDI sin timbrar
-  (03), factura a publico general timbrada por WB (04) y control (05).
+  Walmart 3P (Team_Walmart): ETL de la API de Fenix (00b: que lineas pidieron
+  factura en Walmart), miner (01), XML de los CFDI autofacturados en Walmart
+  por descarga masiva del SAT y ligado con su linea (02), segunda pasada del
+  miner con lo ligado, replica de esos CFDI sin timbrar (03), factura a
+  publico general timbrada por WB (04) y control (05).
   Respaldo manual del XML: wm_carga_xml_flow (02 con el ZIP de Finanzas).
   Team_Walmart ya esta excluido del 1a1. Este flujo reemplaza
   invoice_creation_1a1_local_V18.py e invoice_creation_qtyV18.py.
@@ -64,7 +66,8 @@ tasks:
       - id: walmart
         type: io.kestra.plugin.scripts.shell.Commands
         timeout: PT6H
-        containerImage: wonderbrands-python:v1
+        # v2.0 reconstruida con cryptography (docker/python_librariesv2.Dockerfile).
+        containerImage: wonderbrands-python:v2.0
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
@@ -86,8 +89,15 @@ tasks:
           WM_MAX_FACTURAS: "{{ inputs.max_facturas ?? '' }}"
           WM_GRACE_DAYS: "5"          # decision pendiente de Finanzas
           WM_DIAS_CIERRE_MES: "2"     # una corrida por dia: dias 1 y 2
-          WM_FENIX_MAX_HORAS: "48"
+          # 04 no emite si la ultima corrida buena de 00b (API de Fenix) es mas
+          # vieja que esto. 00b corre en este mismo flujo minutos antes.
+          WM_FENIX_MAX_HORAS: "6"
+          # Crawler de Data (wm_fenix_invoices_report): opcional. Sin el se
+          # liga ~87% (camino rapido + folio); si trae el UUID, liga el resto.
+          WM_USAR_CRAWLER: "1"
           WM_REPORTE_DIR: "."
+          FENIX_WALMART_USER: "{{ secret('FENIX_WALMART_USER') }}"
+          FENIX_WALMART_PASSWORD: "{{ secret('FENIX_WALMART_PASSWORD') }}"
           # e.firma de SRE1410278MA para la descarga masiva del SAT (02).
           # Secrets en el .env de Kestra del EC2 (ver README_WALMART.md).
           SAT_FIEL_CER_B64: "{{ secret('SAT_FIEL_CER_B64') }}"
@@ -95,14 +105,25 @@ tasks:
           SAT_FIEL_PASSWORD: "{{ secret('SAT_FIEL_PASSWORD') }}"
           WM_SAT_MAX_SOLICITUDES: "10"
           WM_SAT_MAX_FOLIOS: "20"
+          WM_SAT_DIAS_TRAS_PETICION: "1"
+          # Barrido: pide siempre los ultimos 7 dias cerrados (1 solicitud por dia).
+          WM_SAT_DIAS_BARRIDO: "7"
+          # 04 detiene una orden si hay un CFDI de Walmart sin ligar que podria
+          # ser suyo, timbrado hasta 7 dias despues de la venta (0 = apagado).
+          WM_B2_DIAS: "7"
         commands:
-          # 00 corta todo si falla. Si Fenix no esta al dia o la e.firma falla
-          # NO corta: avisa; 04 se niega a emitir y 02 a descargar por su cuenta.
+          # 00 corta todo si falla. Si faltan las credenciales de Fenix o la
+          # e.firma falla NO corta: avisa; 04 se niega a emitir y 02 a descargar.
           - python {{ vars.scripts }}/00_wm_precheck.py
+          # 00b nunca corta: si la API falla no actualiza su marca y 04 no emite.
+          - python {{ vars.scripts }}/00b_wm_fenix_etl.py
           - python {{ vars.scripts }}/01_wm_miner.py
           # 02 nunca corta el flujo: un error del SAT se avisa y se reintenta
           # en la siguiente corrida.
           - python {{ vars.scripts }}/02_wm_xml_loader.py
+          # Segunda pasada: convierte en filas <orden>:<UUID> lo que 02 acaba
+          # de ligar, para que 03 lo replique en esta misma corrida.
+          - python {{ vars.scripts }}/01_wm_miner.py
           - python {{ vars.scripts }}/03_wm_loader_pull.py
           - |
             if [ "{{ inputs.emitir_wb }}" = "true" ]; then
@@ -133,5 +154,5 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK') }}"
     payload: |
       {
-        "text": "🚨 *Fallo en el pipeline de Walmart (00-01-02-03-04-05)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecucion:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}\n_Si la causa es CONCURRENCY_LIMIT, otra ejecucion sigue activa: NO relanzar a mano._"
+        "text": "🚨 *Fallo en el pipeline de Walmart (00-00b-01-02-01-03-04-05)* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecucion:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}\n_Si la causa es CONCURRENCY_LIMIT, otra ejecucion sigue activa: NO relanzar a mano._"
       }

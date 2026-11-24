@@ -22,6 +22,9 @@ Por cada fila:
        - cualquier otra (AUTOINV:<SO> a publico general, global, manual
          con otro UUID)                                        -> DOBLE_CFDI
      Si la consulta falla, no se crea.
+  5b. ESTADO EN EL SAT (servicio publico de consulta): solo se replica un CFDI
+     Vigente. Cancelado -> WM_CFDI_NO_VIGENTE. No Encontrado o el servicio no
+     responde -> se queda PENDING_WM_LINK para la siguiente corrida.
   6. create con ref AUTOINV:<SO>:<UUID> -> base y CxC 105.01.007 -> UUID y
      narration -> IVA al centavo del CFDI -> XML adjunto -> action_post.
   7. 205.06.003 contra la salida y chatter.
@@ -53,7 +56,8 @@ from _wm_common import (configurar_log, log, banner, validar_entorno, notify_sla
                         CLIENTE_TELEFONO_GENERICO, CLIENTE_CORREO_GENERICO,
                         ST_PENDING_WM_LINK, ST_WM_LINKED, ST_DOBLE_CFDI, ST_NO_SO,
                         ST_SO_CANCELADA, ST_SO_OTRO_EQUIPO, ST_TOTAL_DIFF,
-                        ST_XML_INVALIDO, ST_ERROR, ST_BORRADOR_AJENO)
+                        ST_XML_INVALIDO, ST_ERROR, ST_BORRADOR_AJENO, ST_WM_NO_VIGENTE)
+import _sat_descarga as sat
 
 
 def fetch_pendientes(db):
@@ -231,6 +235,19 @@ def procesar(odoo, db, fila, catalogos, cache_clientes, stats):
                     facturas=[resumen_factura(f) for f in ajenas])
         return 'doble_cfdi'
 
+    # --- 5b. Estado en el SAT (solo si se va a crear o terminar una factura) ---
+    try:
+        est = sat.consultar_estado(cfdi['emisor_rfc'], cfdi['receptor_rfc'], cfdi['total'], uuid)
+    except sat.ErrorSAT as e:
+        update_fila(db, rid, ST_PENDING_WM_LINK, f"No se pudo consultar el estado en el SAT: {str(e)[:300]}")
+        return 'sat_sin_respuesta'
+    if est['estado'] == 'Cancelado':
+        update_fila(db, rid, ST_WM_NO_VIGENTE, f"El SAT reporta el CFDI {est['estado']} ({est['estatus_cancelacion']})")
+        return 'no_vigente'
+    if est['estado'] != 'Vigente':
+        update_fila(db, rid, ST_PENDING_WM_LINK, f"SAT: {est['estado']} ({est['codigo']}); se reintenta")
+        return 'sat_no_encontrado'
+
     if mias:   # borrador huerfano de una corrida anterior: se retoma
         inv_id = mias[0]['id']
         stats['retomadas'] += 1
@@ -383,10 +400,10 @@ def main():
 
     for k, v in sorted(stats.items()):
         log.info(f"  {k:<22} {v:>6}")
-    if stats['doble_cfdi'] or stats['error']:
+    if stats['doble_cfdi'] or stats['error'] or stats['no_vigente']:
         notify_slack(f"Walmart 03 (pull): creadas={stats['creada']} adoptadas={stats['adoptada']} "
                      f"DOBLE_CFDI={stats['doble_cfdi']} errores={stats['error']} "
-                     f"TOTAL_DIFF={stats['total_diff']}")
+                     f"TOTAL_DIFF={stats['total_diff']} no_vigentes={stats['no_vigente']}")
 
 
 if __name__ == '__main__':
