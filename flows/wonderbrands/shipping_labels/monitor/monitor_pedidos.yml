@@ -1,0 +1,149 @@
+id: monitor_pedidos
+namespace: wonderbrands.shipping_labels.monitor
+description: "Monitor de pedidos frenados: lee las tablas de estado de las automatizaciones de guias y publica tools.monitor_* (lo lee Coffee)"
+
+# Contrato de datos y decisiones D081-D090: cerebro/docs/pedidos-frenados/.
+# Este flujo NO se sincroniza solo: se crea a mano en la UI de Kestra (igual
+# que master_txns_live). El codigo si se toma de main en cada corrida.
+# Va junto a los generadores de guias (wonderbrands.shipping_labels.*): los
+# secrets que usa (deploy key, base, Google, Slack) se ven desde este namespace.
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+variables:
+  # Mismo acceso que master_txns_live: deploy key de solo lectura (ver ese flujo).
+  repo_url: "git@github.com:miguelalexsa1/wonderbrands.git"
+  branch: "main"
+  carpeta: "03_Tools/48_Monitor_pedidos"
+  db_user: "kestra_bot"
+  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+
+tasks:
+  - id: working_env_monitor_pedidos
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      # Clon SPARSE: trae solo la carpeta del monitor (sus modulos son autonomos:
+      # solo importan entre si, la libreria estandar, MySQLdb y gspread). Mismo bloque que
+      # coffee_etl_live, ya probado en Kestra; solo cambia el secret.
+      # No se usa io.kestra.plugin.git.Clone porque no expone sparse-checkout.
+      - id: clone_repo_sparse
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v2.0
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        env:
+          DEPLOY_KEY: "{{ secret('GITHUB_DEPLOY_KEY_WONDERBRANDS_NS') }}"
+        commands:
+          - |
+            git --version
+            ssh -V
+            mkdir -p ~/.ssh && chmod 700 ~/.ssh
+            python - "$HOME/.ssh/deploy_key" <<'PYKEY'
+            import base64, os, re, sys
+
+            # La deploy key llega maltratada: Kestra aplasta los saltos de linea
+            # al pasarla como variable de entorno, y ssh rechaza una llave de una
+            # sola linea con "error in libcrypto".
+            #
+            # Se reconstruye. Es seguro porque el formato PEM es fijo: cabecera,
+            # cuerpo en base64, cierre. El cuerpo no lleva espacios, asi que se
+            # puede volver a partir en renglones de 70 sin ambiguedad.
+            #
+            # Tambien se contempla que el valor venga en base64 (una o dos veces),
+            # por si mas adelante se guarda de esa forma.
+            crudo = os.environ.get("DEPLOY_KEY", "")
+            PEM = re.compile(r'-----BEGIN ([A-Z0-9 ]+?)-----(.*?)-----END \1-----', re.S)
+
+            candidatos = [("CRUDA", crudo)]
+            try:
+                uno = base64.b64decode(re.sub(r'\s+', '', crudo)).decode("utf-8", "replace")
+                candidatos.append(("BASE64", uno))
+                dos = base64.b64decode(re.sub(r'\s+', '', uno)).decode("utf-8", "replace")
+                candidatos.append(("BASE64 x2", dos))
+            except Exception:
+                pass
+
+            for etiqueta, valor in candidatos:
+                m = PEM.search(valor)
+                if not m:
+                    continue
+                tipo = m.group(1).strip()
+                cuerpo = re.sub(r'\s+', '', m.group(2))
+                renglones = [cuerpo[i:i + 70] for i in range(0, len(cuerpo), 70)]
+                llave = "-----BEGIN %s-----\n%s\n-----END %s-----\n" % (
+                    tipo, "\n".join(renglones), tipo)
+                with open(sys.argv[1], "w", newline="\n") as f:
+                    f.write(llave)
+                print("formato del secret : %s" % etiqueta)
+                print("tipo de llave      : %s" % tipo)
+                print("renglones de cuerpo: %d" % len(renglones))
+                sys.exit(0)
+
+            # Nada sirvio. Se informa solo el largo y el prefijo, que no son
+            # secretos: la cabecera PEM es identica para cualquier llave.
+            limpio = re.sub(r'\s+', '', crudo)
+            print("ERROR: el secret GITHUB_DEPLOY_KEY_WONDERBRANDS_NS no contiene una llave PEM.")
+            print("  largo      : %d caracteres" % len(limpio))
+            print("  empieza con: %s" % limpio[:13])
+            print("  Se probo tal cual, en base64 y en base64 doble.")
+            sys.exit(1)
+            PYKEY
+            chmod 600 ~/.ssh/deploy_key
+            ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null && echo "la llave es valida: ssh la puede leer"
+
+            ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+            export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes"
+
+            git clone --depth 1 --filter=blob:none --sparse --branch "{{ vars.branch }}" "{{ vars.repo_url }}" repo
+            cd repo && git sparse-checkout set --no-cone "{{ vars.carpeta }}"
+            cd .. && ls -la "repo/{{ vars.carpeta }}"
+
+      - id: monitor_pedidos
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v2.0
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          # Regla 7 de los flujos de wb-data-hub: todo contenedor declara memoria.
+          # Lee ~30 mil pedidos (45 dias) en memoria: holgura sobre 512MB.
+          memory:
+            memory: "768MB"
+            memorySwap: "1024MB"
+        # Una corrida tarda ~1-2 min (medido en el dry run del 2026-11-23).
+        timeout: PT10M
+        env:
+          MYSQL_HOST: "{{ vars.db1_host }}"
+          MYSQL_USER: "{{ vars.db_user }}"
+          MYSQL_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          # Planilla "Reprocesamiento de guias", SOLO LECTURA. Misma cuenta de
+          # servicio que los flujos de Sergio que ya la leen (Amazon y TikTok).
+          GOOGLE_CREDS_JSON: "{{ secret('GOOGLE_CREDS_TIKTOK_JSON') }}"
+          # Se guarda en automation_run_log.execution_ref.
+          KESTRA_EXECUTION_ID: "{{ execution.id }}"
+        commands:
+          - |
+            set -e
+            cd "repo/{{ vars.carpeta }}"
+            # Chequeo de contrato (segundos, sin tocar la base).
+            python -c "import MySQLdb, gspread, monitor.pipeline; print('contrato ok')"
+            python -m unittest discover -s tests
+            python -u monitor_pedidos.py --apply
+
+triggers:
+  - id: cada_15_min
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+    timezone: "America/Mexico_City"
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *Fallo en monitor_pedidos* 🚨\n*Flujo:* {{ flow.id }}\n*Ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}\n_Las tablas tools.monitor_* quedaron como en la corrida anterior: la publicación es una sola transacción._"
+      }
