@@ -103,6 +103,7 @@ def main():
 
     stamp = datetime.now().strftime('%Y-%m-%d_%H%M')
     path = os.path.join(HERE, 'finanzas', f'Diagnostico_pagos_sin_cobro_ML_{stamp}.csv')
+    os.makedirs(os.path.dirname(path), exist_ok=True)   # finanzas/ no está en el repo
     with open(path, 'w', newline='', encoding='utf-8-sig') as f:
         w = csv.DictWriter(f, fieldnames=list(out[0].keys()))
         w.writeheader()

@@ -54,6 +54,7 @@ COST_ACCOUNTS = ("205.06.003", "107.06.001", "501.01.001")
 TOTAL_TOLERANCE = 0.0101          # ±$0.01 heredado de origen: se cierra contra 704.23.001 en el cobro
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finanzas")
 
+os.makedirs(OUT_DIR, exist_ok=True)   # finanzas/ no está en el repo
 ODOO_URL = (os.getenv("ODOO_TEST_URL") or os.getenv("odoo_url_testV18") or "").strip()
 ODOO_DB  = (os.getenv("ODOO_TEST_DB") or os.getenv("odoo_db_testV18") or "").strip()
 ODOO_USER     = os.getenv("ODOO_USER") or os.getenv("odoo_user_dataV18")

@@ -1,5 +1,20 @@
 # Prueba del 06 · Loader de NC → Odoo 18
 
+> **v9 (25-nov), respuesta de Finanzas del 24-nov**
+> - **Centavos:** tolerancia de $0.15, a favor o en contra, contra 704.23.001.
+>   - En el 06 (`CENTS_TOLERANCE`): NC contra el saldo de la factura que concilia.
+>   - En el 04: pago contra saldo.
+>   - En el 04 una factura se da por saldada solo con menos de $0.01 (`SETTLED_TOLERANCE`), para que un saldo de centavos todavía reciba su pago.
+> - **`LOCAL_RUN = "cents"`:** una sola vez, para las facturas con NC MLNC que quedaron con $0.02–$0.15 por la regla anterior (4 en productivo al 25-nov). Con `LOCAL_DRY_RUN = True` solo lista.
+> - **Tiendas:** el diario de NC, la transitoria del reverso del cobro, el equipo y el diario de reembolsos fuera de MeLi salen de `ml_stores.py`:
+>   - principal: MLNC / 102.03.001 / Team_MercadoLibre / MLREM;
+>   - Oficiales: MLONC / 102.03.007 / Team_MercadoLibreOficiales / MLORM.
+> - **Flujo de Oficiales:** `ml_oficiales_credit_notes_flow.yml`, apagado hasta el piloto.
+> - **Traslado (`traslado_diarios_terceros.py`):**
+>   - Restituye las líneas de costo originales y el IVA, y publica sin que Odoo recalcule, así que ya no hay ajustes MLNC-COSTO.
+>   - Elige el diario por la serie exacta: MELI → MELI, MELINC → MLNC, MELIOF → MLOF, MELIOFNC → MLONC.
+>   - `PART="i/N"` permite varias líneas en paralelo.
+
 > **v5 (12-nov)**
 > - **Corte de retornos:** solo órdenes del flujo nuevo de NC, es decir, las que están en la cola del 05 (`NC_SCAN_TABLE`). Los retornos de ventas anteriores a junio no se reclasifican (Finanzas, 12-nov). En staging quedaron fuera 297 retornos.
 > - **Tablas:** `LOCAL_TABLES = "prod"` (`finance.mkp_credit_notes_prod` / `_scan`). Para probar en staging, usar `"staging"`. El 06 se niega a escribir con el Odoo de pruebas sobre las tablas `_prod`.

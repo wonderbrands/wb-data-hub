@@ -6,8 +6,12 @@
 # Procedimiento por documento (probado en staging el 17-nov, 23 documentos):
 #   borrador -> nombre '/' -> diario y serie-folio -> se restituye la posición fiscal -> publicar
 #   -> volver a conciliar lo que estaba conciliado (cobro, NC, 205.06.003, 107.06.001)
-#   -> si Odoo recalculó el costo (orden sin salida: toma el del día), un asiento MISC con ref
-#      'MLNC-COSTO:<id>' lo regresa al costo original. Así los totales por cuenta no cambian.
+#   -> COSTO ORIGINAL (25-nov, pedido de Finanzas): al pasar a borrador Odoo borra las líneas de costo
+#      y al publicar las recalcula con el costo del día. Ahora se copian ANTES del borrador, se vuelven a
+#      poner tal cual y se publica con contexto move_reverse_cancel (Odoo no recalcula). Resultado: el
+#      costo queda idéntico al original y sin ajustes MLNC-COSTO; las líneas de costo se vuelven a
+#      conciliar con las mismas contrapartidas (salida OUT en 205.06.003, retorno en 107.06.001).
+#      Si aun así algo no cuadra, el documento sale como REVISAR (ya no se ajusta en automático).
 # Controles por lote (los que pidió Finanzas): totales por cuenta antes/después, conciliaciones,
 # UUID, cobro, nombre = serie-folio, lista de lo que no cuadre y cuántos MLNC-COSTO y por cuánto.
 # Funciona porque son CFDI de terceros que Odoo no timbró. Un CFDI timbrado por nosotros NUNCA
@@ -51,14 +55,21 @@ FROM_JOURNALS  = os.getenv("FROM_JOURNALS", "INV,DEV,BON")      # códigos de lo
 DATE_FROM      = os.getenv("DATE_FROM", "2026-11-01")
 DATE_TO        = os.getenv("DATE_TO", "2026-11-30")
 BATCH_LIMIT    = int(os.getenv("BATCH_LIMIT", "50"))
+# Varias líneas en paralelo: PART="i/N" toma solo los documentos con id % N == i (lotes disjuntos)
+PART           = os.getenv("PART", "")
 # ══════════════════════════════════════════════════════════════
 
-DEST = {"out_invoice": ("MELI", ("MELI",)), "out_refund": ("MLNC", ("MELINC",))}   # diario, series permitidas
+# Serie EXACTA del CFDI -> (tipo de documento, diario de terceros). Exacta a propósito: "MELIOF" (Oficiales)
+# empieza con "MELI" y con un prefijo se iría al diario de la tienda principal.
+SERIE_JOURNAL = {"MELI": ("out_invoice", "MELI"), "MELINC": ("out_refund", "MLNC"),
+                 "MELIOF": ("out_invoice", "MLOF"), "MELIOFNC": ("out_refund", "MLONC")}
+DEST = {"out_invoice": None, "out_refund": None}   # tipos de documento que se trasladan
 ACCOUNTS = ["401.01.001", "402.01.001", "402.01.002", "402.01.003", "208.01.001", "105.01.004",
             "501.01.001", "205.06.003", "107.06.001"]
 COST_ACCOUNTS = ("205.06.003", "107.06.001", "501.01.001")
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finanzas")
 
+os.makedirs(OUT_DIR, exist_ok=True)   # finanzas/ no está en el repo
 ODOO_URL = (os.getenv("ODOO_TEST_URL") or os.getenv("odoo_url_testV18") or "").strip()
 ODOO_DB  = (os.getenv("ODOO_TEST_DB") or os.getenv("odoo_db_testV18") or "").strip()
 ODOO_USER     = os.getenv("ODOO_USER") or os.getenv("odoo_user_dataV18")
@@ -117,6 +128,31 @@ def counterparts(mid):
     return out
 
 
+def xml_tax(mid, uuid):
+    """IVA total del CFDI adjunto (TotalImpuestosTrasladados)."""
+    att = sr("ir.attachment", [("res_model", "=", "account.move"), ("res_id", "=", mid), ("name", "=ilike", f"{uuid}.xml")], ["datas"])
+    if not att:
+        return None
+    imp = ET.fromstring(base64.b64decode(att[0]["datas"])).find("{http://www.sat.gob.mx/cfd/4}Impuestos")
+    return float(imp.get("TotalImpuestosTrasladados")) if imp is not None and imp.get("TotalImpuestosTrasladados") else None
+
+
+def restore_tax(mid, target):
+    """En borrador Odoo recalcula el IVA por línea. Se regresa al IVA objetivo con el mismo mecanismo que la
+    pantalla (tax_totals), como el 06 al registrar la NC. Devuelve True si tuvo que ajustar."""
+    mv = sr("account.move", [("id", "=", mid)], ["tax_totals", "amount_tax"])[0]
+    if target is None or abs(mv["amount_tax"] - target) < 0.005:
+        return False
+    totals = mv["tax_totals"]
+    groups = [g for st in totals.get("subtotals", []) for g in st.get("tax_groups", [])] or              [g for v in (totals.get("groups_by_subtotal") or {}).values() for g in v]
+    if len(groups) != 1:
+        raise RuntimeError(f"{len(groups)} grupos de impuestos: no se puede restituir el IVA")
+    key = "tax_amount_currency" if "tax_amount_currency" in groups[0] else "tax_group_amount"
+    groups[0][key] = target
+    odoo("account.move", "write", [mid], {"tax_totals": totals})
+    return True
+
+
 def serie_folio(mid, uuid):
     att = sr("ir.attachment", [("res_model", "=", "account.move"), ("res_id", "=", mid), ("name", "=ilike", f"{uuid}.xml")],
              ["datas"])
@@ -131,7 +167,24 @@ def select_batch(journals):
         return [int(x) for x in MOVE_IDS.split(",") if x.strip()]
     domain = [("journal_id", "in", list(journals.values())), ("move_type", "in", list(DEST)), ("state", "=", "posted"),
               ("date", ">=", DATE_FROM), ("date", "<=", DATE_TO), ("l10n_mx_edi_cfdi_uuid", "!=", False)]
-    return [m["id"] for m in sr("account.move", domain, ["id"], limit=BATCH_LIMIT, order="date asc, id asc")]
+    ids = [m["id"] for m in sr("account.move", domain, ["id"], limit=BATCH_LIMIT, order="date asc, id asc")]
+    if PART:
+        i, n = (int(x) for x in PART.split("/"))
+        ids = [x for x in ids if x % n == i]
+    return ids
+
+
+COGS_FIELDS = ["account_id", "partner_id", "product_id", "name", "quantity", "price_unit", "debit", "credit"]
+
+
+def cogs_lines(mid):
+    """Líneas de costo (display_type 'cogs') tal como están publicadas, para restituirlas sin recalcular."""
+    out = []
+    for ln in sr("account.move.line", [("move_id", "=", mid), ("display_type", "=", "cogs")], COGS_FIELDS):
+        vals = {k: (ln[k][0] if isinstance(ln[k], list) else ln[k]) for k in COGS_FIELDS}
+        vals["display_type"] = "cogs"
+        out.append(vals)
+    return out
 
 
 def cost_adjustment(mid, date_, new_name, adj, misc_journal):
@@ -151,7 +204,11 @@ def cost_adjustment(mid, date_, new_name, adj, misc_journal):
 
 def main():
     journals = {c: odoo("account.journal", "search", [("code", "=", c)])[0] for c in FROM_JOURNALS.split(",")}
-    dest_ids = {c: odoo("account.journal", "search", [("code", "=", c)])[0] for c in ("MELI", "MLNC", "MISC")}
+    dest_ids = {}
+    for c in sorted({j for _, j in SERIE_JOURNAL.values()} | {"MISC"}):
+        found = odoo("account.journal", "search", [("code", "=", c)])
+        if found:
+            dest_ids[c] = found[0]
     ids = select_batch(journals)
     log.info(f"=== Traslado a diarios de terceros | {'EN SECO' if DRY_RUN else 'REAL'} | {ODOO_URL} | lote: {len(ids)} ===")
     tot_before = {a: 0.0 for a in ACCOUNTS}
@@ -161,12 +218,12 @@ def main():
         before = snapshot(mid)
         mv = before[0]
         uuid = mv["l10n_mx_edi_cfdi_uuid"]
-        dest_code, series = DEST[mv["move_type"]]
         serie, folio = serie_folio(mid, uuid)
         new_name = f"{serie}-{folio}"
-        if serie is None or not any(serie.upper().startswith(s) for s in series):
-            problems.append((mv["name"], f"Serie '{serie}' no es de MeLi o falta el XML: no se mueve"))
-            log.warning(f"{mv['name']}: serie '{serie}' no es de MeLi o falta el XML -> se omite")
+        kind, dest_code = SERIE_JOURNAL.get((serie or "").upper(), (None, None))
+        if kind != mv["move_type"] or dest_code not in dest_ids:
+            problems.append((mv["name"], f"Serie '{serie}' no es de MeLi, no corresponde al tipo de documento, falta el XML o falta su diario: no se mueve"))
+            log.warning(f"{mv['name']}: serie '{serie}' sin diario de terceros para este documento (o sin XML) -> se omite")
             continue
         if DRY_RUN:
             rows.append({"Nombre anterior": mv["name"], "Nombre nuevo": new_name, "Diario nuevo": dest_code, "UUID": uuid,
@@ -175,12 +232,23 @@ def main():
             continue
         cps = counterparts(mid)
         fp = mv["fiscal_position_id"]
+        orig_cogs = cogs_lines(mid)
+        orig_tax = sr("account.move", [("id", "=", mid)], ["amount_tax"])[0]["amount_tax"]
+        # NC: su IVA es el del XML (lo fija el 06). Factura: el que tenía antes del traslado.
+        target_tax = xml_tax(mid, uuid) if mv["move_type"] == "out_refund" else orig_tax
         odoo("account.move", "button_draft", [mid])
         odoo("account.move", "write", [mid], {"name": "/"})
         odoo("account.move", "write", [mid], {"journal_id": dest_ids[dest_code], "name": new_name})
         # Cambiar de diario borra la posición fiscal: sin ella la NC tipo B mandaría el costo a 205.06.003
         odoo("account.move", "write", [mid], {"fiscal_position_id": fp[0] if fp else False})
-        odoo("account.move", "action_post", [mid])
+        # Costo original: se vuelve a poner tal cual y se publica sin que Odoo lo recalcule
+        stale = odoo("account.move.line", "search", [("move_id", "=", mid), ("display_type", "=", "cogs")])
+        if stale:   # por si la versión de Odoo no los borró al pasar a borrador
+            odoo("account.move", "write", [mid], {"line_ids": [(2, x) for x in stale]})
+        restore_tax(mid, target_tax)
+        if orig_cogs:
+            odoo("account.move", "write", [mid], {"line_ids": [(0, 0, v) for v in orig_cogs]})
+        odoo("account.move", "action_post", [mid], context={"move_reverse_cancel": True})
         for acc, lines in cps.items():
             mine = odoo("account.move.line", "search", [("move_id", "=", mid), ("account_id", "=", acc), ("reconciled", "=", False)])
             others = odoo("account.move.line", "search", [("id", "in", list(lines)), ("reconciled", "=", False)])
@@ -189,7 +257,7 @@ def main():
         after = snapshot(mid)
         adj = {k: round(after[1].get(k, 0) - before[1].get(k, 0), 2) for k in COST_ACCOUNTS}
         adj = {k: v for k, v in adj.items() if abs(v) > 0.004}
-        adj_name = cost_adjustment(mid, after[0]["date"], new_name, adj, dest_ids["MISC"]) if adj else ""
+        adj_name = ""   # ya no se ajusta en automático: si el costo no es idéntico, el documento sale como REVISAR
         if adj:
             cost_adjs.append((adj_name, mv["name"], adj))
         final = {k: round(after[1].get(k, 0) - adj.get(k, 0), 2) for k in set(after[1]) | set(adj)}
@@ -198,6 +266,7 @@ def main():
             tot_before[a] += before[1].get(a, 0)
             tot_after[a] += final.get(a, 0)
         checks = {"mismo UUID": after[0]["l10n_mx_edi_cfdi_uuid"] == uuid, "asiento igual": final == before[1],
+                  "costo idéntico": not adj,
                   "conciliaciones iguales": after[2] == before[2], "cobro igual": after[0]["payment_state"] == mv["payment_state"],
                   "nombre = serie-folio": after[0]["name"] == new_name}
         bad = [k for k, v in checks.items() if not v]
@@ -207,13 +276,14 @@ def main():
                      "UUID": uuid, "Fecha": after[0]["date"],
                      "Cobro antes→después": f"{mv['payment_state']}→{after[0]['payment_state']}",
                      "Conciliaciones antes→después": f"{sum(before[2].values())}→{sum(after[2].values())}",
-                     "Ajuste de costo": f"{adj_name} {adj}" if adj_name else "-",
+                     "Ajuste de costo": "; ".join(f"{k} {before[1].get(k, 0):,.2f}→{final.get(k, 0):,.2f}" for k in COST_ACCOUNTS
+                                                  if before[1].get(k, 0) or final.get(k, 0)) or "sin costo",
                      "Resultado": "OK" if not bad else "REVISAR: " + ", ".join(bad)})
         log.info(f"{mv['name']} -> {after[0]['name']} | {rows[-1]['Resultado']} | ajuste: {rows[-1]['Ajuste de costo']}")
 
     # ── Controles del lote ──
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
-    out = os.path.join(OUT_DIR, f"Traslado_lote_{'seco_' if DRY_RUN else ''}{stamp}.csv")
+    out = os.path.join(OUT_DIR, f"Traslado_lote_{'seco_' if DRY_RUN else ''}{stamp}{'_parte' + PART.replace('/', 'de') if PART else ''}.csv")
     with open(out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         if not DRY_RUN:

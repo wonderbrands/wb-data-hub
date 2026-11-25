@@ -1,0 +1,138 @@
+id: ml_oficiales_credit_notes_flow
+namespace: wonderbrands.financial.credit_note_refund_processes.mercadolibre
+description: "Pipeline Notas de Crédito ML OFICIALES (seller 160190870): extrae de ML las NC (CFDI E, serie MELIOFNC) de órdenes facturadas (05) y las registra en Odoo en el diario MLONC (06). Arranca al terminar los pagos de Oficiales."
+# Mismos scripts que ml_credit_notes_flow; la tienda sale de ml_stores.py por ML_SELLER_ID:
+#   CxC 105.01.005, diario de NC MLONC, reverso del cobro contra 102.03.007 (diario MPO), equipo
+#   Team_MercadoLibreOficiales, reembolsos fuera de MeLi en MLORM. Corte: 17-sep-2026 (Finanzas, 24-nov:
+#   las ventas anteriores no se consideran).
+# APAGADO hasta el VoBo de Finanzas al piloto de 10 NC de Oficiales en productivo.
+disabled: true
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+inputs:
+  - id: scan_mode
+    type: SELECT
+    values:
+      - both
+      - signals
+      - sweep
+    defaults: both
+  - id: only_order_ids
+    type: STRING
+    required: false
+    description: "Prueba dirigida: order_ids separados por coma (ignora la cola)"
+  - id: max_calls_per_run
+    type: INT
+    defaults: 20000
+  - id: max_nc_per_run
+    type: INT
+    defaults: 300
+    description: "06: tope de NC a registrar en Odoo por corrida"
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  # marketplace y fecha de corte se derivan del seller en ml_stores.py
+  ml_seller_id: "160190870"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db1_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+
+tasks:
+  - id: working_env_credit_notes
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      # ── PASO 05: Extracción de XMLs de NC de Mercado Libre a BD ──
+      - id: run_miner_ml_credit_notes
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        timeout: PT6H
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          memory:                 # obligatorio (flows/README.md, regla 7); mismo valor que ML
+            memory: "768MB"
+            memorySwap: "1024MB"
+        env:
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          ML_SELLER_ID: "{{ vars.ml_seller_id }}"
+          # Explícitos: en Kestra nunca aplican los LOCAL_* del script
+          NC_TABLE: "finance.mkp_credit_notes_prod"
+          NC_SCAN_TABLE: "finance.mkp_credit_notes_scan"
+          PREFLIGHT_ONLY: "false"
+          SCAN_MODE: "{{ inputs.scan_mode }}"
+          ONLY_ORDER_IDS: "{{ inputs.only_order_ids ?? '' }}"
+          MAX_CALLS_PER_RUN: "{{ inputs.max_calls_per_run }}"
+        commands:
+          - python processes/wonderbrands/financial/credit_note_refund_processes/mercadolibre/05_miner_ml_credit_notes.py
+
+      # ── PASO 06: Registro de las NC en Odoo (diario MLONC) ──
+      - id: run_loader_ml_credit_notes
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        timeout: PT3H
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          memory:                 # obligatorio (flows/README.md, regla 7); mismo valor que ML
+            memory: "768MB"
+            memorySwap: "1024MB"
+        env:
+          DB_HOST: "{{ vars.db1_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+          ML_SELLER_ID: "{{ vars.ml_seller_id }}"
+          ODOO_URL: "{{ vars.odoo_url }}"
+          ODOO_DB: "{{ vars.odoo_db }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          # Explícitos: en Kestra nunca aplican los LOCAL_* del script
+          RUN_MODE: "pending"
+          ODOO_TARGET: "prod"
+          NC_TABLE: "finance.mkp_credit_notes_prod"
+          NC_SCAN_TABLE: "finance.mkp_credit_notes_scan"
+          JOURNAL_CODE_DEV: "MLONC"
+          JOURNAL_CODE_BON: "MLONC"
+          NC_NAME_FROM_CFDI: "true"
+          MAX_NC_PER_RUN: "{{ inputs.max_nc_per_run }}"
+          PREFLIGHT_CSV: "false"
+        commands:
+          - python processes/wonderbrands/financial/credit_note_refund_processes/mercadolibre/06_loader_ml_credit_notes.py
+
+triggers:
+  # Se ejecuta automáticamente en cuanto terminan los Pagos ML (así el 06 verá el
+  # payment_state actualizado de cada factura)
+  - id: listen_to_payments_flow
+    type: io.kestra.plugin.core.trigger.Flow
+    states:
+      - SUCCESS
+      - WARNING
+    dependsOn:
+      - namespace: wonderbrands.financial.billing_processes.mercadolibre
+        flowId: ml_oficiales_payments_flow
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *¡Fallo en Pipeline de Notas de Crédito ML Oficiales!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Tarea Fallida:* `{{ execution.tasksRun | filter(t => t.state.current == 'FAILED') | map(t => t.taskId) | first }}`\n*Fecha:* `{{ execution.startDate }}`"
+      }
