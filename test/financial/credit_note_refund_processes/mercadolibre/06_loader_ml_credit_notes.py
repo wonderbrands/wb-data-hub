@@ -71,9 +71,13 @@ log = logging.getLogger(__name__)
 #   "pending"   -> registra las NC PENDING (más recientes primero; filtro LOCAL_MONTH).
 #   "returns"   -> solo el barrido de retornos: reclasifica cada retorno WH/DEV validado de MeLi
 #                  (periodo abierto) en el mes del retorno y lo concilia con su NC tipo B si ya existe.
+#   "cents"     -> una sola vez (Finanzas 24-nov): facturas con NC de MeLi que quedaron con hasta $0.15 de
+#                  saldo por la regla anterior de $0.01 -> se cierran contra 704.23.001 (MLNC-CENT).
+#                  Con LOCAL_DRY_RUN = True solo lista.
 #   ("orders" y "pending" también corren el barrido de retornos al final; "preflight" solo lo cuenta.)
 LOCAL_RUN            = "preflight"
 LOCAL_ODOO           = "test"      # test | prod  (prod = Odoo productivo REAL)
+LOCAL_DRY_RUN        = True        # solo para "cents": True = solo lista lo que cerraría
 LOCAL_ORDER_IDS      = ""
 LOCAL_MONTH          = ""          # "2026-10" = solo NC timbradas ese mes; "" = todas
 LOCAL_MAX_NC_PER_RUN = 10
@@ -86,12 +90,13 @@ LOCAL_TABLES         = "prod"      # prod = finance.mkp_credit_notes_prod (defin
 
 RUN_MODE       = os.getenv("RUN_MODE", LOCAL_RUN).strip().lower()
 ODOO_TARGET    = os.getenv("ODOO_TARGET", LOCAL_ODOO).strip().lower()
+DRY_RUN_CENTS  = os.getenv("DRY_RUN", str(LOCAL_DRY_RUN)).strip().lower() == "true"
 ONLY_ORDER_IDS = [o.strip() for o in os.getenv("ONLY_ORDER_IDS", LOCAL_ORDER_IDS if RUN_MODE != "pending" else "").split(",") if o.strip()]
 NC_MONTH       = os.getenv("NC_MONTH", LOCAL_MONTH).strip()
 MAX_NC_PER_RUN = int(os.getenv("MAX_NC_PER_RUN", LOCAL_MAX_NC_PER_RUN))
 PREFLIGHT_ALL  = os.getenv("PREFLIGHT_ALL", str(LOCAL_PREFLIGHT_ALL)).strip().lower() == "true"
 PREFLIGHT_CSV  = os.getenv("PREFLIGHT_CSV", str(LOCAL_PREFLIGHT_CSV)).strip().lower() == "true"
-if RUN_MODE not in ("preflight", "orders", "pending", "returns") or ODOO_TARGET not in ("test", "prod"):
+if RUN_MODE not in ("preflight", "orders", "pending", "returns", "cents") or ODOO_TARGET not in ("test", "prod"):
     raise ValueError(f"RUN_MODE='{RUN_MODE}' / ODOO_TARGET='{ODOO_TARGET}' inválidos")
 if not all(o.isdigit() for o in ONLY_ORDER_IDS):
     raise ValueError(f"ONLY_ORDER_IDS inválidos: {ONLY_ORDER_IDS}")
@@ -119,16 +124,16 @@ if ODOO_TARGET == "test" and NC_TABLE.endswith("_prod") and RUN_MODE in ("orders
 # Configuración contable (flujo v2 de Finanzas)
 CLASS_CONFIG = {   # tipo -> (diario, cuenta de ingreso)
     # Un solo diario exclusivo de MeLi para las NC (MLNC, serie MELINC). MLDEV y MLBON se archivaron (20-nov).
-    'A': (os.getenv("JOURNAL_CODE_DEV", "MLNC"), os.getenv("ACCOUNT_CODE_A", "402.01.003")),
-    'B': (os.getenv("JOURNAL_CODE_DEV", "MLNC"), os.getenv("ACCOUNT_CODE_B", "402.01.001")),
-    'C': (os.getenv("JOURNAL_CODE_BON", "MLNC"), os.getenv("ACCOUNT_CODE_C", "402.01.002")),
+    'A': (os.getenv("JOURNAL_CODE_DEV", STORE.get('nc_journal_code') or "MLNC"), os.getenv("ACCOUNT_CODE_A", "402.01.003")),
+    'B': (os.getenv("JOURNAL_CODE_DEV", STORE.get('nc_journal_code') or "MLNC"), os.getenv("ACCOUNT_CODE_B", "402.01.001")),
+    'C': (os.getenv("JOURNAL_CODE_BON", STORE.get('nc_journal_code') or "MLNC"), os.getenv("ACCOUNT_CODE_C", "402.01.002")),
 }
 CLASS_DESC = {'A': 'Cancelación', 'B': 'Devolución', 'C': 'Bonificación'}
 FP_B_NAME           = os.getenv("FP_B_NAME", "ML NC Devolución (tipo B)")   # 205.06.003 -> 107.06.001
 ACCOUNT_CODE_FP_SRC = "205.06.003"
 ACCOUNT_CODE_FP_DST = os.getenv("ACCOUNT_CODE_TRANSIT", "107.06.001")
 ACCOUNT_CODE_CXC    = STORE['account_code_cxc']                              # 105.01.004
-ACCOUNT_CODE_MP     = os.getenv("ACCOUNT_CODE_MP", "102.03.001")
+ACCOUNT_CODE_MP     = os.getenv("ACCOUNT_CODE_MP", STORE.get('nc_cobro_account') or "102.03.001")   # Oficiales: 102.03.007
 ACCOUNT_CODE_CENTS  = os.getenv("ACCOUNT_CODE_CENTS", "704.23.001")
 JOURNAL_CODE_MISC   = os.getenv("JOURNAL_CODE_MISC", "MISC")     # centavos y reclasificación del retorno
 JOURNAL_CODE_COBRO  = os.getenv("JOURNAL_CODE_COBRO", STORE.get('mp_journal_code') or "MP")   # reverso del cobro
@@ -141,7 +146,7 @@ PREFIX, PREFIX_COBRO, PREFIX_CENT, PREFIX_RET = "MLNC:", "MLNC-COBRO:", "MLNC-CE
 # Retornos WH/DEV que se reclasifican (Finanzas 12-nov): solo órdenes que entraron al flujo nuevo de NC,
 # es decir, las que están en la cola del 05 (NC_SCAN_TABLE: facturadas por el autofacturador de MeLi
 # desde el 1-jun). Los retornos de ventas anteriores no se reclasifican (sus NC no concilian).
-ML_TEAM_NAME      = os.getenv("ML_TEAM_NAME", "Team_MercadoLibre")
+ML_TEAM_NAME      = os.getenv("ML_TEAM_NAME", STORE.get('team_name') or "Team_MercadoLibre")
 # Nombre de la NC = serie-folio del CFDI de MeLi (MELINC-11844), pedido de Finanzas (12-nov).
 # SOLO con diarios exclusivos de CFDI de terceros: Odoo numera el siguiente documento del diario a
 # partir del folio más alto, así que en DEV/BON (compartidos con las NC propias) la siguiente NC
@@ -150,11 +155,13 @@ ML_TEAM_NAME      = os.getenv("ML_TEAM_NAME", "Team_MercadoLibre")
 NC_NAME_FROM_CFDI = os.getenv("NC_NAME_FROM_CFDI", "true").strip().lower() == "true"   # MLNC es exclusivo de MeLi
 # Diario de reembolsos fuera de MeLi (Finanzas, 20-nov): NC manuales de Finanzas. El flujo no las toca;
 # si MeLi acredita después la misma orden, la NC de MeLi no se carga (doble egreso) y queda para Finanzas.
-JOURNAL_CODE_REM  = os.getenv("JOURNAL_CODE_REM", "MLREM")
+JOURNAL_CODE_REM  = os.getenv("JOURNAL_CODE_REM", STORE.get('rem_journal_code') or "MLREM")
 RETURNS_SINCE     = os.getenv("RETURNS_SINCE", "2026-06-01")
 
 AMOUNT_TOLERANCE  = float(os.getenv("AMOUNT_TOLERANCE", "1.0"))   # tope por factura y casado de unidades
-CENTS_TOLERANCE   = 0.0101                                         # ±$0.01 -> 704.23.001
+# NC vs saldo de la factura que concilia: hasta $0.15, a favor o en contra, va a 704.23.001 (Finanzas, 24-nov;
+# antes $0.01). Por encima, lo que la NC excede al saldo es reverso del cobro.
+CENTS_TOLERANCE   = float(os.getenv("CENTS_TOLERANCE", "0.15")) + 0.0001
 BATCH_SIZE        = int(os.getenv("BATCH_SIZE", "20"))
 MAX_ERROR_RETRIES = int(os.getenv("MAX_ERROR_RETRIES", "2"))
 
@@ -435,7 +442,7 @@ def plan_credit_note(rec, ctx, cfg):
 
     inv_paid = inv['amount_total'] - inv['amount_residual']
     cobro = ('concilia' if inv['amount_residual'] >= total - CENTS_TOLERANCE else
-             'reverso 102.03.001' if inv['amount_residual'] < 0.01 else 'concilia + reverso 102.03.001')
+             f'reverso {ACCOUNT_CODE_MP}' if inv['amount_residual'] < 0.01 else f'concilia + reverso {ACCOUNT_CODE_MP}')
     return {**base, 'status': 'READY', 'key': key, 'xml': xml, 'header': header, 'units': bool(units),
             'existing': next((r for r in ctx['refunds'] if r['ref'] == key), None),
             'cxc': ctx['receivable_acc'].get(inv['id'], cfg['acc_cxc']), 'cobro': cobro, 'inv_paid': inv_paid,
@@ -621,6 +628,36 @@ def sweep_returns(odoo, cfg, db, so_refs=None, dry=False, out_notes=None):
     return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in counts.items()}
 
 
+def sweep_cents(odoo, cfg, dry):
+    """Facturas con NC de MeLi (ref MLNC:) que quedaron con un saldo de $0.01 a CENTS_TOLERANCE: asiento
+    MLNC-CENT:<UUID> contra 704.23.001 con la fecha de la NC, conciliado con la factura. Idempotente."""
+    ncs = odoo.read('account.move', [('move_type', '=', 'out_refund'), ('ref', '=like', PREFIX + '%'), ('state', '=', 'posted')],
+                    ['id', 'name', 'ref', 'date', 'reversed_entry_id', 'partner_id'])
+    by_inv = {n['reversed_entry_id'][0]: n for n in ncs if n['reversed_entry_id']}
+    counts, rows = {}, []
+    for ch in _chunks(list(by_inv), 500):
+        for inv in odoo.call('account.move', 'read', ch, fields=['id', 'name', 'amount_residual', 'state']):
+            res = round(inv['amount_residual'], 2)
+            if inv['state'] != 'posted' or not (0.005 < res <= CENTS_TOLERANCE):
+                continue
+            nc = by_inv[inv['id']]
+            uuid = nc['ref'][len(PREFIX):]
+            if cfg['lock_date'] and nc['date'] <= cfg['lock_date']:
+                counts['periodo cerrado'] = counts.get('periodo cerrado', 0) + 1
+                continue
+            cxc = odoo.read('account.move.line', [('move_id', '=', inv['id']), ('account_type', '=', 'asset_receivable')], ['account_id'])[0]['account_id'][0]
+            msg = f"{inv['name']} saldo ${res:,.2f} tras {nc['name']} -> {ACCOUNT_CODE_CENTS}"
+            if not dry:
+                cent = get_or_post_entry(odoo, PREFIX_CENT + uuid, cfg['journal_misc'], nc['date'], [
+                    {'account_id': cxc, 'partner_id': nc['partner_id'][0], 'debit': 0, 'credit': res, 'name': f"Centavos NC ML {uuid}"},
+                    {'account_id': cfg['acc_cents'], 'partner_id': nc['partner_id'][0], 'debit': res, 'credit': 0, 'name': f"Centavos NC ML {uuid}"}])
+                reconcile_lines(odoo, [inv['id'], cent], cxc)
+                msg += f" ({odoo.one('account.move', cent, ['name'])['name']}; saldo ahora ${residual(odoo, inv['id'], cxc):,.2f})"
+            log.info(f"[CENTAVOS] {'[SECO] ' if dry else ''}{msg}")
+            counts['cerradas' if not dry else 'por cerrar'] = counts.get('cerradas' if not dry else 'por cerrar', 0) + 1
+    return counts
+
+
 def execute_plan(odoo, db, rec, plan, cfg):
     """Crea (o retoma), ajusta al XML, adjunta, publica, aplica el cobro y deja log."""
     inv, uuid, xml = plan['inv'], rec['cfdi_uuid'], plan['xml']
@@ -669,7 +706,7 @@ def execute_plan(odoo, db, rec, plan, cfg):
     if residual(odoo, inv['id'], cxc) < inv['amount_residual'] - 0.005:
         notes.append(f"conciliada ${inv['amount_residual'] - max(residual(odoo, inv['id'], cxc), 0):,.2f} contra la factura")
     inv_res, nc_res = residual(odoo, inv['id'], cxc), residual(odoo, refund_id, cxc)
-    if 0 < inv_res <= CENTS_TOLERANCE or (0 > nc_res >= -CENTS_TOLERANCE and inv_res <= 0):   # 2) ±$0.01 -> 704.23.001
+    if 0 < inv_res <= CENTS_TOLERANCE or (0 > nc_res >= -CENTS_TOLERANCE and inv_res <= 0):   # 2) ±$0.15 -> 704.23.001
         diff, target = (inv_res, inv['id']) if inv_res > 0 else (nc_res, refund_id)
         cent = get_or_post_entry(odoo, PREFIX_CENT + uuid, cfg['journal_misc'], date, [
             {'account_id': cxc, 'partner_id': partner, 'debit': max(-diff, 0), 'credit': max(diff, 0), 'name': f"Centavos NC ML {uuid}"},
@@ -786,7 +823,7 @@ def main():
     log.info(f"=== 06 Loader NC ML | modo={RUN_MODE} | Odoo={ODOO_TARGET.upper()} {ODOO_URL} ({ODOO_DB}) | "
              f"órdenes={ONLY_ORDER_IDS or ('TODO el universo' if PREFLIGHT_ALL and RUN_MODE == 'preflight' else 'cola PENDING')} | "
              f"mes={NC_MONTH or 'todos'} | tope={MAX_NC_PER_RUN} ===")
-    if ODOO_TARGET == "prod" and RUN_MODE != "preflight":
+    if ODOO_TARGET == "prod" and RUN_MODE != "preflight" and not (RUN_MODE == "cents" and DRY_RUN_CENTS):
         log.warning("*** ESCRIBIENDO EN ODOO PRODUCTIVO ***")
     missing = [k for k, v in {"ODOO_URL": ODOO_URL, "ODOO_DB": ODOO_DB, "ODOO_USER": ODOO_USER, "ODOO_PASSWORD": ODOO_PASSWORD,
                               "DB_HOST": DB_HOST, "DB_USER": DB_USER, "DB_PASSWORD": DB_PASSWORD, "DB_NAME": DB_NAME}.items() if not v]
@@ -799,6 +836,12 @@ def main():
     cfg = load_config(odoo)
     log.info(f"Odoo OK (uid {odoo.uid}) | diarios {cfg['journals']} | cuentas {cfg['accounts']} | posición fiscal B {cfg['fp_b']} | "
              f"bloqueo hasta {cfg['lock_date'] or '-'}")
+
+    if RUN_MODE == "cents":
+        counts = sweep_cents(odoo, cfg, dry=DRY_RUN_CENTS)
+        db.close()
+        log.info(f"=== Resumen centavos de NC previas -> {counts} ===")
+        return
 
     if RUN_MODE == "returns":
         counts = sweep_returns(odoo, cfg, db, ONLY_ORDER_IDS or None)
@@ -816,6 +859,7 @@ def main():
     if RUN_MODE == "preflight" and PREFLIGHT_CSV:
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finanzas",
                                 f"Corrida_en_seco_NC_ML_{ODOO_TARGET}_{datetime.now():%Y-%m-%d_%H%M}.csv")
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)   # finanzas/ no está en el repo
         csv_file = open(csv_path, "w", newline="", encoding="utf-8-sig")
         writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
         writer.writeheader()

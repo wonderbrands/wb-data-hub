@@ -37,9 +37,12 @@ MP_ACCOUNT_CODE          = STORE['mp_account_code']
 # l10n_mx_edi.payment.method: 3 = Transferencia
 EDI_PAYMENT_METHOD_ID    = int(os.getenv("EDI_PAYMENT_METHOD_ID", "3"))
 ODOO_TIMEOUT             = int(os.getenv("ODOO_TIMEOUT", "120"))  # Timeout XML-RPC en segundos
-# Diferencias de hasta $0.01 entre el pago y el saldo se saldan contra esta cuenta (Finanzas, 21-nov)
+# Diferencias de hasta $0.15 entre el pago y el saldo, a favor o en contra, se saldan contra esta cuenta
+# (Finanzas, 24-nov; antes $0.01). Mismo criterio que Amazon.
 ACCOUNT_CODE_CENTS       = os.getenv("ACCOUNT_CODE_CENTS", "704.23.001")
-CENTS_TOLERANCE          = 0.0101
+CENTS_TOLERANCE          = float(os.getenv("CENTS_TOLERANCE", "0.15")) + 0.0001
+# Una factura se da por saldada solo con menos de $0.01 de saldo: un saldo de centavos todavía recibe su pago.
+SETTLED_TOLERANCE        = 0.0101
 # Los pagos en ERROR (502, timeout, factura que llegó después, ...) se reintentan en cada corrida.
 # Antes de crear se busca si el pago ya existe en Odoo: un 502 no dice si Odoo hizo commit.
 RETRY_ERRORS             = os.getenv("RETRY_ERRORS", "true").strip().lower() == "true"
@@ -107,7 +110,7 @@ def apply_payment(models, uid, ctx_cfg, record):
     """Aplica un cobro de MP a la factura de su SO. Devuelve (status, nota).
     Tope al saldo (Finanzas, 21-nov): nunca se aplica más que el saldo de la factura. Lo que sobra
     (envío pagado por el comprador, pago posterior a una NC, ...) queda sin aplicar y se reporta.
-    Diferencia de hasta $0.01 entre pago y saldo: se salda contra 704.23.001."""
+    Diferencia de hasta $0.15 entre pago y saldo: se salda contra 704.23.001."""
     inv, missing = find_invoice(models, uid, record['odoo_so_name'], record.get('cfdi_uuid'))
     if missing:
         return missing, f"{record['odoo_so_name']} (UUID {record.get('cfdi_uuid') or '-'})"
@@ -120,7 +123,7 @@ def apply_payment(models, uid, ctx_cfg, record):
         return 'ODOO_PAID', f"Ya estaba en Odoo (account.payment {dup}) en {inv['name']}"
 
     residual = inv['amount_residual']
-    if residual <= CENTS_TOLERANCE:
+    if residual <= SETTLED_TOLERANCE:
         return 'INVOICE_SETTLED', f"Factura {inv['name']} sin saldo al aplicar el pago de ${amount:,.2f}"
 
     vals = {
@@ -288,6 +291,9 @@ def load_ml_payments_to_odoo():
             log.info(f"[SECO] pago {record['payment_id']} orden {record['mkp_order_id']} "
                      f"${float(record['amount']):,.2f} -> {status} | {note or ''}")
             continue
+        prev = record.get('error_log') or ''
+        if prev.startswith('Carrito:'):   # marca del 03: la orden real del pago de carrito se conserva
+            note = prev.split(' | ')[0] + (f" | {note}" if note else '')
         cursor.execute("UPDATE finance.mkp_payments_prod SET status = %s, error_log = %s, processed_at = NOW() "
                        "WHERE id = %s", (status, note, record['id']))
         db.commit()

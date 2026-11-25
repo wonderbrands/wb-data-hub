@@ -36,3 +36,5 @@ pip-delete-this-directory.txt
 ml_traza/
 
 *.zip
+# Correos y CSV para Finanzas: viven fuera del repo (Documents/WonderBrands/Finanzas_NC_ML)
+test/financial/**/finanzas/

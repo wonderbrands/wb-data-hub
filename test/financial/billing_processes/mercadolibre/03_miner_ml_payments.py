@@ -258,11 +258,13 @@ def extract_ml_payments():
                              f"{register_as} por ${data_mp['transaction_amount']:,.2f} (liberado {date_rel:%Y-%m-%d})")
                     released += 1
                 elif date_rel_utc <= datetime.utcnow():
+                    # Carrito: queda anotada la orden real del pago (el 04 conserva la marca al procesarlo)
+                    pack_note = f"Carrito: pago de la orden {order_id}" if register_as != order_id else None
                     cursor.execute("""
                         INSERT IGNORE INTO finance.mkp_payments_prod
-                        (marketplace, mkp_order_id, payment_id, amount, date_released, status)
-                        VALUES (%s, %s, %s, %s, %s, 'PENDING')
-                    """, (MKP_MARKETPLACE, register_as, payment_id, data_mp['transaction_amount'], date_rel))
+                        (marketplace, mkp_order_id, payment_id, amount, date_released, status, error_log)
+                        VALUES (%s, %s, %s, %s, %s, 'PENDING', %s)
+                    """, (MKP_MARKETPLACE, register_as, payment_id, data_mp['transaction_amount'], date_rel, pack_note))
                     db.commit()
                     released += cursor.rowcount
                 else:

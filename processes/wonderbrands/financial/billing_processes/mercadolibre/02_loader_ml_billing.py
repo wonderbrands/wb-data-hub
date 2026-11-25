@@ -65,6 +65,11 @@ if LOG_ERRORS_AND_SUMMARY:
 STORE                   = get_store_config()
 MKP_MARKETPLACE         = STORE['marketplace']
 ACCOUNT_CODE_CXC_ML     = STORE['account_code_cxc']
+# Finanzas (12/24-nov): los CFDI de terceros entran a su diario (MELI / MLOF) con nombre = serie-folio del CFDI,
+# nunca al diario de facturas de Somos Reyes (Odoo numera el diario desde el folio más alto). Sin serie-folio
+# en el XML, la factura entra al diario por defecto como hasta hoy y se reporta. THIRD_PARTY_JOURNAL=false lo apaga.
+INVOICE_JOURNAL_CODE    = os.getenv("INVOICE_JOURNAL_CODE", STORE.get('invoice_journal_code') or '')
+THIRD_PARTY_JOURNAL     = os.getenv("THIRD_PARTY_JOURNAL", "true").strip().lower() == "true"
 
 PARTNER_ID_PUBLICO_GENERAL = int(os.getenv("PARTNER_ID_PUBLICO_GENERAL", "13436"))
 TAX_ID_MARKETPLACES     = int(os.getenv("TAX_ID_MARKETPLACES", "38"))
@@ -437,6 +442,9 @@ def process_single_invoice(record, context):
                 'l10n_mx_edi_payment_policy': metodo_pago,
             }
 
+            if context.get('invoice_journal_id') and xml_parsed.get('serie') and xml_parsed.get('folio'):
+                invoice_vals['journal_id'] = context['invoice_journal_id']
+                invoice_vals['name'] = f"{xml_parsed['serie']}-{xml_parsed['folio']}"   # serie-folio del CFDI de MeLi
             if invoice_date:
                 invoice_vals['invoice_date'] = invoice_date
                 invoice_vals['date'] = invoice_date
@@ -586,6 +594,14 @@ def process_batch_concurrently():
         # Cache de Métodos de pago
         pm_data = models.execute_kw(odoo_db, uid, odoo_pwd, 'l10n_mx_edi.payment.method', 'search_read', [[]], {'fields': ['id', 'code']})
         payment_methods_cache = {pm['code']: pm['id'] for pm in pm_data}
+
+        invoice_journal_id = False
+        if THIRD_PARTY_JOURNAL and INVOICE_JOURNAL_CODE:
+            j = models.execute_kw(odoo_db, uid, odoo_pwd, 'account.journal', 'search',
+                                  [[('code', '=', INVOICE_JOURNAL_CODE), ('type', '=', 'sale')]], {'limit': 1})
+            invoice_journal_id = j[0] if j else False
+            if not j:
+                log.warning(f"No existe el diario {INVOICE_JOURNAL_CODE}: las facturas entran al diario por defecto.")
 
     except Exception as e:
         log.error(f"Error de conexión inicial con Odoo: {e}")
@@ -737,6 +753,8 @@ def process_batch_concurrently():
                 ns = {'cfdi': 'http://www.sat.gob.mx/cfd/4', 'tfd': 'http://www.sat.gob.mx/TimbreFiscalDigital'}
 
                 parsed['forma_pago_code'] = root.get('FormaPago', '03')
+                parsed['serie'] = root.get('Serie') or ''
+                parsed['folio'] = root.get('Folio') or ''
                 parsed['metodo_pago'] = root.get('MetodoPago', 'PUE')
                 parsed['total_xml'] = float(root.get('Total', 0.0))
 
@@ -801,7 +819,8 @@ def process_batch_concurrently():
         'models': models,
         'so_map': so_map, 'lines_map': lines_map, 'invoice_map': invoice_map,
         'partner_map': partner_map, 'xml_parsed_map': xml_parsed_map,
-        'payment_methods_cache': payment_methods_cache
+        'payment_methods_cache': payment_methods_cache,
+        'invoice_journal_id': invoice_journal_id,
     }
 
     ready_to_post_list = []

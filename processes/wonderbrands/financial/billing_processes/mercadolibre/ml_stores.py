@@ -13,6 +13,11 @@ import os
 #                           el 04 aborta cuando el diario no la tiene (candado)
 #   billing_start        -> corte sobre somos_reyes.ml_order_update.date_created,
 #                           que se guarda en UTC-4 (hora de los servidores de ML)
+#   invoice_journal_code -> diario de terceros de las facturas de MeLi (02); el nombre es la serie-folio del CFDI
+#   nc_journal_code      -> diario de terceros de las NC de MeLi (06)
+#   nc_cobro_account     -> transitoria del reverso del cobro de una NC (06)
+#   rem_journal_code     -> diario de NC de reembolsos fuera de MeLi (06: doble egreso y retornos)
+#   team_name            -> equipo de ventas de la tienda en Odoo (06: retornos)
 STORES = {
     '25523702': {
         'seller_name': 'SOMOS-REYES',
@@ -22,6 +27,11 @@ STORES = {
         'mp_account_code': None,
         # Paciente Cero: 2026-06-01 19:50:58 UTC
         'billing_start': '2026-06-01 15:50:55',
+        'invoice_journal_code': 'MELI',
+        'nc_journal_code': 'MLNC',
+        'nc_cobro_account': '102.03.001',
+        'rem_journal_code': 'MLREM',
+        'team_name': 'Team_MercadoLibre',
     },
     '160190870': {
         'seller_name': 'SOMOS-REYES OFICIALES',
@@ -32,6 +42,12 @@ STORES = {
         # Arranque del autofacturador de Oficiales:
         # 2026-09-17 15:56:00 CDMX (UTC-6) = 2026-09-17 17:56:00 UTC-4
         'billing_start': '2026-09-17 17:56:00',
+        # Diarios y cuenta creados por Finanzas (24-nov): código de 5 caracteres; el nombre sale del CFDI
+        'invoice_journal_code': 'MLOF',
+        'nc_journal_code': 'MLONC',
+        'nc_cobro_account': '102.03.007',     # Mercado Pago Oficiales (cuenta transitoria)
+        'rem_journal_code': 'MLORM',          # reembolsos fuera de MeLi de Oficiales
+        'team_name': 'Team_MercadoLibreOficiales',
     },
 }
 

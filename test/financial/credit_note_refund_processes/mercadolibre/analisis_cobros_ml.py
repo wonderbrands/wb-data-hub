@@ -47,6 +47,7 @@ CXC_CODE    = "105.01.004"
 TOLERANCE   = 1.00               # misma regla de ±$1.00 que TOTAL_DIFF
 CHUNK       = 500
 OUT_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finanzas")
+os.makedirs(OUT_DIR, exist_ok=True)   # finanzas/ no está en el repo
 APPLIED     = ("ODOO_PAID", "INVOICE_SETTLED")      # estados del 04 que ya están en Odoo
 
 if LOCAL_ODOO == "test":
