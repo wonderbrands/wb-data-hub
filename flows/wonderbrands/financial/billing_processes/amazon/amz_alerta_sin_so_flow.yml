@@ -23,9 +23,9 @@ variables:
   db_name: "finance"
   db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
   scripts: "processes/wonderbrands/financial/billing_processes/amazon"
-  # Por ahora solo a Sergio (25-nov); cuando se confirme el correo de Will se
-  # agrega aquí por PR.
-  destinatarios: "sergio@wonderbrands.co"
+  # Will le da seguimiento con Yuju (25-nov); Sergio en copia.
+  destinatarios: "will@wonderbrands.co"
+  copia: "sergio@wonderbrands.co"
 
 tasks:
   - id: working_env_sin_so
@@ -70,6 +70,7 @@ tasks:
         password: "{{ secret('SMTP_PASSWORD') }}"
         from: "data@wonderbrands.co"
         to: "{{ vars.destinatarios }}"
+        cc: "{{ vars.copia }}"
         subject: "Amazon: órdenes cobradas sin SO en Odoo (Yuju)"
         htmlTextContent: |
           {{ read(outputs.ordenes_sin_so.outputFiles['email_body.html']) }}
