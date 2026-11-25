@@ -1,0 +1,95 @@
+id: amz_alerta_sin_so_flow
+namespace: wonderbrands.financial.billing_processes.amazon
+description: |
+  Amazon: correo diario con las órdenes que Amazon ya cobró y que siguen sin SO
+  en Odoo (NO_SO_IN_ODOO) 2 días o más después del cobro. Sin SO no se facturan;
+  la SO la baja Yuju. La alerta de Slack de 01 solo la ve Sergio: este correo es
+  para darle seguimiento con Yuju. Solo lee MySQL. Sin órdenes, no sale correo.
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: dias
+    type: INT
+    defaults: 2
+    displayName: "Días desde el cobro sin SO"
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  db_user: "kestra_bot"
+  db_name: "finance"
+  db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
+  scripts: "processes/wonderbrands/financial/billing_processes/amazon"
+  # Por ahora solo a Sergio (25-nov); cuando se confirme el correo de Will se
+  # agrega aquí por PR.
+  destinatarios: "sergio@wonderbrands.co"
+
+tasks:
+  - id: working_env_sin_so
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: ordenes_sin_so
+        type: io.kestra.plugin.scripts.shell.Commands
+        timeout: PT15M
+        containerImage: wonderbrands-python:v1
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+        env:
+          AMZ_ENTORNO: "prod"
+          AMZ_SIN_SO_DIAS: "{{ inputs.dias }}"
+          DB_HOST: "{{ vars.db_host }}"
+          DB_USER: "{{ vars.db_user }}"
+          DB_PASSWORD: "{{ secret('DB_PASSWORD_KESTRA') }}"
+          DB_NAME: "{{ vars.db_name }}"
+        commands:
+          - "python {{ vars.scripts }}/19_alerta_sin_so.py"
+        outputFiles:
+          - "ordenes_sin_so.csv"
+          - "email_body.html"
+
+      # Sin órdenes el script no escribe archivos y el correo no sale (allowFailure).
+      - id: enviar_sin_so
+        type: io.kestra.plugin.email.MailSend
+        allowFailure: true
+        host: smtp.gmail.com
+        port: 587
+        transportStrategy: SMTP_TLS
+        username: "{{ secret('SMTP_USERNAME') }}"
+        password: "{{ secret('SMTP_PASSWORD') }}"
+        from: "data@wonderbrands.co"
+        to: "{{ vars.destinatarios }}"
+        subject: "Amazon: órdenes cobradas sin SO en Odoo (Yuju)"
+        htmlTextContent: |
+          {{ read(outputs.ordenes_sin_so.outputFiles['email_body.html']) }}
+        attachments:
+          - name: "ordenes_amazon_sin_so.csv"
+            uri: "{{ outputs.ordenes_sin_so.outputFiles['ordenes_sin_so.csv'] }}"
+
+triggers:
+  # Lunes a viernes 09:00 CDMX: después de la corrida de 02:30, que siembra las
+  # órdenes nuevas sin SO, y lejos de las corridas de facturación.
+  - id: diario
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 * * 1-5"
+    timezone: America/Mexico_City
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *Fallo en la alerta de órdenes de Amazon sin SO* 🚨\n*Flujo:* {{ flow.id }}\n*ID de ejecución:* {{ execution.id }}\n*Fecha:* {{ execution.startDate }}"
+      }
