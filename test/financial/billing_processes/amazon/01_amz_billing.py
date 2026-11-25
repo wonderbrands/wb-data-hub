@@ -119,7 +119,7 @@ from _amz_common import (
     ACCOUNT_MERC_NO_ENVIADA, IDEMPOTENCY_PREFIX, KESTRA_EXECUTION_ID, UTC_local,
     validar_entorno, banner, notify_slack, get_db_connection,
     OdooModelProxy, OdooWriteUncertain, get_account_id, a_float,
-    ejecutar_sin_retorno, sp_api_token, get_order_items,
+    ejecutar_sin_retorno, sp_api_token, sp_api_get, get_order_items,
 )
 
 # =============================================================================
@@ -343,6 +343,13 @@ DEDUP_LOOKBACK_DAYS = 90
 # 401.01.001 en todos los canales).
 PRODUCTO_ENVIO = 'C-ENVIO'
 
+# Diario de los CFDI de Amazon Business (Jero, hoja de ruta del 24-nov, punto
+# 1). Exclusivo de comprobantes de Amazon: la factura se llama como el CFDI
+# (serie-folio, AB-1245), igual que las NC de MeLi en MLNC. En un diario
+# compartido no se puede: Odoo numera el siguiente documento a partir del
+# folio mas alto. Si el diario no existe, se usa el de siempre y se avisa.
+B2B_JOURNAL_CODE = os.getenv('AMZ_B2B_JOURNAL_CODE', 'AMZB').strip()
+
 B2B_TELEFONO_GENERICO = os.getenv('AMZ_B2B_TELEFONO', '11111')
 B2B_CORREO_GENERICO = os.getenv('AMZ_B2B_CORREO', 'market@somos-reyes.com')
 
@@ -421,10 +428,15 @@ MINER_OVERFETCH = int(os.getenv('AMZ_MINER_OVERFETCH', '3'))
 #                       todos los envios. Era definitivo y la orden se quedaba
 #                       sin vincular aunque despues cuadrara (SO10384682).
 #   NO_SO_IN_ODOO       en cuanto Yuju crea la SO, la orden se factura.
+#
+# Desde el 24-nov-2026 (Jero, punto 8 de la hoja de ruta):
+#   LIBERACION_PARCIAL  la SO coincide con lo que pago el cliente pero Amazon
+#                       solo ha liberado parte de las piezas. Caia en TOTAL_DIFF,
+#                       que es final: 102 ordenes de noviembre sin facturar.
 REFRESCABLES = ('PENDING_B2B_LINK', 'PENDING_WB_INVOICE', 'SKIPPED_GRACE', 'ERROR',
                 'SO_DRAFT', 'SO_CANCELLED', 'B2B_NO_RECEPTOR', 'B2B_FACTURADA_PG',
                 'ENVIO_SIN_CONFIRMAR', 'B2B_SIN_CFDI', 'B2B_SPLIT_MISMATCH',
-                'NO_SO_IN_ODOO')
+                'NO_SO_IN_ODOO', 'LIBERACION_PARCIAL')
 
 # Las que el miner regresa a pendiente al refrescarlas (todas menos ERROR, que
 # se reintenta por retry_count_loader y lo revisa una persona).
@@ -1509,6 +1521,54 @@ def alertar_sat_cancelado_vivo(odoo):
     return lista
 
 
+# =============================================================================
+# MARCA DE AMAZON BUSINESS EN LA SO (Demian, Tech, 24-nov)
+# =============================================================================
+# El portal de autofacturacion bloquea las SO con is_amazon_business = True
+# (campo nuevo del modulo wb_data_autoinvoice). Yuju no lo llena: aqui se marca
+# con amazon_orders.IsBusinessOrder, que existe desde que la orden esta
+# Pending (antes de que Amazon la cobre). Solo pone True, nunca lo quita. Si el
+# campo no existe todavia en Odoo, no hace nada. Nunca rompe la corrida.
+# =============================================================================
+MARCA_BUSINESS_DIAS = int(os.getenv('AMZ_MARCA_BUSINESS_DIAS', '45'))
+
+
+def marcar_business_en_so(odoo, db_conn):
+    """Devuelve cuantas SO se marcaron."""
+    try:
+        campos = odoo.execute_kw('sale.order', 'fields_get', [['is_amazon_business']],
+                                 {'attributes': ['type']})
+        if 'is_amazon_business' not in campos:
+            log.info("[BUSINESS] sale.order no tiene is_amazon_business; no se marca.")
+            return 0
+        cur = db_conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT s.name
+            FROM somos_reyes.amazon_orders o
+            JOIN somos_reyes.odoo_new_sale_order_live s
+              ON s.channel_order_reference = o.AmazonOrderId
+            WHERE o.IsBusinessOrder = 1
+              AND o.PurchaseDate >= NOW() - INTERVAL %s DAY
+        """, (MARCA_BUSINESS_DIAS,))
+        nombres = [r[0] for r in cur.fetchall() if r[0]]
+        cur.close()
+        marcadas = 0
+        for i in range(0, len(nombres), 500):
+            ids = odoo.execute_kw('sale.order', 'search',
+                                  [[('name', 'in', nombres[i:i + 500]),
+                                    ('is_amazon_business', '=', False)]])
+            if ids:
+                odoo.execute_kw('sale.order', 'write', [ids, {'is_amazon_business': True}],
+                                {'context': {'tracking_disable': True}})
+                marcadas += len(ids)
+        log.info(f"[BUSINESS] {len(nombres)} SO Business en {MARCA_BUSINESS_DIAS} dias; "
+                 f"{marcadas} marcadas ahora con is_amazon_business.")
+        return marcadas
+    except Exception as e:
+        log.warning(f"[BUSINESS] No se pudo marcar is_amazon_business: {e}")
+        return 0
+
+
 def _fetch_por_status(cursor, status, limite, orden):
     sql = f"""
         SELECT id, mkp_order_id, odoo_so_name, cfdi_uuid, total_amount,
@@ -2218,9 +2278,16 @@ def cargar_catalogos(odoo):
     if not envio:
         log.warning(f"No existe el producto {PRODUCTO_ENVIO}: las facturas con "
                     f"envio cobrado y SO sin envio saldran en TOTAL_DIFF.")
+    diario_b2b = odoo.execute_kw('account.journal', 'search',
+                                 [[('code', '=', B2B_JOURNAL_CODE), ('type', '=', 'sale')]],
+                                 {'limit': 1}) if B2B_JOURNAL_CODE else []
+    if B2B_JOURNAL_CODE and not diario_b2b:
+        log.warning(f"No existe el diario de ventas {B2B_JOURNAL_CODE}: los CFDI de "
+                    f"Amazon Business se registran en el diario por defecto.")
     return {'formas_pago': metodos, 'mx_country_id': mx[0] if mx else False,
             'cuenta_merc_no_enviada': get_account_id(odoo, ACCOUNT_MERC_NO_ENVIADA),
-            'producto_envio': envio[0] if envio else None}
+            'producto_envio': envio[0] if envio else None,
+            'diario_b2b': diario_b2b[0] if diario_b2b else None}
 
 
 def extraer_desglose_b2b(record):
@@ -2605,6 +2672,109 @@ def evaluar_promo_amazon(record, parte):
             'excedente': round(transacciones - estimado, 2)}
 
 
+# =============================================================================
+# LIBERACION PARCIAL (B2C) -- Jero, hoja de ruta del 24-nov, punto 8
+# =============================================================================
+# Amazon libera por pieza. Al sexto dia de la compra una orden de 2 piezas
+# puede tener solo una liberada: la SO (lo que pago el cliente, 3,398.00) no
+# cuadra con las transacciones (1,699.00) y caia en TOTAL_DIFF, que es final.
+# Al 24-nov eran 102 ordenes de noviembre, casi todas asi.
+#
+# REGLA (opcion C, aprobada por Finanzas):
+#   1. La SO coincide con lo que pago el cliente (+-TOLERANCIA_TOTAL) y es
+#      MAYOR que lo liberado. Si fuera menor es promocion de Amazon (arriba).
+#   2. Fuera del cierre: no se factura. Queda en LIBERACION_PARCIAL, que el
+#      miner reevalua en cada corrida; se factura cuando Amazon libera todo.
+#   3. En el cierre (venta del mes anterior): se factura por lo que pago el
+#      cliente, con fecha del ultimo dia del mes. La venta no sale de su mes.
+# =============================================================================
+
+def evaluar_liberacion_parcial(record, parte):
+    """{'cobrado_cliente', 'liberado'} si la orden cumple la regla; si no, None."""
+    try:
+        raw = json.loads(record['raw_json']) if record.get('raw_json') else {}
+    except (ValueError, TypeError):
+        return None
+    cobrado = raw.get('amazon', {}).get('order_total_cliente')
+    if not cobrado:
+        return None
+    estimado, liberado = parte['estimado'], parte['referencia']
+    if abs(estimado - cobrado) > TOLERANCIA_TOTAL:
+        return None                    # la SO no es lo que pago el cliente
+    if estimado <= liberado + TOLERANCIA_TOTAL:
+        return None                    # no falta nada por liberar
+    return {'cobrado_cliente': a_float(cobrado), 'liberado': liberado}
+
+
+# =============================================================================
+# LO QUE PAGO EL CLIENTE, DESDE LA API, CUANDO amazon_orders NO LO TRAE
+# =============================================================================
+# Jero, hoja de ruta del 24-nov, punto 5. amazon_orders guarda la orden cuando
+# esta Pending (sin OrderTotalAmount) y el ETL no siempre la vuelve a leer: al
+# 23-nov eran 54 ordenes desde el 1-oct. Sin ese dato las reglas de promocion
+# y de liberacion parcial no tienen contra que validar (SO10347964,
+# SO10340253). El ETL no es de este repo: aqui se consulta getOrder solo para
+# las ordenes que no cuadran y no traen el total. Solo se usa si la orden ya
+# esta Shipped y en MXN.
+# =============================================================================
+
+def total_cliente_api(db_conn, order_id):
+    """OrderTotal de getOrder (Orders API v0) o None."""
+    try:
+        orden = sp_api_get(sp_api_token(db_conn),
+                           f"/orders/v0/orders/{order_id}").get('payload') or {}
+    except Exception as e:
+        log.warning(f"{order_id}: no se pudo leer la orden en la API: {e}")
+        return None
+    total = orden.get('OrderTotal') or {}
+    if orden.get('OrderStatus') != 'Shipped' or total.get('CurrencyCode') != 'MXN':
+        log.info(f"{order_id}: la API no da un total utilizable "
+                 f"(estado {orden.get('OrderStatus')}, {total}).")
+        return None
+    return a_float(total.get('Amount')) or None
+
+
+def completar_total_cliente(db_conn, record, total):
+    """Mete en el raw_json de ESTA corrida lo que pago el cliente segun la API.
+    No se guarda en la tabla: el miner lo vuelve a leer de amazon_orders."""
+    try:
+        raw = json.loads(record['raw_json']) if record.get('raw_json') else {}
+    except (ValueError, TypeError):
+        raw = {}
+    raw.setdefault('amazon', {})['order_total_cliente'] = total
+    raw['amazon']['order_total_fuente'] = 'api'
+    record['raw_json'] = json.dumps(raw, ensure_ascii=False, default=str)
+
+
+# =============================================================================
+# ENVIO EN AMAZON BUSINESS -- Jero, hoja de ruta del 24-nov, punto 6
+# =============================================================================
+# SO10393600: CFDI de Amazon AB-1245 por 793.00; la SO trae 749.00. Los 44.00
+# son el envio que pago el cliente (37.93 + 6.07 de IVA) y que Yuju no pone en
+# la SO. En B2C ya se agregaba C-ENVIO; en B2B la orden caia en TOTAL_DIFF.
+# Se agrega solo si el envio viene en las transacciones y con el la factura
+# queda igual al CFDI de Amazon: el comprobante se importa tal cual.
+# =============================================================================
+
+def envio_b2b(record, estimado, referencia, catalogos, tiene_envio):
+    """{'base', 'iva', 'total'} del envio que falta en una B2B, o None."""
+    if tiene_envio or not catalogos.get('producto_envio'):
+        return None
+    try:
+        imp = (json.loads(record['raw_json']) or {}).get('importes', {})
+    except (ValueError, TypeError):
+        return None
+    base = round(a_float(imp.get('envio_base')), 2)
+    iva = round(a_float(imp.get('envio_iva')), 2)
+    if base <= 0.005:
+        return None
+    if abs(estimado - referencia) <= TOLERANCIA_TOTAL:
+        return None                    # el CFDI de Amazon no cobra el envio aparte
+    if abs(round(estimado + base + iva, 2) - referencia) > TOLERANCIA_TOTAL:
+        return None                    # con el envio tampoco cuadra: TOTAL_DIFF
+    return {'base': base, 'iva': iva, 'total': round(base + iva, 2)}
+
+
 def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache):
     so_name = record['odoo_so_name']
     es_b2b = record['status'] == 'PENDING_B2B_LINK'
@@ -2800,6 +2970,24 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
     # agrega a la FACTURA (401.01.002) por la base e IVA de las transacciones.
     # La SO no se toca: es de Yuju. Solo B2C de factura unica; en B2B manda
     # el CFDI de Amazon.
+    #
+    # Antes: si amazon_orders no trae lo que pago el cliente y la SO no cuadra
+    # con lo liberado, se pregunta a la API (ver total_cliente_api).
+    if not es_b2b and len(partes) == 1:
+        try:
+            sin_total = not (json.loads(record.get('raw_json') or '{}') or {}) \
+                .get('amazon', {}).get('order_total_cliente')
+        except (ValueError, TypeError):
+            sin_total = True
+        if sin_total and abs(total_estimado(partes[0]['lineas'])
+                             - partes[0]['referencia']) > TOLERANCIA_TOTAL:
+            total_api = total_cliente_api(db_conn, record['mkp_order_id'])
+            if total_api:
+                completar_total_cliente(db_conn, record, total_api)
+                partes[0]['total_api'] = total_api
+                log.info(f"{so_name}: amazon_orders sin OrderTotal; la API dice que "
+                         f"el cliente pago {total_api:,.2f}.")
+
     if not es_b2b and len(partes) == 1:
         lineas0 = partes[0]['lineas']
         envio = envio_por_facturar(
@@ -2820,6 +3008,19 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
                 partes[0]['referencia'] = round(partes[0]['referencia'] + envio['total'], 2)
             log.info(f"{so_name}: la SO no trae el envio que cobro Amazon; se "
                      f"agrega C-ENVIO {envio['total']:,.2f} (fuente: {envio['fuente']}).")
+
+    # B2B de un solo CFDI: el envio que la SO no trae, si con el la factura
+    # queda igual al CFDI de Amazon (ver envio_b2b).
+    if es_b2b and len(partes) == 1:
+        lineas0 = partes[0]['lineas']
+        envio = envio_b2b(
+            record, total_estimado(lineas0), partes[0]['referencia'], catalogos,
+            any(c[2].get('product_id') == catalogos.get('producto_envio') for c in lineas0))
+        if envio:
+            lineas0.append(comando_envio(envio['base'], catalogos))
+            partes[0]['envio_agregado'] = envio['total']
+            log.info(f"{so_name}: B2B sin el envio que trae el CFDI de Amazon; se "
+                     f"agrega C-ENVIO {envio['total']:,.2f}.")
 
     malas = []
     for parte in partes:
@@ -2843,6 +3044,25 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
                      f"lo que pago el cliente {promo['cobrado_cliente']:,.2f} "
                      f"(transacciones {promo['transacciones']:,.2f}, "
                      f"excedente {promo['excedente']:,.2f}).")
+
+    # Liberacion parcial (ver bloque arriba de evaluar_liberacion_parcial).
+    if malas and not es_b2b and len(partes) == 1:
+        parcial = evaluar_liberacion_parcial(record, partes[0])
+        if parcial and en_cierre_de_mes() and venta_de_mes_anterior(so):
+            partes[0]['parcial'] = parcial
+            partes[0]['referencia'] = parcial['cobrado_cliente']
+            malas = []
+            log.info(f"{so_name}: liberacion parcial en el cierre. Se factura lo que "
+                     f"pago el cliente {parcial['cobrado_cliente']:,.2f} (liberado "
+                     f"{parcial['liberado']:,.2f}).")
+        elif parcial:
+            motivo = (f"Amazon libero {parcial['liberado']:,.2f} de "
+                      f"{parcial['cobrado_cliente']:,.2f} que pago el cliente (la SO "
+                      f"coincide). Se factura al liberarse todo o en el cierre del mes.")
+            update_staging(db_conn, record['id'], 'LIBERACION_PARCIAL', error_log=motivo)
+            stats['liberacion_parcial'].append(f"{so_name}: {motivo}")
+            log.info(f"{so_name}: LIBERACION_PARCIAL. {motivo}")
+            return
 
     if malas:
         detalle = '; '.join(
@@ -2911,6 +3131,13 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
         notas.append("SO_CONFIRMADA: estaba en borrador")
     if len(partes) == 1 and partes[0].get('envio_agregado'):
         notas.append(f"ENVIO_AGREGADO C-ENVIO {partes[0]['envio_agregado']:.2f}")
+    parcial = partes[0].get('parcial') if len(partes) == 1 else None
+    if parcial:
+        notas.append(f"LIBERACION_PARCIAL_CIERRE cliente {parcial['cobrado_cliente']:.2f} "
+                     f"liberado {parcial['liberado']:.2f}")
+    if len(partes) == 1 and partes[0].get('total_api'):
+        notas.append(f"ORDER_TOTAL_API {partes[0]['total_api']:.2f}")
+    cobrado = (promo or parcial or {}).get('cobrado_cliente')
     # cfdi_uuid: en B2B el de Amazon (ya estaba); en B2C el de nuestro timbrado,
     # None si fallo. Todas las facturas, con su UUID, en raw_json.facturas_odoo.
     uuid_wb = next((c['uuid'] for c in creadas if c['uuid']), None)
@@ -2919,7 +3146,7 @@ def procesar(odoo, db_conn, record, account_cxc, stats, catalogos, partner_cache
         'ODOO_B2B_LINKED' if es_b2b else 'ODOO_INVOICED',
         cfdi_uuid=record['cfdi_uuid'] if es_b2b else uuid_wb,
         error_log=' | '.join(notas) or None,
-        total_amount=promo['cobrado_cliente'] if promo else None,
+        total_amount=cobrado,
         facturas=[{'factura': c['factura'], 'uuid': c['uuid'], 'fecha': c['fecha'],
                    'timbre': c['timbre'], 'total': c['total_odoo']} for c in creadas])
 
@@ -3321,12 +3548,23 @@ def crear_parte(odoo, db_conn, record, so, parte, account_cxc, stats,
         if cfdi.get('metodo_pago'):
             invoice_vals['l10n_mx_edi_payment_policy'] = cfdi['metodo_pago']
 
-        # Fecha del comprobante de Amazon, no la de la corrida.
+        # Fecha del comprobante de Amazon, no la de la corrida. Solo la fecha
+        # de factura: la contable ('date') la calcula Odoo a partir de ella y
+        # respeta la fecha de bloqueo. Si el mes del CFDI ya esta cerrado, el
+        # asiento cae en el primer dia abierto en vez de rechazarse (riesgo
+        # del 18-nov: las Business del portal canceladas despues del cierre).
         fecha_cfdi = str(cfdi.get('date') or '')[:10]
         if len(fecha_cfdi) == 10:
             invoice_vals['invoice_date'] = fecha_cfdi
-            invoice_vals['date'] = fecha_cfdi
             invoice_vals['invoice_date_due'] = fecha_cfdi
+
+        # Diario de los CFDI de Amazon (AMZB) con el nombre del comprobante.
+        if catalogos.get('diario_b2b'):
+            invoice_vals['journal_id'] = catalogos['diario_b2b']
+            serie = str(cfdi.get('series') or '').strip()
+            folio = str(cfdi.get('folio') or '').strip()
+            if serie and folio and ',' not in folio:
+                invoice_vals['name'] = f"{serie}-{folio}"
 
         log.info(f"{so_name}{parte['etiqueta']}: B2B -> receptor "
                  f"{cfdi.get('receiver_rfc')} ({cfdi.get('receiver_name')}) | "
@@ -3562,6 +3800,7 @@ def nuevos_stats(reclasificadas_b2b=0):
             'confirmadas': [], 'en_global': [], 'b2b_facturada_pg': [],
             'envio_agregado': [], 'envio_sin_confirmar': [], 'envio_aparte': [],
             'kit_sin_costo': [], 'timbrado_fallido': [], 'mes_anterior_fuera_cierre': [],
+            'liberacion_parcial': [],
             'conciliacion_205': {},
             'reclasificadas_b2b': reclasificadas_b2b,
             'cuota': {'B2B': 0, 'B2C_PUBLICO_GENERAL': 0}}
@@ -3574,6 +3813,7 @@ def run_loader(db_conn):
     # tiene que consultarlo y sus filas entran en esta misma corrida.
     odoo = OdooModelProxy(timeout=300)
     alertar_sat_cancelado_vivo(odoo)
+    marcar_business_en_so(odoo, db_conn)
     reabiertas = reabrir_facturas_canceladas(odoo, db_conn)
     records = fetch_pendientes(db_conn)
     if not records:
@@ -3697,6 +3937,7 @@ def reportar(stats):
     log.info(f"  B2B sin receptor en el CFDI     : {len(stats['b2b_sin_receptor'])}")
     log.info(f"  B2C con promocion de Amazon     : {len(stats['promo_amazon'])}")
     log.info(f"  TOTAL_DIFF (no facturadas)      : {len(stats['total_diff'])}")
+    log.info(f"  Liberacion parcial (en espera)  : {len(stats['liberacion_parcial'])}")
     log.info(f"  Reparto B2B fallido             : {len(stats['split_fallido'])}")
     log.info(f"  Reclasificadas a B2B (tardias)  : {stats['reclasificadas_b2b']}")
     log.info(f"  Adoptadas tras create incierto  : {stats['adoptadas']}")

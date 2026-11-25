@@ -23,6 +23,7 @@ Las copias de trabajo y los scripts de un solo uso (saneamiento 12, centavos 13,
 |---|---|---|
 | `amz_billing_payments_flow` | 00 → 01 → 02 → 03 | 02:30 y 15:00 diario |
 | `amz_cierre_mercFacNoEnv_flow` | 11 + correo de kits | día 2, 09:00 |
+| `amz_alerta_sin_so_flow` | 19: correo con las órdenes cobradas sin SO (2+ días) para darle seguimiento con Yuju | L–V 09:00 |
 
 `concurrency: FAIL` y sin retry: nunca dos corridas a la vez (incidente del 26-jul-2026, 549 dobles CFDI). Los horarios esquivan ML (00/06/12/18 h), el 1a1 (04:30 y 19:30) y el housekeeping (03:15). Una corrida manual larga que se traslape hace fallar la del cron.
 
@@ -63,16 +64,19 @@ Una corrida que arranca en cierre termina en cierre, aunque pase la medianoche (
   - B2B → se vincula el CFDI de Amazon;
   - Business sin CFDI → `B2B_SIN_CFDI`;
   - B2C → se reemite **con relación de sustitución (04)** con la cancelada (`AMZ_SUSTITUCION=1`).
+- **Marca Business en la SO** (24-nov, para el portal de autofacturación): pone `sale.order.is_amazon_business = True` en las SO cuya orden tiene `IsBusinessOrder = 1` en `amazon_orders` (compras de los últimos `AMZ_MARCA_BUSINESS_DIAS` días, 45). Solo pone True. Si el campo no existe en Odoo, no hace nada.
 
 Luego, por orden, con candado `PROCESSING`:
 1. Toda venta que Amazon cobró se factura: la SO en borrador se confirma y la SO cancelada se factura igual (su NC sale por devoluciones).
 2. Revalida en Odoo justo antes de crear (fail-closed). Una SO con factura viva, incluida una global, no se refactura.
-3. Valida contra Amazon (±$1.00) antes de crear. Si no cuadra → `TOTAL_DIFF`.
-4. **Envío:** Yuju no pone C-ENVIO en la SO. Se agrega a la factura solo si lo confirma el settlement, el depósito o la API. Si la factura ya existía sin envío, se emite otra aparte: `AUTOINV:<SO>:ENVIO`.
+3. Valida contra Amazon (±$1.00) antes de crear. Si no cuadra → `TOTAL_DIFF`. Si `amazon_orders` no trae lo que pagó el cliente (la orden se guardó en Pending), se pregunta a la API (`getOrder`, solo si ya está Shipped).
+4. **Envío:** Yuju no pone C-ENVIO en la SO. Se agrega a la factura solo si lo confirma el settlement, el depósito o la API. Si la factura ya existía sin envío, se emite otra aparte: `AUTOINV:<SO>:ENVIO`. **En Business** se agrega si viene en las transacciones y con él la factura queda igual al CFDI de Amazon (SO10393600).
 5. **Promoción pagada por Amazon:** la B2C se factura por lo que pagó el comprador; el excedente lo asienta 03.
+5b. **Liberación parcial** (24-nov): la SO coincide con lo que pagó el cliente pero Amazon solo liberó parte de las piezas → `LIBERACION_PARCIAL`, se reevalúa cada corrida y se factura cuando Amazon libera todo. En el cierre de mes la venta del mes anterior se factura por lo que pagó el cliente, con fecha del último día.
 6. **Kits:** en SO cancelada, la línea se crea sin liga a la SO (para que tome costo) y se religa después de publicar.
 7. **Centavo:** en B2B se ajusta la línea de IVA al CFDI de Amazon. **En B2C nunca**: el PAC lo rechaza (CFDI40119). Ese centavo lo salda 03.
 8. Publica, timbra (B2C) y concilia la 205.06.003 contra la salida de almacén (`conciliar_salida`).
+9. **B2B en el diario AMZB** (24-nov): la factura que replica el CFDI de Amazon va al diario `AMZB` (`AMZ_B2B_JOURNAL_CODE`) y se llama como el CFDI (`AB-1245`). Lleva la fecha de factura del CFDI; la fecha contable la pone Odoo y respeta el candado (si el mes del CFDI está cerrado, cae en el primer día abierto). Las anteriores, que quedaron en INV/, se pasan con `test/.../amazon/16_traslado_amzb.py` (uso único).
 
 **Identificación en Odoo.**
 - `ref` de la factura:
@@ -108,6 +112,7 @@ Luego, por orden, con candado `PROCESSING`:
 | `B2B_FACTURADA_PG` | Amazon emitió el CFDI B2B pero la orden tiene una factura viva a público general. Finanzas la cancela (SAT motivo 02) y se vincula sola | sí, cada corrida, de cualquier mes |
 | `B2B_NO_RECEPTOR` / `SO_DRAFT` / `ENVIO_SIN_CONFIRMAR` | Excepción temporal | sí |
 | `B2B_SPLIT_MISMATCH` | Varios CFDI de Amazon que no se pudieron repartir contra los envíos. Suele ser un envío que Amazon aún no libera; el motivo queda en `error_log` | sí, cada corrida; si persiste, a mano |
+| `LIBERACION_PARCIAL` | B2C: la SO = lo que pagó el cliente, pero Amazon solo liberó parte. No se factura todavía | sí, cada corrida; en el cierre se factura por lo pagado |
 | `TOTAL_DIFF` | Odoo ≠ Amazon por más de $1; no se facturó | a mano |
 | `NO_SO_IN_ODOO` | Amazon cobró y no hay SO en Odoo (la crea Yuju). Alerta por Slack | sí: se factura cuando aparece la SO |
 | `ERROR` | Fallo de Odoo (`FECHA_INCORRECTA`, create rechazado…). El miner actualiza sus datos pero no la reabre | a mano: regresarla a `PENDING_*` |

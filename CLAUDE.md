@@ -158,6 +158,7 @@ Los crons de ML **no tienen `timezone`**: corren en UTC. Los de Amazon y el 1a1 
 | `odoo_facturacion_1a1_mkp_pipeline` | 04:30 y 19:30 |
 | `amz_billing_payments_flow` | 02:30 y 15:00 |
 | `amz_cierre_mercFacNoEnv_flow` | día 2, 09:00 |
+| `amz_alerta_sin_so_flow` (solo MySQL, correo) | L–V 09:00 |
 | `daily_dispatch_alerts` | 08:00 L–V |
 
 ⚠️ **Choques en Odoo:** Amazon 15:00 y el cierre de Amazon (día 2, 09:00) coinciden con ML Oficiales. ML Oficiales 03:00 cae dentro de la corrida larga de Amazon del día 1. No duplican CFDI (son otros equipos), pero cargan Odoo a la vez. Un flujo nuevo debe buscar hueco en esta tabla.
@@ -254,6 +255,13 @@ Una tienda nueva va en `ml_stores.STORES` más un par de YAML, nunca con scripts
   - `B2B_SPLIT_MISMATCH` y `NO_SO_IN_ODOO` se reevalúan en cada corrida;
   - las órdenes cobradas sin SO se siembran y alertan;
   - alerta de compañía por CFDI cancelado ante el SAT con asiento publicado.
+- **Hoja de ruta de Finanzas (24/25-nov):**
+  - `LIBERACION_PARCIAL`: la SO = lo pagado y Amazon liberó parte. Espera y se reevalúa; en el cierre se factura por lo pagado.
+  - Si `amazon_orders` no trae `OrderTotal`, se consulta `getOrder`.
+  - C-ENVIO en Business cuando cuadra con el CFDI.
+  - Las Business van al diario **AMZB** con nombre serie-folio (AB-1245), sin forzar fecha contable (respeta el candado). Las 269 anteriores se trasladaron el 25-nov (script 16).
+  - 01 marca `sale.order.is_amazon_business` para el portal.
+  - `amz_alerta_sin_so_flow` (19) manda por correo las órdenes sin SO.
 - `amz_cierre_mercFacNoEnv_flow` (11): cierre de la 205.06.003, día 2.
 
 **Datos de Amazon (`somos_reyes`):**
