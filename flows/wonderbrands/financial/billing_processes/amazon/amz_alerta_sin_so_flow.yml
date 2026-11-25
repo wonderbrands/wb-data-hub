@@ -23,8 +23,9 @@ variables:
   db_name: "finance"
   db_host: "wonderbrands1.cuwd36ifbz5t.us-east-1.rds.amazonaws.com"
   scripts: "processes/wonderbrands/financial/billing_processes/amazon"
-  # Will le da seguimiento con Yuju (25-nov); Sergio en copia.
-  destinatarios: "will@wonderbrands.co"
+  # Will le da seguimiento con Yuju y Jero (Finanzas) lo monitorea (25-nov);
+  # Sergio en copia.
+  destinatarios: "will@wonderbrands.co, jeronimo@wonderbrands.co"
   copia: "sergio@wonderbrands.co"
 
 tasks:
