@@ -26,7 +26,7 @@ from _amz_common import (
     ACCOUNT_AMAZON_CXC, ACCOUNT_LIBERACIONES, ACCOUNT_MERC_NO_ENVIADA,
     ACCOUNT_CUPONES_AMAZON, ACCOUNT_IVA_TRASLADADO, ACCOUNT_REDONDEO,
     validar_entorno, get_db_connection, OdooModelProxy, get_amazon_team_ids,
-    find_journal_by_account,
+    find_journal_by_account, validar_impuesto,
 )
 
 CUENTAS = [ACCOUNT_AMAZON_CXC, ACCOUNT_LIBERACIONES, ACCOUNT_MERC_NO_ENVIADA,
@@ -62,10 +62,11 @@ def run():
     revisar(bool(odoo.execute_kw('account.journal', 'search', [[('type', '=', 'general')]],
                                  {'limit': 1})), "diario general (cierre mensual)")
 
-    t = odoo.execute_kw('account.tax', 'search_read', [[('id', '=', TAX_ID_MARKETPLACES)]],
-                        {'fields': ['name', 'amount']})
-    revisar(bool(t) and t[0]['amount'] == 16, f"impuesto {TAX_ID_MARKETPLACES} (IVA 16%)",
-            t[0]['name'] if t else '')
+    try:
+        t = validar_impuesto(odoo)
+        revisar(True, f"impuesto {TAX_ID_MARKETPLACES} (IVA 16% al cobro, 209.01.001)", t['name'])
+    except Exception as e:
+        revisar(False, f"impuesto {TAX_ID_MARKETPLACES} (IVA 16% al cobro, 209.01.001)", str(e))
     p = odoo.execute_kw('res.partner', 'search_read', [[('id', '=', PARTNER_ID_PUBLICO_GENERAL)]],
                         {'fields': ['vat']})
     revisar(bool(p) and p[0]['vat'] == 'XAXX010101000', f"publico en general {PARTNER_ID_PUBLICO_GENERAL}")

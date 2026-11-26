@@ -120,6 +120,7 @@ from _amz_common import (
     validar_entorno, banner, notify_slack, get_db_connection,
     OdooModelProxy, OdooWriteUncertain, get_account_id, a_float,
     ejecutar_sin_retorno, sp_api_token, sp_api_get, get_order_items,
+    validar_impuesto,
 )
 
 # =============================================================================
@@ -2266,6 +2267,10 @@ def total_estimado(comandos):
 
 def cargar_catalogos(odoo):
     """Cataloga una sola vez lo que despues se consulta por factura."""
+    # IVA al cobro (209.01.001). Si no lo es, ninguna factura sale (FAIL-CLOSED).
+    impuesto = validar_impuesto(odoo)
+    log.info(f"Impuesto {TAX_ID_MARKETPLACES} ({impuesto['name']}): IVA 16% al cobro, "
+             f"transitoria {impuesto['cash_basis_transition_account_id'][1]}.")
     pm = odoo.execute_kw('l10n_mx_edi.payment.method', 'search_read', [[]],
                          {'fields': ['id', 'code']})
     metodos = {p['code']: p['id'] for p in pm}

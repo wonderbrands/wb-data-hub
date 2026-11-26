@@ -72,7 +72,12 @@ INVOICE_JOURNAL_CODE    = os.getenv("INVOICE_JOURNAL_CODE", STORE.get('invoice_j
 THIRD_PARTY_JOURNAL     = os.getenv("THIRD_PARTY_JOURNAL", "true").strip().lower() == "true"
 
 PARTNER_ID_PUBLICO_GENERAL = int(os.getenv("PARTNER_ID_PUBLICO_GENERAL", "13436"))
-TAX_ID_MARKETPLACES     = int(os.getenv("TAX_ID_MARKETPLACES", "38"))
+# IVA 16% de venta AL COBRO (Finanzas, correo de Jero del 25-nov-2026, A1): el IVA de la factura queda en la
+# transitoria 209.01.001 (trasladado NO cobrado) y Odoo lo pasa a la 208.01.001 cuando 04 concilia el cobro
+# (asiento de base de flujo). Antes era el 38 "IVA(16%) Marketplaces", directo a la 208.01.001 al facturar.
+# validar_impuesto() aborta la corrida si el impuesto no es así en Odoo.
+TAX_ID_MARKETPLACES     = int(os.getenv("TAX_ID_MARKETPLACES", "14"))
+ACCOUNT_IVA_NO_COBRADO  = "209.01.001"
 BATCH_LIMIT             = int(os.getenv("BATCH_LIMIT", "40"))            # Facturas por lote
 MAX_WORKERS             = int(os.getenv("MAX_WORKERS", "1"))             # Hilos concurrentes
 SLEEP_BETWEEN_BATCHES   = int(os.getenv("SLEEP_BETWEEN_BATCHES", "10"))  # Segundos de respiro tras cada lote
@@ -214,6 +219,24 @@ def get_account_id(models, db, uid, pwd, code):
     if not acc:
         raise Exception(f"¡ALERTA! No se encontró la cuenta contable con código {code} en Odoo.")
     return acc[0]
+
+
+def validar_impuesto(models):
+    """El IVA tiene que ser al cobro y pasar por la 209.01.001 (A1 de Finanzas). Si alguien cambia el
+    impuesto en Odoo, no se factura con el equivocado: la corrida se detiene antes de tomar registros."""
+    t = models.execute_kw(ODOO_DB, models.uid, ODOO_PASSWORD, 'account.tax', 'read', [[TAX_ID_MARKETPLACES]],
+                          {'fields': ['name', 'amount', 'type_tax_use', 'tax_exigibility',
+                                      'cash_basis_transition_account_id']})
+    if not t:
+        raise Exception(f"No existe el impuesto {TAX_ID_MARKETPLACES} (TAX_ID_MARKETPLACES) en {ODOO_DB}.")
+    t = t[0]
+    transitoria = (t['cash_basis_transition_account_id'] or [None, ''])[1] or ''
+    if (t['type_tax_use'] != 'sale' or float(t['amount']) != 16 or t['tax_exigibility'] != 'on_payment'
+            or not transitoria.startswith(ACCOUNT_IVA_NO_COBRADO)):
+        raise Exception(f"El impuesto {TAX_ID_MARKETPLACES} ({t['name']}) no es IVA 16% de venta al cobro "
+                        f"con transitoria {ACCOUNT_IVA_NO_COBRADO} (exigibilidad {t['tax_exigibility']}, "
+                        f"transitoria {transitoria or 'ninguna'}). Revisar TAX_ID_MARKETPLACES.")
+    return t
 
 
 # -------------------------------------------------------------------------------
@@ -949,6 +972,13 @@ if __name__ == "__main__":
     log.info(f"=== Iniciando Inyección CONCURRENTE de Facturas ML a Odoo "
              f"| {STORE['seller_name']} ({STORE['seller_id']}) -> {MKP_MARKETPLACE}, CxC {ACCOUNT_CODE_CXC_ML} ===")
     validate_env()
+
+    # IVA al cobro (209.01.001): FAIL-CLOSED. Si no se puede confirmar, no se factura.
+    try:
+        validar_impuesto(OdooModelProxy(ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD))
+    except Exception as e:
+        log.error(f"ABORTADO antes de facturar: {e}")
+        raise SystemExit(1)
 
     # Al arrancar la ejecución, se limpia el set de IDs especiales reintentados
     with retried_lock:
