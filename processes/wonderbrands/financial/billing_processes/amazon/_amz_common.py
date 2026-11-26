@@ -65,7 +65,14 @@ MARKETPLACE = 'AMAZON'
 # CONFIGURACION CONTABLE
 # =============================================================================
 
-TAX_ID_MARKETPLACES        = 38          # IVA 16% trasladado
+# IVA 16% de venta AL COBRO (Finanzas, correo de Jero del 25-nov-2026, A1):
+# al facturar, el IVA queda en la transitoria 209.01.001 (trasladado NO
+# cobrado) y Odoo lo pasa a la 208.01.001 cuando 03 concilia el cobro con la
+# factura (asiento de base de flujo, diario "Effectively Paid"). Antes era el
+# 38 "IVA(16%) Marketplaces", al facturar, directo a la 208.01.001.
+# validar_impuesto() aborta si el impuesto deja de ser asi en Odoo.
+TAX_ID_MARKETPLACES        = 14          # IVA 16% al cobro (transitoria 209.01.001)
+ACCOUNT_IVA_NO_COBRADO     = '209.01.001'  # IVA TRASLADADO NO COBRADO
 PARTNER_ID_PUBLICO_GENERAL = 13436       # XAXX010101000
 ACCOUNT_AMAZON_CXC         = '105.01.006'
 ACCOUNT_LIBERACIONES       = '102.02.008'  # Liberaciones Amazon Pend. de Procesar
@@ -367,6 +374,27 @@ def ejecutar_sin_retorno(odoo, model, method, ids):
         if 'cannot marshal None' not in (e.faultString or ''):
             raise
     return True
+
+
+def validar_impuesto(odoo):
+    """El IVA de la factura tiene que ser al cobro y pasar por la 209.01.001
+    (A1 de Finanzas). Si alguien cambia el impuesto en Odoo, no se factura con
+    el equivocado: se lanza la excepcion y la corrida se detiene."""
+    t = odoo.execute_kw('account.tax', 'read', [[TAX_ID_MARKETPLACES]],
+                        {'fields': ['name', 'amount', 'type_tax_use', 'tax_exigibility',
+                                    'cash_basis_transition_account_id']})
+    if not t:
+        raise Exception(f"No existe el impuesto {TAX_ID_MARKETPLACES} en {ODOO_DB}.")
+    t = t[0]
+    transitoria = (t['cash_basis_transition_account_id'] or [None, ''])[1] or ''
+    if (t['type_tax_use'] != 'sale' or a_float(t['amount']) != 16
+            or t['tax_exigibility'] != 'on_payment'
+            or not transitoria.startswith(ACCOUNT_IVA_NO_COBRADO)):
+        raise Exception(f"El impuesto {TAX_ID_MARKETPLACES} ({t['name']}) no es IVA 16% de venta "
+                        f"al cobro con transitoria {ACCOUNT_IVA_NO_COBRADO} (exigibilidad "
+                        f"{t['tax_exigibility']}, transitoria {transitoria or 'ninguna'}). "
+                        f"Revisar TAX_ID_MARKETPLACES.")
+    return t
 
 
 def get_amazon_team_ids(odoo):

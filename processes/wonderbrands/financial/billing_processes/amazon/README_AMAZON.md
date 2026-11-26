@@ -163,7 +163,7 @@ Lo avisa Slack o el reporte de la corrida:
 | 403.01.002 + 208.01.001 | Promoción pagada por Amazon |
 | 704.23.001 | Redondeo de centavos |
 
-Impuesto 38 (IVA 16 %). Partner público general 13436.
+Impuesto 14 (IVA 16 % **al cobro**, desde el 26-nov-2026; antes el 38): la factura deja el IVA en la 209.01.001 (no cobrado) y Odoo lo pasa a la 208.01.001 al conciliar el cobro (asiento de base de flujo, diario CBMX). `validar_impuesto` (`_amz_common`) detiene 01 si el impuesto deja de ser al cobro con esa transitoria. Partner público general 13436.
 
 ## Para notas de crédito (siguiente flujo)
 
@@ -195,4 +195,4 @@ Impuesto 38 (IVA 16 %). Partner público general 13436.
 
 - **Ventas anteriores a octubre de 2026 sin facturar.** Finanzas pidió reabrir periodos y asentar cada factura en su mes. 01 no lo hace: factura con fecha del día (o del cierre) y el SAT no permite un CFDI B2C con más de 72 h de antigüedad. Lo anterior a la migración a Odoo 18 tiene la SO en Odoo 15, donde este flujo no opera. Se define con Finanzas sobre la base de `test/.../amazon/14_base_historico_amazon.py`.
 - **Doble CFDI histórico de Amazon Business** (240 órdenes abr–nov, `000_historical_billing_back_analysis.py`): la cancelación es de Finanzas; al cancelar, 01 vincula el CFDI de Amazon solo.
-- **Anular automáticamente las `B2B_FACTURADA_PG`**, **IVA no cobrado 209.01.001 → 208.01.001** y **notas de crédito**: fuera de este flujo.
+- **Anular automáticamente las `B2B_FACTURADA_PG`** y **notas de crédito**: fuera de este flujo. El IVA al cobro (209 → 208) ya está, solo para facturas nuevas: las anteriores al cambio se quedan con el IVA en la 208.

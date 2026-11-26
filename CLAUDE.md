@@ -136,7 +136,7 @@ Para consultar MySQL desde aquí: el `python` del sistema no tiene `mysql.connec
 | 107.06.001 | Devoluciones en tránsito (NC tipo B) |
 | 402 (código exacto por confirmar en Odoo) | Devoluciones, descuentos o bonificaciones (NC) |
 
-Impuesto `38` (IVA 16 %). Partner público general `13436` (XAXX010101000).
+Impuestos: `14` = IVA 16 % **al cobro** (transitoria 209.01.001 → 208.01.001 al conciliar el cobro, diario CBMX); lo usan ML, Amazon y Walmart desde el A1 de Finanzas (25-nov-2026), con `validar_impuesto` que aborta si deja de ser así. `38` = IVA 16 % al facturar (directo a 208.01.001); sigue en el 1a1 y en las NC de ML (06). Partner público general `13436` (XAXX010101000).
 
 ---
 
@@ -381,7 +381,8 @@ Las fases 1 y 2 no dependen de Finanzas.
 - 🟡 Índices: `amz_transactions(order_id)`, `amz_transaction_items(order_adjustment_item_id)`.
 - 🟡 Acceso de lectura a Odoo 15 para el histórico.
 - ⏸️ NC de Mercado Libre (sin XML).
-- ⏸️ Anular automáticamente las `B2B_FACTURADA_PG`; IVA 209 → 208 (pospuesto por Finanzas).
+- ⏸️ Anular automáticamente las `B2B_FACTURADA_PG`.
+- 🟡 IVA al cobro (A1): ML y Amazon pasan al impuesto 14 (rama `fix/iva-209-ml-amazon`). Falta decidir con Finanzas el 1a1 (TikTok, Coppel, Piso…) y las NC de ML, que siguen con el 38.
 
 ---
 
