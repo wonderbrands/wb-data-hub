@@ -1,0 +1,144 @@
+id: ml_traslado_diarios_terceros_flow
+namespace: wonderbrands.financial.credit_note_refund_processes.mercadolibre
+description: "Traslado de CFDI de MeLi a sus diarios de terceros (MELI / MLNC) con nombre = serie-folio. De noche, al terminar la cadena de medianoche de MeLi, en varias líneas en paralelo hasta las 05:45 CDMX."
+# Script: processes/.../credit_note_refund_processes/mercadolibre/traslado_diarios_terceros.py (copia de test/).
+# Restituye el costo y el IVA originales y vuelve a conciliar cobro, salida y retorno (sin ajustes MLNC-COSTO).
+# Omite y reporta: periodo cerrado, UUID repetido, serie-folio ya usada, series fuera de SERIES.
+# Runbook y criterios: test/.../mercadolibre/docs/TRASLADO_DIARIOS_TERCEROS_PROD.md.
+#
+# Cómo se usa:
+#   - Paso 2 (lote chico): ejecutar a mano desde Kestra con lines=1, batch_limit=20, series=MELI,
+#     date_to=2026-10-31 (y otro con series=MELINC, from_journals=DEV,BON, batch_limit=5). Revisar el CSV
+#     que queda en los archivos de la ejecución antes de encender el disparador.
+#   - Paso 3 (masivo): con el VoBo del lote chico, quitar `disabled: true` del disparador (PR a main). Corre
+#     cada noche al terminar ml_credit_notes_flow de la cadena de medianoche (00:00 CDMX) y se corta solo a
+#     las 05:45 CDMX, antes de la cadena de las 06:00. Cada noche retoma lo que siga en INV/DEV/BON.
+#   - Al terminar oct–nov (la corrida en seco ya no da "SE TRASLADARÍA"), volver a poner `disabled: true`.
+# Oficiales (MELIOF/MELIOFNC, ~50 documentos) queda fuera de la nocturna: su cadena corre a las 03:00.
+
+concurrency:
+  limit: 1
+  behavior: FAIL
+
+inputs:
+  - id: lines
+    type: INT
+    defaults: 6
+    description: "Líneas en paralelo (PART i/N)"
+  - id: date_from
+    type: STRING
+    defaults: "2026-10-01"
+  - id: date_to
+    type: STRING
+    defaults: "2026-11-30"
+  - id: from_journals
+    type: STRING
+    defaults: "INV,DEV,BON"
+  - id: series
+    type: STRING
+    defaults: "MELI,MELINC"
+    description: "Series de MeLi a trasladar (vacío = todas, incluida Oficiales)"
+  - id: batch_limit
+    type: INT
+    defaults: 0
+    description: "Documentos por línea; 0 = sin tope"
+  - id: hasta
+    type: STRING
+    defaults: "05:45"
+    description: "Hora CDMX en que cada línea deja de tomar documentos nuevos"
+  - id: dry_run
+    type: BOOLEAN
+    defaults: false
+
+variables:
+  repo_url: "https://github.com/wonderbrands/wb-data-hub.git"
+  branch: "main"
+  odoo_url: "https://somosreyes.odoo.com"
+  odoo_db: "wonderbrands2026-main-28990431"
+  script_dir: "processes/wonderbrands/financial/credit_note_refund_processes/mercadolibre"
+
+tasks:
+  - id: working_env_traslado
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ vars.branch }}"
+        username: "{{ secret('GIT_USER') }}"
+        password: "{{ secret('GIT_TOKEN_WB') }}"
+
+      - id: run_traslado
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: wonderbrands-python:v1
+        timeout: PT6H
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          memory:                 # obligatorio (flows/README.md, regla 7); 6 procesos de Python en paralelo
+            memory: "1536MB"
+            memorySwap: "2048MB"
+        env:
+          LOCAL_ODOO: "prod"
+          odoo_urlV18: "{{ vars.odoo_url }}"
+          odoo_dbV18: "{{ vars.odoo_db }}"
+          ODOO_USER: "{{ secret('odoo_user_dataV18') }}"
+          ODOO_PASSWORD: "{{ secret('odoo_password_dataV18') }}"
+          DRY_RUN: "{{ inputs.dry_run }}"
+          CONFIRMAR_PROD: "TRASLADAR"
+          FROM_JOURNALS: "{{ inputs.from_journals }}"
+          DATE_FROM: "{{ inputs.date_from }}"
+          DATE_TO: "{{ inputs.date_to }}"
+          SERIES: "{{ inputs.series }}"
+          BATCH_LIMIT: "{{ inputs.batch_limit }}"
+          HASTA: "{{ inputs.hasta }}"
+          LINES: "{{ inputs.lines }}"
+          # Disparado por la cadena de MeLi: solo trabaja si esa cadena es la de medianoche
+          TRIGGER_FLOW: "{{ trigger.flowId ?? '' }}"
+          PYTHONUNBUFFERED: "1"
+        outputFiles:
+          - "{{ vars.script_dir }}/finanzas/*.csv"
+          - "{{ vars.script_dir }}/linea_*.log"
+        commands:
+          - |
+            set -u
+            if [ -n "$TRIGGER_FLOW" ]; then
+              H=$(date -u -d '-6 hours' +%H%M)      # CDMX = UTC-6 fijo
+              if [ "$H" -gt 230 ]; then
+                echo "Cadena de MeLi terminada a las $H CDMX: fuera de la ventana nocturna (00:00-02:30). No se traslada."
+                exit 0
+              fi
+            fi
+            cd "{{ vars.script_dir }}"
+            pids=""
+            for i in $(seq 0 $((LINES - 1))); do
+              PART="$i/$LINES" python traslado_diarios_terceros.py > "linea_$i.log" 2>&1 &
+              pids="$pids $!"
+            done
+            fail=0
+            for p in $pids; do wait "$p" || fail=1; done
+            for f in linea_*.log; do echo "== $f"; tail -n 4 "$f"; done
+            exit $fail
+
+triggers:
+  # Al terminar la cadena de medianoche (ml_billing -> ml_payments -> ml_credit_notes). La guardia del
+  # comando ignora las demás (06:00, 12:00, 18:00, 23:00). APAGADO hasta el VoBo del lote chico (Paso 2).
+  - id: after_midnight_ml_chain
+    type: io.kestra.plugin.core.trigger.Flow
+    disabled: true
+    states:
+      - SUCCESS
+      - WARNING
+    dependsOn:
+      - namespace: wonderbrands.financial.credit_note_refund_processes.mercadolibre
+        flowId: ml_credit_notes_flow
+
+errors:
+  - id: slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK') }}"
+    payload: |
+      {
+        "text": "🚨 *¡Fallo en el traslado de CFDI de MeLi a diarios de terceros!* 🚨\n*Flujo:* `{{ flow.id }}`\n*ID Ejecución:* `{{ execution.id }}`\n*Fecha:* `{{ execution.startDate }}`\nRevisar el log de la línea que falló: puede haber quedado un documento en borrador (el log dice cuál)."
+      }

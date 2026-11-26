@@ -78,6 +78,12 @@ HASTA          = os.getenv("HASTA", "").strip()                 # "HH:MM" CDMX; 
 # empieza con "MELI" y con un prefijo se iría al diario de la tienda principal.
 SERIE_JOURNAL = {"MELI": ("out_invoice", "MELI"), "MELINC": ("out_refund", "MLNC"),
                  "MELIOF": ("out_invoice", "MLOF"), "MELIOFNC": ("out_refund", "MLONC")}
+# SERIES="MELI,MELINC" limita la corrida a esas series (la nocturna de Kestra deja fuera Oficiales, cuya cadena
+# de facturación y cobros corre a las 03:00). Vacío = todas.
+ALL_SERIE_JOURNAL = dict(SERIE_JOURNAL)
+SERIES = [x.strip().upper() for x in os.getenv("SERIES", "").split(",") if x.strip()]
+if SERIES:
+    SERIE_JOURNAL = {k: v for k, v in SERIE_JOURNAL.items() if k in SERIES}
 MOVE_TYPES = ["out_invoice", "out_refund"]   # tipos de documento que se trasladan
 ACCOUNTS = ["401.01.001", "402.01.001", "402.01.002", "402.01.003", "208.01.001", "105.01.004", "105.01.005",
             "501.01.001", "205.06.003", "107.06.001"]
@@ -390,7 +396,7 @@ def main():
             break
         if atts[mid] not in cfdi:
             k = att_pos[atts[mid]]
-            cfdi.update(read_cfdi(att_order[k:k + 100]))
+            cfdi.update(read_cfdi(att_order[k:k + XML_CHUNK]))
         serie, folio, xml_iva = cfdi[atts[mid]]
         uuid = m["l10n_mx_edi_cfdi_uuid"]
         new_name = f"{serie}-{folio}"
@@ -400,7 +406,9 @@ def main():
         row = {"Nombre anterior": m["name"], "Nombre nuevo": new_name, "Diario anterior": origen,
                "Diario nuevo": dest_code or "", "Tipo": m["move_type"], "UUID": uuid, "Fecha": m["date"]}
         cat, motivo = "", ""
-        if kind is None:
+        if kind is None and serie.upper() in ALL_SERIE_JOURNAL:
+            cat, motivo = "OMITIDO fuera de SERIES", f"serie '{serie}' fuera del filtro SERIES={','.join(SERIES)}"
+        elif kind is None:
             cat, motivo = "OMITIDO serie no MeLi", f"serie '{serie}' no es de MeLi (o el XML no tiene serie)"
         elif kind != m["move_type"]:
             cat, motivo = "OMITIDO serie/tipo", f"serie '{serie}' no corresponde a un {m['move_type']}"
