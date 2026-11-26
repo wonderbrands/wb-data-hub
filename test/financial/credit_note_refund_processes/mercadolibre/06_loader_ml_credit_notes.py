@@ -6,7 +6,9 @@ import os
 import sys
 import time
 import csv
+import json
 import logging
+import requests
 from datetime import datetime, timedelta
 
 # ── 06 · Loader de Notas de Crédito ML → Odoo 18 (flujo v2 de Finanzas, 9-nov; v3 10-nov) ──
@@ -30,8 +32,20 @@ from datetime import datetime, timedelta
 #   Sin reembolso ni disputa en MeLi -> MANUAL_REVIEW (posible refactura).
 #   Reventa (DeRemate) entra con las mismas reglas (INCLUDE_RESALE).
 #   SIN sale_line_ids: la SO no se reabre a facturar.
+#   R Refacturación (Finanzas, 18-nov) · MLNC · 401.01.006, sin costo y sin reverso de cobro:
+#     * la NC relaciona una F1 de refactura (factura cargada con todo su ingreso en 401.01.006, ver
+#       corregir_cfdi_factura.py MODO=refactura);
+#     * o es uno de los "sin reembolso" que Finanzas aprobó (SIN_REEMBOLSO_ORDERS).
+#   Reconsulta de la orden (fila 7, Finanzas 24-nov): si la NC relaciona una factura que no está en Odoo,
+#     se vuelve a pedir a MeLi la factura vigente (transaction_type=sale, solo lectura):
+#     * es la que relaciona la NC y trae relación 04 contra la de Odoo -> SUSTITUCIÓN: la factura de Odoo
+#       (público general, cancelada por MeLi ante el SAT) se cancela en Odoo y entra la F2 al diario MELI,
+#       a nombre del receptor, ligada a la SO, con la venta y el costo ORIGINAL de la sustituida (sin
+#       recalcular, como el traslado) y su cobro / salida conciliados; después se registra la NC;
+#     * MeLi solo devuelve la factura que ya está en Odoo -> REFACTURA_WAIT_F1: falta el XML del SAT de la F1;
+#     * la factura de Odoo trae el CFDI de esta NC -> NC_AS_INVOICE (corregir_cfdi_factura.py).
 # Idempotencia: ref 'MLNC:<UUID>' (NC), 'MLNC-COBRO:<UUID>', 'MLNC-CENT:<UUID>' y
-#   'MLNC-RET:<UUID>:<retorno>' (asientos).
+#   'MLNC-RET:<UUID>:<retorno>' (asientos); la F2 de una sustitución, por su UUID.
 
 # Ejecución local: credenciales desde los .env locales (el primero que define una
 # variable gana; lo que ya esté en env gana sobre todos). En Kestra llegan por env.
@@ -127,8 +141,23 @@ CLASS_CONFIG = {   # tipo -> (diario, cuenta de ingreso)
     'A': (os.getenv("JOURNAL_CODE_DEV", STORE.get('nc_journal_code') or "MLNC"), os.getenv("ACCOUNT_CODE_A", "402.01.003")),
     'B': (os.getenv("JOURNAL_CODE_DEV", STORE.get('nc_journal_code') or "MLNC"), os.getenv("ACCOUNT_CODE_B", "402.01.001")),
     'C': (os.getenv("JOURNAL_CODE_BON", STORE.get('nc_journal_code') or "MLNC"), os.getenv("ACCOUNT_CODE_C", "402.01.002")),
+    # R: refacturas y "sin reembolso" (Finanzas 18-nov): 401.01.006 REFACTURACIONES, sin costo ni reverso de cobro
+    'R': (os.getenv("JOURNAL_CODE_DEV", STORE.get('nc_journal_code') or "MLNC"), os.getenv("ACCOUNT_CODE_R", "401.01.006")),
 }
-CLASS_DESC = {'A': 'Cancelación', 'B': 'Devolución', 'C': 'Bonificación'}
+CLASS_DESC = {'A': 'Cancelación', 'B': 'Devolución', 'C': 'Bonificación', 'R': 'Refacturación'}
+# Los 5 "sin reembolso" que Finanzas aprobó como tipo R (18-nov): cobrados y entregados, sin reembolso en
+# MeLi. Cualquier otra NC sin reembolso ni disputa sigue en MANUAL_REVIEW hasta que Finanzas la decida.
+SIN_REEMBOLSO_ORDERS = {o.strip() for o in os.getenv("SIN_REEMBOLSO_ORDERS", ",".join([
+    "2000018099840026", "2000017889635610", "2000017819668034", "2000017019249582", "2000016979514324"])).split(",") if o.strip()}
+# Reconsulta de la orden en MeLi cuando la NC relaciona una factura que no está en Odoo (fila 7).
+# APAGADA por defecto: el 06 corre solo en productivo, y las sustituciones entran con el VoBo de Finanzas
+# (ventana de reapertura). Se enciende con RECONSULTA=true en el flujo. Apagada, todo queda como antes.
+RECONSULTA        = os.getenv("RECONSULTA", "false").strip().lower() == "true"
+ML_SALE_URL       = "https://api.mercadolibre.com/invoices/io/documents/stream/order/{order_id}/xml"
+JOURNAL_CODE_INV  = os.getenv("JOURNAL_CODE_INV", STORE.get('invoice_journal_code') or "MELI")   # F2 de la sustitución
+PARTNER_ID_PUBLICO_GENERAL = int(os.getenv("PARTNER_ID_PUBLICO_GENERAL", "13436"))
+RFC_PUBLICO_GENERAL = "XAXX010101000"
+SUB_NOTE            = "SUSTITUCION-CONTRAPARTIDAS:"   # nota en la F2 para retomar una sustitución a medias
 FP_B_NAME           = os.getenv("FP_B_NAME", "ML NC Devolución (tipo B)")   # 205.06.003 -> 107.06.001
 ACCOUNT_CODE_FP_SRC = "205.06.003"
 ACCOUNT_CODE_FP_DST = os.getenv("ACCOUNT_CODE_TRANSIT", "107.06.001")
@@ -165,8 +194,9 @@ CENTS_TOLERANCE   = float(os.getenv("CENTS_TOLERANCE", "0.15")) + 0.0001
 BATCH_SIZE        = int(os.getenv("BATCH_SIZE", "20"))
 MAX_ERROR_RETRIES = int(os.getenv("MAX_ERROR_RETRIES", "2"))
 
-NS = {'cfdi': 'http://www.sat.gob.mx/cfd/4'}
-RETRY_STATUSES = ('PENDING', 'REFUND_DRAFT', 'ERROR_BG', 'WAIT_INVOICE_IN_ODOO', 'PERIOD_LOCKED')
+NS = {'cfdi': 'http://www.sat.gob.mx/cfd/4', 'tfd': 'http://www.sat.gob.mx/TimbreFiscalDigital'}
+RETRY_STATUSES = ('PENDING', 'REFUND_DRAFT', 'ERROR_BG', 'WAIT_INVOICE_IN_ODOO', 'PERIOD_LOCKED') + \
+                 (('UUID_MISMATCH', 'REFACTURA_WAIT_F1', 'NC_AS_INVOICE') if RECONSULTA else ())
 
 
 class TimeoutTransport(xmlrpc.client.SafeTransport):
@@ -231,6 +261,55 @@ def parse_xml(xml_b64):
     }
 
 
+def parse_invoice_cfdi(xml_bytes):
+    """Encabezado de un CFDI de ingreso (F2 de una sustitución): UUID, serie-folio, fecha, receptor y relaciones."""
+    root = ET.fromstring(xml_bytes)
+    rec = root.find('cfdi:Receptor', NS)
+    tfd = root.find('cfdi:Complemento/tfd:TimbreFiscalDigital', NS)
+    imp = root.find('cfdi:Impuestos', NS)
+    rels = {}
+    for group in root.findall('cfdi:CfdiRelacionados', NS):
+        rels.setdefault(group.get('TipoRelacion'), []).extend((x.get('UUID') or '').upper() for x in group)
+    return {'tipo': root.get('TipoDeComprobante'), 'uuid': (tfd.get('UUID') if tfd is not None else '').upper(),
+            'serie': root.get('Serie') or '', 'folio': root.get('Folio') or '', 'date': (root.get('Fecha') or '')[:10],
+            'total': float(root.get('Total') or 0),
+            'tax': float(imp.get('TotalImpuestosTrasladados') or 0) if imp is not None else 0.0,
+            'rfc': rec.get('Rfc') if rec is not None else '', 'name': rec.get('Nombre') if rec is not None else '',
+            'zip': rec.get('DomicilioFiscalReceptor') if rec is not None else '',
+            'regime': rec.get('RegimenFiscalReceptor') if rec is not None else '',
+            'usage': rec.get('UsoCFDI') if rec is not None else None,
+            'forma_pago': root.get('FormaPago'), 'metodo_pago': root.get('MetodoPago'), 'rels': rels}
+
+
+def ml_headers(db):
+    """Token de MeLi de la tienda (somos_reyes.tokens), como el 01."""
+    cur = db.cursor()
+    cur.execute("SELECT token FROM somos_reyes.tokens WHERE seller_id = %s", (STORE['seller_id'],))
+    row = cur.fetchone()
+    cur.close()
+    return {'Authorization': f"Bearer {row[0]}"} if row else None
+
+
+def fetch_sale_document(headers, order_id):
+    """Reconsulta (fila 7): la factura vigente de la orden en MeLi. Solo lectura. Devuelve los bytes del
+    XML si es un CFDI de ingreso (tipo I), o None (404, error de red o documento que no es factura)."""
+    for params in ({'transaction_type': 'sale'}, None):
+        try:
+            r = requests.get(ML_SALE_URL.format(order_id=order_id), headers=headers, params=params, timeout=30)
+        except requests.RequestException:
+            return None
+        if r.status_code == 401:
+            raise RuntimeError("Token de MeLi expirado (401) en la reconsulta")
+        if r.status_code == 200:
+            try:
+                if ET.fromstring(r.content).get('TipoDeComprobante') == 'I':
+                    return r.content
+            except ET.ParseError:
+                pass
+        time.sleep(0.3)
+    return None
+
+
 def load_config(odoo):
     """IDs fijos de Odoo. Cualquier faltante es error de configuración (aborta)."""
     def one(model, domain, label):
@@ -262,6 +341,13 @@ def load_config(odoo):
     cfg['fp_b'] = fp[0] if fp else False
     rem = odoo.call('account.journal', 'search', [('code', '=', JOURNAL_CODE_REM)], limit=1)
     cfg['journal_rem'] = rem[0] if rem else False
+    # Sustitución (fila 7): diario de facturas de MeLi, público general y México para clientes nuevos
+    inv_j = odoo.call('account.journal', 'search', [('code', '=', JOURNAL_CODE_INV), ('type', '=', 'sale')], limit=1)
+    cfg['journal_invoice'] = inv_j[0] if inv_j else False
+    if RECONSULTA and not inv_j:
+        log.warning(f"No existe el diario {JOURNAL_CODE_INV}: las sustituciones quedan sin registrar")
+    mx = odoo.call('res.country', 'search', [('code', '=', 'MX')], limit=1)
+    cfg['country_mx'] = mx[0] if mx else False
     for code in (ACCOUNT_CODE_FP_SRC, ACCOUNT_CODE_FP_DST):   # la reclasificación del retorno concilia en ambas
         if not odoo.one('account.account', acc(code), ['reconcile'])['reconcile']:
             raise RuntimeError(f"La cuenta {code} no permite conciliación")
@@ -297,10 +383,10 @@ def load_context(odoo, db, recs):
                                       ('l10n_mx_edi_cfdi_uuid', 'in', [r['related_invoice_uuid'] for r in recs])], inv_fields)
     by_origin = odoo.read('account.move', [('move_type', '=', 'out_invoice'), ('state', '=', 'posted'),
                                            ('invoice_origin', 'in', [s['name'] for s in sos])],
-                          ['name', 'invoice_origin', 'l10n_mx_edi_cfdi_uuid'])
+                          inv_fields + ['date', 'journal_id', 'l10n_mx_edi_cfdi_state'])
     inv_ids = [i['id'] for i in invs]
     lines = odoo.read('account.move.line', [('move_id', 'in', inv_ids), ('display_type', '=', 'product')],
-                      ['move_id', 'product_id', 'name', 'quantity', 'price_unit', 'price_total'])
+                      ['move_id', 'product_id', 'name', 'quantity', 'price_unit', 'price_total', 'account_id'])
     receivables = odoo.read('account.move.line', [('move_id', 'in', inv_ids), ('account_type', '=', 'asset_receivable')],
                             ['move_id', 'account_id'])
     keys = [PREFIX + r['cfdi_uuid'] for r in recs]
@@ -333,6 +419,16 @@ def load_context(odoo, db, recs):
         ctx['receivable_acc'][ln['move_id'][0]] = ln['account_id'][0]
     for p in returns:
         ctx['returns'].setdefault(p['sale_id'][0], []).append(p['name'])
+    # Reconsulta (fila 7): la NC relaciona una factura que no está en Odoo y la SO sí tiene factura
+    ctx['sale_doc'] = {}
+    asks = [r for r in recs if r['related_invoice_uuid'] not in ctx['inv_by_uuid']
+            and r['mkp_order_id'] in ctx['so_by_ref'] and ctx['by_origin'].get(ctx['so_by_ref'][r['mkp_order_id']]['name'])]
+    if RECONSULTA and asks:
+        headers = ml_headers(db)
+        if not headers:
+            log.warning(f"Sin token de MeLi para {STORE['seller_id']}: no hay reconsulta en esta corrida")
+        for r in asks if headers else []:
+            ctx['sale_doc'][r['mkp_order_id']] = fetch_sale_document(headers, r['mkp_order_id'])
     return ctx
 
 
@@ -353,6 +449,199 @@ def match_units(concepts, inv_lines):
     return matched
 
 
+def plan_other_invoice(rec, base, other, ctx, cfg):
+    """La NC relaciona una factura que no está en Odoo, pero la SO sí tiene factura publicada.
+    Reconsulta (fila 7): se decide con la factura vigente que devuelve MeLi para la orden."""
+    uuid, related = rec['cfdi_uuid'], rec['related_invoice_uuid']
+    odoo_uuids = {(o['l10n_mx_edi_cfdi_uuid'] or '').upper(): o for o in other}
+    desc = f"la NC relaciona {related}; en Odoo la SO tiene {[(o['name'], o['l10n_mx_edi_cfdi_uuid']) for o in other]}"
+    if uuid in odoo_uuids:
+        return {**base, 'status': 'NC_AS_INVOICE', 'error': f"NC cargada como factura: {odoo_uuids[uuid]['name']} trae el CFDI de esta NC. "
+                                                            "Se corrige con corregir_cfdi_factura.py (MODO=nc_como_factura)"}
+    if not RECONSULTA:
+        return {**base, 'status': 'UUID_MISMATCH', 'error': f"Refactura: {desc}"}
+    doc = ctx['sale_doc'].get(rec['mkp_order_id'])
+    if not doc:
+        return {**base, 'status': 'UUID_MISMATCH', 'error': f"{desc}; MeLi no devolvió una factura vigente (reconsulta)"}
+    f2 = parse_invoice_cfdi(doc)
+    if f2['uuid'] in odoo_uuids and related in f2['rels'].get('04', []):
+        # Filas 1 y 5 de Finanzas: la vigente (ya en Odoo) sustituyó a la factura que relaciona la NC
+        return {**base, 'status': 'MANUAL_REVIEW',
+                'error': f"La NC relaciona {related}, que la factura vigente {odoo_uuids[f2['uuid']]['name']} ya sustituyó (relación 04): "
+                         "sustitución con la F2 en Odoo y NC contra la sustituida; caso puntual de la ventana"}
+    if f2['uuid'] in odoo_uuids:
+        return {**base, 'status': 'REFACTURA_WAIT_F1',
+                'error': f"Refactura: la NC relaciona la F1 {related}, que MeLi no expone; la factura vigente en MeLi y en Odoo es "
+                         f"{odoo_uuids[f2['uuid']]['name']}. Falta el XML del SAT de la F1 (corregir_cfdi_factura.py MODO=refactura)"}
+    if f2['uuid'] != related:
+        return {**base, 'status': 'UUID_MISMATCH', 'error': f"{desc}; MeLi devuelve otra factura {f2['uuid']} (relaciones {f2['rels']})"}
+    pgs = [odoo_uuids[u] for u in f2['rels'].get('04', []) if u in odoo_uuids]
+    if len(pgs) != 1:
+        return {**base, 'status': 'UUID_MISMATCH', 'error': f"{desc}; la factura vigente en MeLi {f2['serie']}-{f2['folio']} no sustituye "
+                                                            f"(relación 04) a la de Odoo: {f2['rels']}"}
+    pg = pgs[0]
+    plan = {**base, 'inv': pg, 'pg': pg, 'f2': f2, 'f2_xml': doc}
+    if pg['l10n_mx_edi_cfdi_state']:
+        return {**plan, 'status': 'MANUAL_REVIEW', 'error': f"Sustitución: {pg['name']} la timbró Odoo; no se cancela desde aquí"}
+    if abs(f2['total'] - pg['amount_total']) > 0.0101:
+        return {**plan, 'status': 'MANUAL_REVIEW', 'error': f"Sustitución con total distinto: F2 ${f2['total']:,.2f} vs "
+                                                           f"{pg['name']} ${pg['amount_total']:,.2f}"}
+    if not cfg['journal_invoice']:
+        return {**plan, 'status': 'ERROR', 'error': f"Sustitución: no existe el diario {JOURNAL_CODE_INV}"}
+    locked = [d for d in (f2['date'], pg['date']) if cfg['lock_date'] and d <= cfg['lock_date']]
+    if locked:
+        return {**plan, 'status': 'PERIOD_LOCKED', 'error': f"Sustitución: F2 del {f2['date']} / {pg['name']} del {pg['date']}; "
+                                                           f"periodo cerrado (bloqueo {cfg['lock_date']})"}
+    return {**plan, 'status': 'SUBSTITUTION',
+            'error': f"Sustitución (relación 04): {pg['name']} (público general, cancelada por MeLi ante el SAT) se cancela; entra "
+                     f"{f2['serie']}-{f2['folio']} a {f2['rfc']} del {f2['date']} con su venta y costo; después se registra la NC"}
+
+
+def cogs_lines(odoo, move_id, partner_id=None):
+    """Líneas de costo (display_type 'cogs') tal como están publicadas, para ponerlas sin que Odoo recalcule."""
+    fields = ['account_id', 'partner_id', 'product_id', 'name', 'quantity', 'price_unit', 'debit', 'credit']
+    out = []
+    for ln in odoo.read('account.move.line', [('move_id', '=', move_id), ('display_type', '=', 'cogs')], fields):
+        vals = {k: (ln[k][0] if isinstance(ln[k], list) else ln[k]) for k in fields}
+        vals['display_type'] = 'cogs'
+        if partner_id:
+            vals['partner_id'] = partner_id
+        out.append(vals)
+    return out
+
+
+def counterparts(odoo, move_id):
+    """Líneas de OTROS asientos conciliadas con este documento (cobro, salida OUT), por cuenta."""
+    out = {}
+    for ln in odoo.read('account.move.line', [('move_id', '=', move_id)], ['account_id', 'matched_debit_ids', 'matched_credit_ids']):
+        ids = ln['matched_debit_ids'] + ln['matched_credit_ids']
+        if not ids:
+            continue
+        parts = odoo.read('account.partial.reconcile', [('id', 'in', ids)], ['debit_move_id', 'credit_move_id'])
+        other = {p[k][0] for p in parts for k in ('debit_move_id', 'credit_move_id')} - {ln['id']}
+        if other:
+            out.setdefault(str(ln['account_id'][0]), set()).update(other)
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def cfdi_partner(odoo, cfg, f2):
+    """Cliente del receptor del CFDI, como el 02: público general, el que ya tiene el RFC o uno nuevo."""
+    if f2['rfc'] == RFC_PUBLICO_GENERAL:
+        return PARTNER_ID_PUBLICO_GENERAL
+    found = odoo.call('res.partner', 'search', [('vat', '=', f2['rfc'])], limit=1)
+    if found:
+        return found[0]
+    return odoo.call('res.partner', 'create', {'name': f2['name'] or f"Cliente {f2['rfc']}", 'vat': f2['rfc'], 'zip': f2['zip'],
+                                               'l10n_mx_edi_fiscal_regime': f2['regime'], 'country_id': cfg['country_mx'],
+                                               'company_type': 'person' if len(f2['rfc']) == 13 else 'company'},
+                     retry=False, context={'tracking_disable': True})
+
+
+def substitute_invoice(odoo, rec, plan, cfg):
+    """Sustitución PG -> RFC (Finanzas 18-nov, fila 6): la factura de Odoo se cancela y entra la F2 con la venta,
+    el costo ORIGINAL de la sustituida (sin recalcular) y sus conciliaciones (cobro, salida). Se puede retomar:
+    la F2 se busca por UUID y las contrapartidas quedan anotadas en la F2 antes de cancelar la sustituida."""
+    pg, f2, f2_name = plan['pg'], plan['f2'], f"{plan['f2']['serie']}-{plan['f2']['folio']}"
+    found = odoo.read('account.move', [('move_type', '=', 'out_invoice'), ('l10n_mx_edi_cfdi_uuid', '=ilike', f2['uuid']),
+                                       ('state', '!=', 'cancel')], ['id', 'state'])
+    if found and found[0]['state'] == 'posted':
+        return found[0]['id'], [f"F2 {f2_name} ya estaba registrada"]
+    f2_id = found[0]['id'] if found else None
+    pg_state = odoo.one('account.move', pg['id'], ['state'])['state']
+    prior = odoo.read('account.move', [('reversed_entry_id', '=', pg['id']), ('state', '=', 'posted')], ['name'])
+    if prior:   # FAIL-CLOSED: una sustituida con NC no se cancela en automático
+        raise RuntimeError(f"Sustitución: {pg['name']} ya tiene NC {[p['name'] for p in prior]}; revisar a mano")
+    if pg_state == 'posted':
+        cps = counterparts(odoo, pg['id'])
+        partner = cfdi_partner(odoo, cfg, f2)
+        cogs = cogs_lines(odoo, pg['id'], partner)
+        if not f2_id:
+            src = odoo.read('account.move.line', [('move_id', '=', pg['id']), ('display_type', '=', 'product')],
+                            ['product_id', 'name', 'quantity', 'price_unit', 'tax_ids', 'account_id', 'sale_line_ids'])
+            cxc = odoo.read('account.move.line', [('move_id', '=', pg['id']), ('account_type', '=', 'asset_receivable')], ['account_id'])
+            vals = {'move_type': 'out_invoice', 'journal_id': cfg['journal_invoice'], 'name': f2_name, 'partner_id': partner,
+                    'team_id': pg['team_id'][0] if pg.get('team_id') else False, 'invoice_origin': pg['invoice_origin'],
+                    'invoice_date': f2['date'], 'date': f2['date'], 'invoice_date_due': f2['date'], 'invoice_payment_term_id': False,
+                    'payment_reference': f"{f2_name} sustituye a {pg['name']} (UUID {pg['l10n_mx_edi_cfdi_uuid']}, relación 04)",
+                    'invoice_line_ids': [(0, 0, {'product_id': ln['product_id'][0] if ln['product_id'] else False, 'name': ln['name'],
+                                                 'quantity': ln['quantity'], 'price_unit': ln['price_unit'],
+                                                 'tax_ids': [(6, 0, ln['tax_ids'])], 'account_id': ln['account_id'][0],
+                                                 'sale_line_ids': [(6, 0, ln['sale_line_ids'])]}) for ln in src]}
+            if f2['usage'] in cfg['usages']:
+                vals['l10n_mx_edi_usage'] = f2['usage']
+            if f2['forma_pago'] in cfg['pay_methods']:
+                vals['l10n_mx_edi_payment_method_id'] = cfg['pay_methods'][f2['forma_pago']]
+            f2_id = odoo.call('account.move', 'create', vals, retry=False)
+            adjust_tax_to_xml(odoo, f2_id, f2['tax'])
+            # UUID después del create (en el create Odoo lo recalcula y lo deja vacío; igual que el 02) y la CxC de
+            # la sustituida (105.01.004), no la del cliente nuevo
+            rec_lines = odoo.read('account.move.line', [('move_id', '=', f2_id), ('account_type', '=', 'asset_receivable')], ['id'])
+            odoo.call('account.move', 'write', [f2_id], {
+                'l10n_mx_edi_cfdi_uuid': f2['uuid'], 'narration': f2['uuid'],
+                'line_ids': [(1, ln['id'], {'account_id': cxc[0]['account_id'][0]}) for ln in rec_lines] if cxc else []},
+                context={'tracking_disable': True})
+            if cogs:
+                odoo.call('account.move', 'write', [f2_id], {'line_ids': [(0, 0, v) for v in cogs]})
+            draft = odoo.one('account.move', f2_id, ['amount_total'])
+            if abs(draft['amount_total'] - f2['total']) > 0.005:
+                odoo.call('account.move', 'unlink', [f2_id], retry=False)
+                raise RuntimeError(f"Sustitución: la F2 en borrador suma ${draft['amount_total']:,.2f} y el XML ${f2['total']:,.2f} (borrador eliminado)")
+            att_id = odoo.call('ir.attachment', 'create', {'name': f"{f2['uuid']}.xml", 'datas': base64.b64encode(plan['f2_xml']).decode(),
+                                                           'res_model': 'account.move', 'res_id': f2_id})
+            try:   # aviso EDI 'sent', como el 02 (no bloqueante)
+                odoo.call('account.edi.document', 'create', {'move_id': f2_id, 'edi_format_id': 2, 'attachment_id': att_id,
+                                                             'state': 'sent'}, retry=False)
+            except Exception:
+                pass
+        odoo.call('account.move', 'message_post', [f2_id], body=SUB_NOTE + json.dumps(cps), message_type='comment',
+                  subtype_xmlid='mail.mt_note')
+        # La sustituida: borrador -> diario de facturas de MeLi con su serie-folio (si es de la misma serie) -> cancelada
+        old_name = pg['name']
+        odoo.call('account.move', 'button_draft', [pg['id']])
+        att = odoo.read('ir.attachment', [('res_model', '=', 'account.move'), ('res_id', '=', pg['id']),
+                                          ('name', '=ilike', f"{pg['l10n_mx_edi_cfdi_uuid']}.xml")], ['datas'], limit=1)
+        root = ET.fromstring(base64.b64decode(att[0]['datas'])) if att else None
+        if root is not None and root.get('Serie') == f2['serie'] and pg['journal_id'][0] != cfg['journal_invoice']:
+            odoo.call('account.move', 'write', [pg['id']], {'name': '/'})
+            odoo.call('account.move', 'write', [pg['id']], {'journal_id': cfg['journal_invoice'],
+                                                            'name': f"{root.get('Serie')}-{root.get('Folio')}"})
+        odoo.call('account.move', 'button_cancel', [pg['id']])
+        odoo.call('account.move', 'message_post', [pg['id']],
+                  body=(f"Factura sustituida por {f2_name} (UUID {f2['uuid']}, relación 04) a {f2['rfc']} {f2['name']}. MeLi la canceló "
+                        f"ante el SAT. Nombre anterior {old_name}. La venta, el costo y el cobro pasan a {f2_name}."),
+                  message_type='comment', subtype_xmlid='mail.mt_note')
+    else:
+        if not f2_id:
+            raise RuntimeError(f"Sustitución a medias: {pg['name']} ya no está publicada y no hay F2 {f2_name}; revisar a mano")
+        notes = odoo.read('mail.message', [('model', '=', 'account.move'), ('res_id', '=', f2_id), ('body', 'ilike', SUB_NOTE)],
+                          ['body'], limit=1)
+        if not notes:
+            raise RuntimeError(f"Sustitución a medias: la F2 {f2_name} no tiene anotadas las contrapartidas; revisar a mano")
+        raw = notes[0]['body'].split(SUB_NOTE, 1)[1]
+        cps = json.loads(raw[:raw.rindex('}') + 1].replace('&quot;', '"'))
+    # Publicar la F2 sin que Odoo recalcule el costo (como el traslado) y volver a conciliar cobro y salida
+    if odoo.one('account.move', f2_id, ['state'])['state'] == 'draft':
+        odoo.call('account.move', 'action_post', [f2_id], retry=False, context={'move_reverse_cancel': True})
+    f2_move = odoo.one('account.move', f2_id, ['name', 'state', 'date', 'invoice_date', 'payment_state', 'partner_id'])
+    if f2_move['state'] != 'posted' or f2_move['date'] != f2_move['invoice_date']:
+        raise RuntimeError(f"Sustitución: la F2 {f2_name} quedó en {f2_move['state']} con fecha {f2_move['date']}")
+    reconciled = 0
+    for acc, lines in cps.items():
+        mine = odoo.call('account.move.line', 'search', [('move_id', '=', f2_id), ('account_id', '=', int(acc)), ('reconciled', '=', False)])
+        others = odoo.call('account.move.line', 'search', [('id', 'in', lines), ('reconciled', '=', False)])
+        if mine and others:
+            odoo.call('account.move.line', 'reconcile', mine + others)
+            reconciled += len(others)
+    cost = sum(ln['debit'] for ln in odoo.read('account.move.line', [('move_id', '=', f2_id), ('display_type', '=', 'cogs')], ['debit']))
+    so = plan.get('so')
+    body = (f"{f2_move['name']} (UUID {f2['uuid']}) sustituye a {pg['name']} (UUID {pg['l10n_mx_edi_cfdi_uuid']}, relación 04). "
+            f"Cliente {f2['rfc']}; costo original ${cost:,.2f}; {reconciled} conciliaciones restituidas.")
+    for model, res_id in [('account.move', f2_id)] + ([('sale.order', so['id'])] if so else []):
+        odoo.call(model, 'message_post', [res_id], body=body, message_type='comment', subtype_xmlid='mail.mt_note')
+    return f2_id, [f"sustitución: {pg['name']} cancelada -> {f2_move['name']} a {f2['rfc']} ({f2_move['payment_state']}), "
+                   f"costo ${cost:,.2f}, {reconciled} conciliaciones"]
+
+
 def plan_credit_note(rec, ctx, cfg):
     """Decide qué hacer con una NC SIN escribir nada. Devuelve dict con 'status'
     ('READY' o el estado final de rechazo) y, si READY, el encabezado a crear."""
@@ -366,8 +655,7 @@ def plan_credit_note(rec, ctx, cfg):
     if not inv:
         other = ctx['by_origin'].get(so['name'], []) if so else []
         if other:
-            return {**base, 'status': 'UUID_MISMATCH', 'error': f"Refactura: la NC relaciona {related}; en Odoo la SO tiene "
-                                                                f"{[(o['name'], o['l10n_mx_edi_cfdi_uuid']) for o in other]}"}
+            return plan_other_invoice(rec, base, other, ctx, cfg)
         return {**base, 'status': 'WAIT_INVOICE_IN_ODOO', 'error': f"No hay factura en Odoo con UUID {related}"}
     base['inv'] = inv
     if inv['state'] == 'cancel':
@@ -393,7 +681,12 @@ def plan_credit_note(rec, ctx, cfg):
     if previous + total > inv['amount_total'] + AMOUNT_TOLERANCE:
         return {**base, 'status': 'AMOUNT_EXCEEDS_INVOICE', 'error': f"Tope: NC previas ${previous:,.2f} + esta ${total:,.2f} > "
                                                                      f"factura ${inv['amount_total']:,.2f}"}
-    if not origin:
+    # Tipo R (Finanzas 18-nov): la factura es una F1 de refactura (todo su ingreso en 401.01.006) o la orden
+    # es uno de los "sin reembolso" aprobados. Va a 401.01.006, sin costo y sin reverso de cobro.
+    inv_accounts = {ln['account_id'][0] for ln in ctx['lines'].get(inv['id'], []) if ln.get('account_id')}
+    refactura = bool(inv_accounts) and inv_accounts == {cfg['accounts']['R']}
+    sin_reembolso = not origin and rec['mkp_order_id'] in SIN_REEMBOLSO_ORDERS
+    if not origin and not refactura and not sin_reembolso:
         return {**base, 'status': 'MANUAL_REVIEW', 'error': "Sin reembolso ni disputa en MeLi para la orden: posible refactura"}
     if rec.get('rfc_receptor') == RFC_RESALE and not INCLUDE_RESALE:
         return {**base, 'status': 'MANUAL_REVIEW', 'error': "Reventa: en discusión con Finanzas si entra al flujo (INCLUDE_RESALE)"}
@@ -401,16 +694,16 @@ def plan_credit_note(rec, ctx, cfg):
     # ── Clasificación y líneas desde el XML ──
     xml = parse_xml(rec['xml_data'])
     shipped = bool(so and so.get('effective_date'))
-    units = match_units(xml['concepts'], ctx['lines'].get(inv['id'], []))
-    op_class = ('B' if shipped else 'A') if units else ('C' if shipped else 'A')
+    units = None if (refactura or sin_reembolso) else match_units(xml['concepts'], ctx['lines'].get(inv['id'], []))
+    op_class = 'R' if (refactura or sin_reembolso) else ('B' if shipped else 'A') if units else ('C' if shipped else 'A')
     journal_code, _ = CLASS_CONFIG[op_class]
     account = cfg['accounts'][op_class]
     base.update({'op_class': op_class, 'journal': journal_code, 'account_code': CLASS_CONFIG[op_class][1]})
     if units:
         lines = [{'product_id': ln['product_id'][0] if ln['product_id'] else False, 'name': ln['name'],
                   'quantity': c['qty'], 'price_unit': c['unit']} for ln, c in units]
-    else:   # importe parcial: servicio sin costo (C bonificación; A si no hubo salida)
-        prefix = 'BON_SRV' if op_class == 'C' else 'CANC_SRV'
+    else:   # importe parcial o R: servicio sin costo (C bonificación; A si no hubo salida; R refacturación)
+        prefix = {'C': 'BON_SRV', 'R': 'REFACT'}.get(op_class, 'CANC_SRV')
         lines = [{'product_id': cfg['bon_product'], 'name': f"{prefix}-{c['desc']}"[:250], 'quantity': 1,
                   'price_unit': c['amount']} for c in xml['concepts']]
     for ln in lines:
@@ -442,6 +735,7 @@ def plan_credit_note(rec, ctx, cfg):
 
     inv_paid = inv['amount_total'] - inv['amount_residual']
     cobro = ('concilia' if inv['amount_residual'] >= total - CENTS_TOLERANCE else
+             'sin reverso de cobro (tipo R): queda saldo a favor en CxC' if op_class == 'R' else
              f'reverso {ACCOUNT_CODE_MP}' if inv['amount_residual'] < 0.01 else f'concilia + reverso {ACCOUNT_CODE_MP}')
     return {**base, 'status': 'READY', 'key': key, 'xml': xml, 'header': header, 'units': bool(units),
             'existing': next((r for r in ctx['refunds'] if r['ref'] == key), None),
@@ -714,7 +1008,9 @@ def execute_plan(odoo, db, rec, plan, cfg):
         reconcile_lines(odoo, [target, cent], cxc)
         notes.append(f"centavos ${abs(diff):.2f} a {ACCOUNT_CODE_CENTS}")
         nc_res = residual(odoo, refund_id, cxc)
-    if nc_res < -CENTS_TOLERANCE:                                 # 3) lo ya cobrado: baja 102.03.001 (diario MP)
+    if nc_res < -CENTS_TOLERANCE and plan['op_class'] == 'R':     # 3') R: sin reverso de cobro (Finanzas 18-nov)
+        notes.append(f"sin reverso de cobro (tipo R): saldo a favor ${-nc_res:,.2f} en {ACCOUNT_CODE_CXC}")
+    elif nc_res < -CENTS_TOLERANCE:                               # 3) lo ya cobrado: baja 102.03.001 (diario MP)
         amount = -nc_res
         cobro = get_or_post_entry(odoo, PREFIX_COBRO + uuid, cfg['journal_cobro'], date, [
             {'account_id': cxc, 'partner_id': partner, 'debit': amount, 'credit': 0, 'name': f"Reverso cobro NC ML {rec['serie']}-{rec['folio']}"},
@@ -793,7 +1089,9 @@ STATUS_LABEL = {   # estado del proceso, en el lenguaje del listado para Finanza
     'WAIT_INVOICE_IN_ODOO': 'Espera factura en Odoo', 'UUID_MISMATCH': 'Refactura (relaciona otra factura)',
     'AMOUNT_EXCEEDS_INVOICE': 'Tope (excede la factura)', 'INVOICE_CANCELLED_IN_ODOO': 'Factura cancelada en Odoo',
     'ALREADY_ODOO_CREDITED': 'UUID ya en Odoo (otra NC)', 'TOTAL_DIFF': 'Diferencia de total', 'ERROR': 'Error al planear',
-    'REGISTERED': 'Ya registrada', 'MLREM_DOUBLE_EGRESS': 'Doble egreso con NC fuera de MeLi (MLREM)'}
+    'REGISTERED': 'Ya registrada', 'MLREM_DOUBLE_EGRESS': 'Doble egreso con NC fuera de MeLi (MLREM)',
+    'SUBSTITUTION': 'Sustitución: entra la F2 y después la NC', 'REFACTURA_WAIT_F1': 'Refactura: falta el XML del SAT de la F1',
+    'NC_AS_INVOICE': 'NC cargada como factura (corregir CFDI)'}
 CSV_COLUMNS = ['Orden ML', 'Tipo de orden', 'NC Mercado Libre', 'UUID NC', 'Fecha NC (fiscal)', 'Subtotal', 'IVA', 'Total',
                'UUID factura relacionada', 'Estado proceso', 'Código', 'Detalle', 'Tipo NC', 'Diario', 'Cuenta',
                'SO Odoo', 'Factura Odoo', 'Factura cobrada', 'Saldo factura', 'Cobro', 'Retorno WH/DEV validado',
@@ -880,6 +1178,21 @@ def main():
                 plan = plan_credit_note(rec, ctx, cfg)
             except Exception as e:
                 plan = {'status': 'ERROR', 'error': f"Al planear: {e}"}
+
+            if plan['status'] == 'SUBSTITUTION' and RUN_MODE != "preflight":
+                # Fila 7: primero la sustitución (la F2 entra a Odoo); después se vuelve a planear la NC contra la F2
+                try:
+                    set_status(db, rec['id'], 'PROCESSING')
+                    f2_id, sub_notes = substitute_invoice(odoo, rec, plan, cfg)
+                    log.info(f"[SUSTITUCIÓN] {tag} -> {sub_notes[0]}")
+                    bump('SUBSTITUTED')
+                    plan = plan_credit_note(rec, load_context(odoo, db, [rec]), cfg)
+                except Exception as e:
+                    status, retry = classify_error(e)
+                    set_status(db, rec['id'], status, f"Sustitución: {e}"[:2000], bump_retry=retry)
+                    log.error(f"[{status}] {tag} sustitución: {str(e)[:500]}")
+                    bump(status)
+                    continue
 
             if RUN_MODE == "preflight":
                 if writer:
