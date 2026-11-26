@@ -38,6 +38,7 @@ import base64
 import signal
 import logging
 import xmlrpc.client
+import http.client
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
@@ -120,20 +121,26 @@ def _pedir_alto(signum, frame):
     log.warning("Ctrl+C: termino el documento en curso y me detengo.")
 
 
+READ_RETRIES = 6        # lecturas: reintentos ante 502/504 de Odoo.sh
+XML_CHUNK = 25          # XML adjuntos por lectura (cada uno pesa; 100 tumbaba la respuesta en prod)
+
+
 def odoo(model, method, *args, **kwargs):
     """Solo se reintentan lecturas. 'cannot marshal None' = el método se ejecutó y no devuelve valor."""
     read = method in ("search_read", "read", "search", "search_count")
-    for attempt in range(1, 4):
+    for attempt in range(1, READ_RETRIES + 1):
         try:
             return _models.execute_kw(ODOO_DB, UID, ODOO_PASSWORD, model, method, list(args), kwargs)
         except xmlrpc.client.Fault as e:
             if "cannot marshal None" in str(e):
                 return None
             raise
-        except (xmlrpc.client.ProtocolError, OSError):
-            if not read or attempt == 3:
+        except (xmlrpc.client.ProtocolError, OSError, http.client.HTTPException):
+            # 502/504 o página HTML de Odoo.sh: solo se reintentan lecturas, con reconexión
+            if not read or attempt == READ_RETRIES:
                 raise
-            time.sleep(3 * attempt)
+            time.sleep(5 * attempt)
+            globals()["_models"] = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
 
 def sr(model, domain, fields, **kw):
@@ -217,8 +224,8 @@ def third_party_attachments(moves):
 def read_cfdi(att_ids):
     """{id del adjunto: (serie, folio, IVA del XML)}. XML ilegible -> ('', '', None)."""
     out = {}
-    for i in range(0, len(att_ids), 100):
-        for a in odoo("ir.attachment", "read", att_ids[i:i + 100], fields=["datas"]):
+    for i in range(0, len(att_ids), XML_CHUNK):
+        for a in odoo("ir.attachment", "read", att_ids[i:i + XML_CHUNK], fields=["datas"]):
             try:
                 root = ET.fromstring(base64.b64decode(a["datas"] or b""))
                 imp = root.find(f"{CFDI_NS}Impuestos")
