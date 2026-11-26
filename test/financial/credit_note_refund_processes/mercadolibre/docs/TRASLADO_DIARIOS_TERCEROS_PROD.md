@@ -65,6 +65,24 @@ Qué revisar:
 - **MLOF / MLONC:** si salen como `OMITIDO sin diario`, falta crear el diario en productivo.
 - **DEV / BON:** las NC del piloto deben salir hacia MLNC.
 
+## En Kestra: `ml_traslado_diarios_terceros_flow` (recomendado para los pasos 2 y 3)
+
+El flujo corre el script de `processes/` con 6 líneas en paralelo y deja los CSV y los logs de cada línea como archivos de la ejecución.
+
+- **Paso 2, a mano desde Kestra:** "Execute" con los inputs:
+  - **facturas:** `lines=1`, `batch_limit=20`, `series=MELI`, `from_journals=INV`, `date_from=2026-10-01`, `date_to=2026-10-31`;
+  - **NC:** `lines=1`, `batch_limit=5`, `series=MELINC`, `from_journals=DEV,BON`, `date_from=2026-10-01`, `date_to=2026-11-30`.
+
+  Revisar el CSV en "Outputs" con el criterio de abajo.
+- **Paso 3, automático:** con el VoBo del Paso 2, se quita `disabled: true` del disparador `after_midnight_ml_chain` (PR a `main`).
+  - Arranca cuando termina `ml_credit_notes_flow` de la cadena de medianoche y se corta solo a las 05:45 CDMX. Si la cadena termina después de las 02:30, esa noche no trabaja.
+  - Usa `series=MELI,MELINC`; Oficiales queda fuera, porque su cadena corre a las 03:00.
+  - Cada noche retoma lo que quede.
+  - Al terminar oct–nov se vuelve a apagar el disparador.
+- **Detener:** la línea termina el documento en curso solo con `HASTA`. "Kill" en Kestra puede dejar un documento en borrador (el log dice cuál); se termina a mano como en "Si una línea sale con FALLO".
+
+Los pasos manuales de abajo siguen sirviendo para correrlo desde la PC.
+
 ## Paso 2 — Lote chico real (20 facturas de octubre + 5 NC)
 
 Fuera de los horarios de cobros de MeLi (ver Paso 3). Tarda ~2 min.
