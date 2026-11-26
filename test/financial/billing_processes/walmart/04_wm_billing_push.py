@@ -24,8 +24,11 @@ Toma las filas PENDING_WB_INVOICE. Candados, en orden:
      Finanzas). El UPC de la linea sale de wm_order_line (API de Walmart), que
      coincide con el NoIdentificacion del CFDI (232 de 232 en octubre).
   C. GRACIA. El cliente tiene 30 dias para pedir factura a Walmart. Se espera
-     WM_GRACE_DAYS desde order_date (decision pendiente de Finanzas; 5 como
-     Amazon). En el cierre de mes (dias 1..WM_DIAS_CIERRE_MES) la venta del mes
+     WM_GRACE_DAYS desde order_date: 7 dias (Finanzas lo dejo a criterio de
+     Data el 25-nov). En los datos el 94% de las peticiones llega en 3 dias, el
+     99.8% en 5 y el 100% en 10 (434 peticiones de ventas hasta el 9-oct).
+     Mas gracia casi no evita dobles CFDI y amontona el cierre de mes, donde
+     todo lo pendiente se timbra en los dias 1-2. En el cierre de mes (dias 1..WM_DIAS_CIERRE_MES) la venta del mes
      anterior se emite sin gracia con fecha del ultimo dia de ese mes.
   D. 72 HORAS. Con fecha del mes anterior, no se crea despues de
      limite_72h(): el SAT ya no la timbraria.
@@ -68,7 +71,7 @@ from _wm_common import (configurar_log, log, banner, validar_entorno, notify_sla
                         ST_SO_CANCELADA, ST_SO_OTRO_EQUIPO, ST_TOTAL_DIFF,
                         ST_RECLASIFICAR, ST_ERROR, ST_BORRADOR_AJENO)
 
-GRACE_DAYS = int(os.getenv('WM_GRACE_DAYS', '5'))
+GRACE_DAYS = int(os.getenv('WM_GRACE_DAYS', '7'))
 FENIX_MAX_HORAS = float(os.getenv('WM_FENIX_MAX_HORAS', '48'))
 B2_DIAS = int(os.getenv('WM_B2_DIAS', '7'))   # 0 = candado B2 apagado
 

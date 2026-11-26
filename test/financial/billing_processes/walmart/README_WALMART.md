@@ -49,7 +49,19 @@ Kestra (borradores en `kestra/`, no en `flows/`): `wm_billing_flow` (00→00b→
 
 1. **Avanza lo pedido antes.** Verifica las solicitudes abiertas; si están terminadas, descarga sus paquetes (ZIP en base64) y guarda cada XML.
 2. **Pide por día.** Pide los CFDI **emitidos** por `SRE1410278MA`, tipo I, vigentes, de 00:00:00 a 23:59:59, para cada día con CFDI de Walmart de UUID conocido sin XML (fecha del crawler) y para el día de cada petición `RECIBIDO` de las órdenes `PENDING_WM_UUID` más `WM_SAT_DIAS_TRAS_PETICION` (1). Solo días ya cerrados.
-3. **Pide por folio.** Lo que siga faltando después de descargar su día se pide UUID por UUID.
+3. **Segunda descarga (definitiva).** El PAC tiene hasta 72 h para entregar un CFDI al SAT, así que lo que se pide al día siguiente puede llegar incompleto.
+   - Una solicitud del día D hecha antes de D+4 es **provisional**. Al cumplirse D+4, el día se pide otra vez: es la segunda y última que permite el SAT.
+   - Si la primera ya se hizo en D+4 o después, es definitiva y no se repite.
+   - Los CFDI de Walmart que solo trae la definitiva se avisan por Slack, porque su orden pudo timbrarse a público general.
+   - Si la definitiva falla, el día se queda con lo que bajó la provisional.
+   - Variable: `WM_SAT_DIAS_DEFINITIVA` (4).
+
+   Se descartaron dos alternativas:
+   - **Pedir un rango semanal:** baja ~7 veces más XML.
+   - **Pedir metadatos y luego folios:** requiere otro tipo de solicitud y otro lector.
+4. **Pide por folio.** Lo que siga faltando después de la descarga definitiva de su día se pide UUID por UUID.
+
+**Pruebas:** `WM_SAT_SOLO_DIAS=AAAA-MM-DD[,…]` pide solo esos días; apaga el barrido, los pendientes y los folios.
 
 **Repositorio.** De todo lo descargado, los CFDI de Fénix (PAC `ICA050422AA6`, serie `FI`, certificado con OU=Walmart) se guardan como filas `CFDI:<UUID>` (`marketplace='WALMART_FENIX'`), estén pendientes o no. Lo demás (Mercado Libre, Amazon, público general) se descarta. Después `ligar_cfdis` liga cada CFDI suelto con su línea y la segunda pasada del miner crea las filas `<orden>:<UUID>`.
 
@@ -261,7 +273,7 @@ Sin crawler, solo 1 orden queda para timbrar WB cuando Walmart ya la facturó (l
 |---|---|---|---|---|
 | `wm_fenix_invoices_report` (crawler, `crawler_wm_invoices.py`) | Selenium sobre el portal `edifacturacionsellers.com` (Reportes > Reporte CFDI, últimos 30 días). Lo corre Data a mano en Windows (lee la versión de Chrome del registro) | Una fila por petición: `identificador`, `invoice`, pedido, línea, **UUID**, `estado_cfdi` (`CON_XML_PDF`, `ERROR`, `CANCELADO`, `REEMPLAZADO`), UPC, total | — | **2-nov-2026** (22 días) |
 | API de Fénix (`00b`) | En vivo, cada corrida | Las mismas peticiones: **`cfdiid` = `identificador` e `invoiceno` = `invoice`** (232 de 232) y su estado | **El UUID** y el estado del CFDI | Cada corrida |
-| FTM (`wm_financial_transactions_master`) | ETL de Data | Ventas, devoluciones y cobros. Las columnas `wm_invoice_uuids`, `wm_invoice_count`… **salen del crawler**: los 1,622 UUID están en el crawler y noviembre tiene 1 | Fuente independiente de UUID | 22-nov |
+| FTM (`wm_financial_transactions_master`) | ETL de Data (Yanina), fuera de este repo; carga diaria (24-nov: 67 filas nuevas y 455 actualizadas). Es una tabla **consolidada** por línea (`so_prime_line_sub_line_no`): la orden de la API de Walmart (`wm_order_line`), los pagos del reporte de pagos de Walmart (`wm_payments_report`: un renglón por línea y concepto, de ahí `venta`, `comision`, `killer`, retenciones, cargos WFS y sus fechas de pago; `venta` coincide en 4,010 de 4,108 líneas de sep–oct), las devoluciones (`wm_return_orders`, filas `type='Refund'`) y el crawler de Fénix (`wm_invoice_*`) | Ventas, devoluciones y cobros. Las columnas `wm_invoice_uuids`, `wm_invoice_count`… **salen del crawler**: los 1,622 UUID están en el crawler y noviembre tiene 1 | Fuente independiente de UUID | 22-nov |
 | `wm_new_orders` / `wm_order_line` | API de Walmart | Orden, línea, SKU, **UPC**, precio, estado | Nada de facturación | 24-nov |
 
 **¿La API sustituye al crawler?**
@@ -295,13 +307,202 @@ Sin crawler, solo 1 orden queda para timbrar WB cuando Walmart ya la facturó (l
 - **Otro mes.** Solo octubre tiene XML en el repositorio. No se pidió otro mes al SAT para no gastar solicitudes que producción va a necesitar.
 - **La corrida completa en Odoo con el ligado nuevo.** En staging los 232 ya estaban ligados por el crawler, así que 01 y 03 no tendrían nada nuevo que hacer.
 
-## Pendiente antes de producción
+## Pruebas del 24-nov-2026 (tarde): SAT real, SIN_LIGAR y noviembre
 
-1. Decisiones de Finanzas: días de gracia, doble CFDI, SO cancelada, órdenes mixtas, Fénix en `ERROR` (ver el análisis, §10).
-2. FTM y `wm_order_line` tienen que seguir cargándose a diario (hoy al día). El crawler de Fénix es opcional: sin él se liga ~87 %; si Data lo automatiza (hoy es Selenium en Windows, a mano), liga el resto. Si no, Finanzas liga a mano los `SIN_LIGAR` del CSV de 05.
-3. Finanzas revisa los asientos de la prueba (INV/2026/255545 a 255624) y Operaciones, la salida de WFS.
-4. Finanzas confirma: cliente de la factura = receptor del CFDI; lista de SKU de bicis eléctricas; cancelar los borradores ajenos y las 15 facturas a público general con doble CFDI de octubre (6 ya en el correo del 23-nov, 9 nuevas).
-5. Kestra: secrets `SAT_FIEL_*` y `FENIX_WALMART_*` en el `.env` del EC2; fusionar el Dockerfile a `main` y reconstruir `wonderbrands-python:v2.0`.
-6. Las filas `SAT_DESCARGA` dependen de `WM_ENTORNO`. El SAT limita 2 solicitudes por parámetros: en staging no repetir las solicitudes por día que producción va a necesitar (por eso 02 corrió sin e.firma en la prueba del 23-nov).
-7. Ligado manual: hoy Finanzas ve los `SIN_LIGAR` en el CSV de 05, pero no hay forma de cargar su liga. Falta una entrada simple (por ejemplo un CSV `uuid,orden` que lea 02).
-8. Al activar: copiar a `processes/` y `flows/` por PR y dejar de correr los dos scripts manuales.
+Todo en staging (`finance.mkp_billing_staging`) y Odoo pruebas `somosreyes-test-13-10-2026-41883942` (copia con órdenes hasta el 13-nov), crawler apagado, timbrado apagado.
+
+### Ciclo de 02 con el SAT real
+
+Ya había corrido completo el 23-nov para el 30 y el 31-oct (1,353 y 11,953 CFDI; 1 y 2 paquetes). El 24-nov se pidieron con `WM_SAT_SOLO_DIAS` el **6-oct** y del **1 al 23-nov**:
+
+| Qué | Resultado |
+|---|---|
+| Solicitudes | 24 aceptadas (5000). El SAT terminó la verificación de las 24 en 25 minutos |
+| Descarga | 24 paquetes, 73,737 CFDI de la empresa. Se guardaron 535 de Fénix (noviembre) y se desechó el resto |
+| 6-oct contra la carpeta de Finanzas | El SAT trajo 34 CFDI de Fénix y **los 34 ya estaban** en el repositorio cargado con la carpeta de Finanzas: 0 nuevos y 0 faltantes |
+| Fallas de red | 3 corridas con *timeout* al conectar con el SAT. La corrida siguiente retomó donde iba, sin perder paquetes ni repetir solicitudes |
+| Segunda descarga | Del 1 al 20-nov quedaron `definitiva=True`, porque se pidieron en D+4 o después. Del 21 al 23-nov quedaron provisionales: se vuelven a pedir del 25 al 27-nov |
+
+Costo: el 6-oct y del 1 al 23-nov ya gastaron 1 de sus 2 solicitudes. Producción no los vuelve a pedir si se siembra con estas filas (ver "Pendiente antes de producción").
+
+### Por qué queda SIN_LIGAR (octubre, crawler apagado)
+
+Son 29 de 232 CFDI, de **13 órdenes: el 0.7 % de las órdenes de Walmart del mes** (12.5 % de los CFDI de Walmart).
+
+| CFDI | Motivo |
+|---|---|
+| 22 | **Ambiguos.** El mismo cliente compró piezas iguales al mismo precio en varias órdenes: 10 CFDI de $589 en 2 órdenes, 10 de $1,359 en 3 órdenes (con 6 órdenes candidatas) y 2 de $3,738 en la misma línea. En cada grupo **todos los CFDI tienen el mismo receptor** |
+| 4 | El total del CFDI es menor que el precio de FTM (de $70 a $600). Aunque se ligaran caerían en `TOTAL_DIFF`, así que Finanzas los ve de todos modos |
+| 2 | Una sola petición candidata, pero a 68 min y a 12 días del timbrado: fuera de la ventana y de un tramo |
+| 1 | El pedido no tiene petición en la API (600000121084541) |
+
+**¿Requiere a una persona?** No siempre. Con el crawler al día se ligan los 29.
+
+Sin el crawler hay una regla segura, **todavía no implementada**, que ligaría 12 de los 22 ambiguos. Se aplica a un grupo cerrado: N CFDI con el mismo receptor, UPC y total, que solo pueden ir a N piezas pedidas, y esas piezas no tienen otro CFDI posible. En ese caso cualquier forma de emparejarlos da el mismo resultado contable: mismo cliente, producto y precio, y cada orden recibe sus piezas.
+
+Lo que queda (el grupo de $1,359, los 2 fuera de ventana y el que no está en la API) sí necesita el crawler o la liga manual.
+
+### Noviembre (ventas del 1 al 12-nov, crawler apagado)
+
+| Paso | Resultado |
+|---|---|
+| 00b | 1,267 peticiones recibidas, 210 con error y 14 nuevas |
+| 01 | 1,514 órdenes para WB, 85 `PENDING_WM_UUID`, 30 SO canceladas, 8 duplicadas, 7 `WM_CFDI_REVISAR`, 13 bicis eléctricas y 1 sin SO |
+| 02 | 535 CFDI de Fénix (1 al 23-nov): **356 ligados (66 %)** (256 por el camino rápido, 15 por el folio con el pedido y 85 por tramo) y 179 `SIN_LIGAR` |
+| 01 (segunda pasada, con la corrección) | 101 CFDI de Walmart de las ventas del 1 al 12-nov tomaron su XML del repositorio |
+| 03 (sin tope) | **92 facturas sin timbrar (INV/2026/255698 a 255789), las 92 con dif $0.00**. 89 quedaron conciliadas con su salida y 3 no tienen salida todavía. Se crearon clientes nuevos con el RFC del receptor. Las otras 9 no se crearon: el SAT no respondió la consulta de vigencia, así que 03 se detuvo como debe y las reintenta en la corrida siguiente |
+| 04 (tope 50) | 50 facturas a público general (INV/2026/255648 a 255697), dif de $0.01 como máximo, 0 errores. El candado B2 detuvo **21 órdenes** (`RECLASIFICAR`), el 1.4 % |
+
+**Noviembre liga menos que octubre (66 % contra 87 %).** La semana del Buen Fin (13 al 20-nov) trajo de 38 a 75 CFDI de Walmart por día, contra unos 8 en octubre. Con tanto volumen hay más piezas iguales y más brecha entre la petición y el timbrado. De los 179 `SIN_LIGAR`:
+- 75 no tienen ninguna petición candidata;
+- 59 tienen una a ≤ 30 min, pero son ambiguos;
+- 45 tienen la candidata más cercana a más de 30 min.
+
+**Lo que no se pudo verificar:** si los 356 ligados de noviembre son correctos. El crawler no se carga desde el 2-nov, así que no hay contra qué comparar. Hace falta que Data lo corra una vez.
+
+**Lo que quedó en la base de pruebas:** INV/2026/255648 a 255789 (142 facturas publicadas sin timbrar) y 68 clientes nuevos creados por 03 (ids 170551 a 170618).
+
+**Error encontrado y corregido.** La segunda pasada de 01 creaba las filas `<orden>:<UUID>` sin XML: el XML solo se copiaba del repositorio al empezar 02. Por eso 03 no replicaba lo recién ligado hasta la corrida siguiente, aunque el YAML dice que lo hace en la misma. Ahora 01 llama a `llenar_xml_desde_repositorio` (en `_wm_common`) al terminar de escribir.
+
+## Respuesta de Finanzas (25-nov-2026) y cambios
+
+| Punto | Pedido | Cambio | Por qué y cómo |
+|---|---|---|---|
+| A1 | IVA como **no cobrado** (209.01.001) hasta el cobro | 03 y 04 usan el impuesto **14** (`WM_TAX_ID`), no el 38 | En Odoo el 14 ("16%") es exigible al cobro con transitoria 209.01.001: al publicar va a la 209 y Odoo lo pasa a la 208 al conciliar el cobro. El 38 (ML y Amazon) es exigible al facturar. `cargar_catalogos` valida que el impuesto sea al cobro con la 209, y si no, no factura. **ML y Amazon van en su propia rama** |
+| A3 | Bicis eléctricas sin trato especial | `WM_SKUS_FACTURA_MANUAL` vacío por defecto | Ya no existe `FACTURA_MANUAL_SERIE`: pasada la gracia, 04 las factura a público general |
+| A4 | Gracia lo más larga posible, desde `order_date` | `WM_GRACE_DAYS=7` | 434 peticiones de ventas hasta el 9-oct: 94 % llega en 3 días, 99.8 % en 5 y 100 % en 10. Más de 7 días casi no evita dobles CFDI y amontona el cierre de mes (todo lo pendiente se timbra los días 1 y 2; ~500 órdenes con 7 días) |
+| B2 | Una factura por CFDI vigente; público general una por orden | Sin cambio | Ya era así (03 por UUID, 04 por SO). 03 respeta la cantidad del CFDI (hay de 2 y 4 piezas) |
+| B3 / D4 | Completitud siempre contra el SAT | 05 reporta **completitud contra el SAT** | El universo es el repositorio de la descarga masiva: CFDI en Odoo, ligados sin factura y sin ligar. Los que faltan salen en el CSV (`SAT_SIN_FACTURA_EN_ODOO`) |
+| C1 | Importar los CFDI faltantes y corregir la existente | 03 adopta una factura existente **solo si coincide** con el CFDI | Si no coinciden total, cliente (RFC), CxC o diario → `WM_ADOPTADA_REVISAR` con el motivo. Esas facturas las corrige el traslado de 2026 (C3). Las piezas que faltan se importan normal |
+| C2 | Datos cruzados (UUID con otro producto y monto) | 03 nunca usa la línea de otro SKU; el UPC del CFDI tiene que ser el de la línea | **Causa:** si la línea del SKU ya estaba facturada, 03 tomaba "la única línea pendiente" aunque fuera otro producto. En SO10339388 la línea GARDENSET3 la había tomado INV/2026/171511 (proceso manual, con el UUID equivocado), y 03 puso el CFDI de $1,605 sobre la línea LIVGREEN4. Ahora → `WM_LINEA_REVISAR` |
+| C3 / D5 | CFDI de Walmart en el diario WALM con su serie y folio | 03 crea en el diario `WALM` (`WM_JOURNAL_CODE`) con nombre `FI-<folio>` | Mismo patrón que `MELI-xxxxx` y `AB-xxxx`. No consume la secuencia INV. 04 (público general) sigue en INV |
+| C6 | Monto: `price_amount` cruzado con la SO | Sin cambio | 04 factura las líneas de la SO y las cruza contra `price_amount` (±$1, si no `TOTAL_DIFF`). 03 toma el monto del CFDI y lo cruza contra `price_amount` por pieza. Nunca se usa `tax_amount` |
+| C7 | Solo CFDI vigentes | Sin cambio | El crawler solo cuenta `CON_XML_PDF` (incluye `REFACTURAR`); la descarga pide solo vigentes, y 03 consulta el SAT antes de crear |
+
+**Regla de grupo cerrado** (`WM_GRUPO_CERRADO`, 5.º método de `ligar_cfdis`). Aplica a N CFDI del mismo receptor, UPC, total y piezas que solo pueden ser de N peticiones libres, y esas peticiones de ningún otro CFDI. Se emparejan en orden de folio y `cfdiid`. Medida contra el crawler en octubre (tabla temporal):
+
+| Modo | Ligas nuevas (oct + nov) | Octubre | Errores contra el crawler |
+|---|---|---|---|
+| `orden` (por defecto): solo si las N peticiones son de la misma orden | 21 | 207 de 232 (89 %) | 0 |
+| `cliente`: también entre órdenes del mismo cliente | 71 | 227 de 232 (98 %) | 2: CFDI cruzados entre dos órdenes del mismo cliente |
+
+**Prueba en Odoo pruebas (25-nov, staging, timbrado apagado).** El diario `WALM` (id 231) se creó en la copia de pruebas, porque esta es del 13-nov y Finanzas lo creó después en prod.
+
+| Qué | Resultado |
+|---|---|
+| 03, CFDI de noviembre | **14 facturas en el diario WALM, nombradas `FI-4384`, `FI-4714`…**, dif $0.00. No consumieron la secuencia INV: la siguiente de 04 fue INV/2026/255798 |
+| IVA | FI-4384: Dr 105.01.007 1,149.00 / Cr 401.01.001 990.52 / **Cr 209.01.001 158.48** / Dr 501.01.001 640.80 / Cr 205.06.003 640.80. Las 10 de público general de 04 (INV/2026/255798 a 255807) también van a la 209 |
+| C1, SO10352113 | INV/2026/171541 → `WM_ADOPTADA_REVISAR`: "cliente Walmart (sin RFC) vs receptor GCA951222FA5; CxC 105.01.001; diario Customer Invoices". Las otras 4 piezas ya estaban importadas |
+| C2, SO10339388 | INV/2026/171511 (UUID 8B982DAA) → `WM_ADOPTADA_REVISAR`: "total 1,605.00 vs CFDI 3,270.01; cliente Walmart; CxC 105.01.001". El CFDI C10C6640 → `WM_LINEA_REVISAR`: la línea GARDENSET3 ya la facturó 171511, así que **no se crea nada cruzado** (antes salió INV/2026/255564, que se canceló en pruebas) |
+| Facturas del proceso manual (octubre) | Las 111 que 03 había adoptado → `WM_ADOPTADA_REVISAR`. Las 111 tienen cliente "Walmart" sin RFC, CxC 105.01.001 y diario INV; 1 además con total distinto. Es la lista para el traslado de 2026 (C3) |
+| Grupo cerrado (modo `orden`) | 17 CFDI de noviembre ligados de más; se crearon junto con los 9 que el SAT no respondió el 24-nov |
+| 05, completitud contra el SAT | 767 CFDI de Fénix descargados: 163 en Odoo, 162 sin ligar y 442 ligados sin factura. Los 442 son en su mayoría las 111 por corregir y CFDI de ventas del 13 al 23-nov, fuera de la ventana de la prueba |
+
+Emparejar por fecha en lugar de folio cruzaba 8 de 24. Un CFDI en la orden equivocada da el mismo asiento, pero confunde la NC de una devolución, por eso el modo por defecto es `orden`.
+
+## Cobros (fuera de esta fase; se hacen en otra sesión)
+
+Este flujo **solo factura**. Walmart no tiene cobros automáticos (CLAUDE.md §7). Mientras tanto Finanzas los sigue aplicando como hoy. En Odoo una factura queda pagada cuando su línea de CxC (105.01.007) se concilia con un pago (`account.payment.register`): `payment_state` pasa a `paid`, o a `partial`. Así lo hacen ML (04) y Amazon (03).
+
+**Cuentas ya creadas por Finanzas (25-nov):** 102.03.008 Walmart (transitoria de cobros) y diario **WMT**. Al cobrar, el IVA pasa solo de la 209 a la 208, porque el impuesto es al cobro.
+
+**Qué pide Finanzas** (`6. flujo_facturacion_walmart.html`, §6):
+1. Tomar las órdenes cuya fecha de liberación cae en el periodo.
+2. Registrar un pago por factura, por el total con IVA (`price_amount`), que salde la CxC.
+3. Asiento: Dr "Liberaciones Walmart Pendientes de Procesar" (**código pendiente**) / Cr 105.01.007. La cuenta puente se concilia después contra el banco, igual que en Amazon.
+4. Las retenciones de IVA e ISR quedan para una fase 2.
+
+**Qué trae FTM** (`wm_financial_transactions_master`, por línea, `type='Order'`):
+- `fecha_pago_venta` / `venta`.
+- `fecha_pago_comision` / `comision` y `costo_de_envio`.
+- `killer` / `killercomision`, `penalty`, `reclamo` y los cargos de WFS (inventario extraviado, almacenaje, envío, manejo), cada uno con su fecha de pago.
+- `withholding_iva_amount`, `withholding_isr_amount`, `refund_amount`.
+- Las devoluciones van en filas `type='Refund'`.
+- No hay id de depósito ni de liquidación.
+- **De dónde salen:** del reporte de pagos de Walmart, `somos_reyes.wm_payments_report`. Tiene un renglón por línea y concepto:
+  - **Conceptos:** Venta, Comision, Killer, Costo de envio, Retencion IVA/ISR, WFS, Penalty, Reclamo, Publicidad.
+  - **Último pago:** 18-nov, cargado el 21-nov.
+  - **Retenciones:** el reporte las trae como egreso, así que el depósito llega neto de retenciones.
+  - **Para cuadrar contra el banco** conviene usar este reporte directo, no FTM.
+
+**Perfil de sep–oct-2026** (solo lectura, 24-nov; 4,197 líneas de 4,141 órdenes):
+
+| Dato | Resultado |
+|---|---|
+| Líneas con `fecha_pago_venta` | 4,108, repartidas en **11 fechas** (9-sep a 18-nov): Walmart libera por lotes |
+| `venta` contra `price_amount` | Iguales en 3,979 de 4,035 órdenes de una línea. `venta` es el total con IVA sin restar retenciones. Las 56 restantes no se han revisado |
+| `venta` repetido por orden (advertencia del Playbook) | No aparece en esta ventana: en las 55 órdenes de varias líneas, la suma de `venta` es igual a la de `price_amount`. Revisar otros meses |
+| `comision` | En las 4,108 líneas pagadas, siempre con la misma fecha que la venta: el depósito llega neto |
+| Otros cargos | `killer` en 1,764 líneas, `costo_de_envio` en 1,809, envío WFS en 167, `penalty` en 0 |
+
+**Antes de diseñar:**
+1. **Cuadrar contra el banco** (regla 6). La suma de todos los conceptos de una `payment_date` de `wm_payments_report` (ingresos menos egresos, retenciones incluidas) tiene que igualar el depósito del estado de cuenta. Hasta que cuadre, FTM no sirve como fuente de cobro.
+2. **Preguntas a Finanzas:**
+   - ¿Cuál es el código de la cuenta puente?
+   - ¿Qué cuentas llevan comisión, envío, killers, cargos de WFS y retenciones? El HTML solo cubre el cobro bruto.
+   - ¿Cómo aplican hoy los cobros de Walmart, y contra qué CxC? Las cargas manuales usaban la 105.01.001; este flujo usa la 105.01.007.
+   - ¿Cómo se cobra una orden con doble CFDI o con NC?
+3. **Datos:** ¿las fechas de pago de FTM se llenan después, sobre líneas ya cargadas? Eso decide cada cuánto relee el miner.
+
+**Propuesta** (patrón de Amazon 02 → 03, ver `README_AMAZON.md`), en su rama `feat/cobros-walmart` desde `main`:
+- **Miner:** una fila por orden liberada en `finance.mkp_payments_{entorno}`, con `payment_id = '<fecha_pago_venta>:<customer_order_id>'` porque no hay id de depósito.
+- **Loader:**
+  - `account.payment.register` contra cada factura de la orden (`AUTOINV:<SO>` y las `AUTOINV:<SO>:<UUID>`; una orden puede tener varias), en el diario de la cuenta puente.
+  - Solo si la factura está en la 105.01.007 (`CXC_INCORRECTA`).
+  - Redondeo hasta $0.15 por factura contra 704.23.001.
+  - Las escrituras con `OdooWriteUncertain` se confirman leyendo.
+- No se aplica cobro a una orden en `DOBLE_CFDI`, porque una de sus facturas se va a cancelar (CLAUDE.md §8).
+
+## Pendiente antes de producción (24-nov-2026)
+
+**Desarrollo (nuestro):**
+1. ~~Segunda descarga de cada día~~ **hecha el 24-nov** (`WM_SAT_DIAS_DEFINITIVA`, ver "Descarga masiva del SAT").
+2. ~~Ciclo de 02 con el SAT real~~ **probado** (23 y 24-nov, ver arriba).
+3. **Ligado manual.** Hoy Finanzas ve los `SIN_LIGAR` en el CSV de 05, pero no puede cargar la liga. Falta una entrada `uuid,orden` (CSV) que lea 02. Con el crawler apagado es el 0.7 % de las órdenes en un mes normal, y más en Buen Fin.
+4. ~~Regla de grupo cerrado~~ **hecha el 25-nov** (modo `orden`, 0 errores).
+5. **Validar las ligas de noviembre** cuando Data corra el crawler una vez (373 ligas sin verificar).
+6. **Corrida de noviembre completo** (ventas del 13 al 30) en una copia nueva de Odoo pruebas. La actual llega al 13-nov. **No frena la salida.**
+6b. **Traslado de 2026 al diario WALM** (C3): mover las facturas importadas del proceso manual y corregir cliente (receptor del CFDI) y CxC (105.01.007) desde el 31-jul. Base: `credit_note_refund_processes/traslado_diarios_terceros.py` (el de MeLi). La lista son las filas `WM_ADOPTADA_REVISAR`. **No frena la salida:** el flujo nuevo no las toca, solo las reporta.
+6c. **Revisión periódica de dobles CFDI** (D1): cancelar en el mismo mes o hacer NC en un mes posterior. Va después de la auditoría contra el SAT de Luis (D2). Hoy el flujo los detecta (`DOBLE_CFDI`), pero no los cancela.
+6d. **IVA 209 en ML y Amazon** (A1): rama propia (`fix/iva-209-ml-amazon`), porque son flujos en producción.
+
+**Finanzas (25-nov):** respondieron A1–A4 y B1–B4 (ver "Respuesta de Finanzas"). Para salir falta:
+
+7. Visto bueno a la prueba del 25-nov: FI-xxxx en el diario WALM y el IVA en la 209 (D5).
+8. Confirmar que en producción el diario se llama exactamente `WALM` y es de tipo venta.
+9. ~~Gracia, cliente = receptor, bicis eléctricas~~: resuelto (7 días, sí y sin trato especial).
+
+**Finanzas y Operaciones (no frenan la salida):**
+- Cancelar las 15 facturas con doble CFDI de octubre y los borradores ajenos, **en Odoo producción y ante el SAT**. Son facturas reales del proceso manual; la copia de pruebas se desecha. El flujo ya los deja en `DOBLE_CFDI` y `BORRADOR_AJENO`.
+- Revisar con Operaciones la salida de WFS.
+
+**Infraestructura y salida:**
+
+10. **Tablas `_staging` y `_prod`.** Todas las pruebas usan `finance.mkp_billing_staging` y Odoo pruebas. `_prod` está vacía para Walmart. El cambio lo hace una sola variable, `WM_ENTORNO=prod`, que ya trae el YAML de Kestra: entra en vigor cuando el flujo llega a `flows/` en `main`.
+
+   El repositorio de CFDI y las solicitudes al SAT no dependen del entorno: el mismo día vale igual en staging y en prod. Antes de la primera corrida de prod se copian de staging, para no volver a pedir días que ya gastaron solicitudes:
+
+   ```sql
+   INSERT IGNORE INTO finance.mkp_billing_prod
+     (marketplace, mkp_order_id, cfdi_uuid, total_amount, xml_data, raw_json, status,
+      error_log, retry_count, retry_count_loader, processed_at)
+   SELECT marketplace, mkp_order_id, cfdi_uuid, total_amount, xml_data, raw_json, status,
+          error_log, retry_count, retry_count_loader, processed_at
+   FROM finance.mkp_billing_staging
+   WHERE marketplace = 'SAT_DESCARGA'
+      OR (marketplace = 'WALMART_FENIX' AND mkp_order_id LIKE 'CFDI:%');
+   ```
+
+   No se copian las filas `WALMART`, porque apuntan a facturas de Odoo pruebas, ni las `PRECFDI`, que 00b reescribe en cada corrida.
+11. **Secrets en Kestra:** `SAT_FIEL_*` y `FENIX_WALMART_*`, en el `.env` del EC2.
+12. **Orden de salida:**
+   1. PR con `requirements.txt` y el Dockerfile.
+   2. Reconstruir `wonderbrands-python:v2.0`.
+   3. Dar de alta los secrets.
+   4. PR con `processes/` y `flows/`.
+
+   Si el YAML llega a `main` antes que la imagen o los secrets, la corrida de las 10:30 falla.
+13. **Corte:**
+    - Fijar una fecha de arranque (`start_date`). Ese día se dejan de correr los dos scripts manuales. `Team_Walmart` ya está fuera del 1a1, y la revalidación ve las facturas del proceso manual.
+    - Los primeros días, con `max_facturas` bajo.
+14. **Fuentes diarias:** FTM y `wm_order_line` tienen que cargarse a diario. El crawler es opcional: sin él se liga del 66 % (Buen Fin) al 87 % (octubre); con él, el resto. Automatizarlo (hoy es Selenium a mano) quitaría casi toda la liga manual.

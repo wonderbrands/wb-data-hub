@@ -36,7 +36,8 @@ from _wm_common import (configurar_log, log, banner, notify_slack, get_db_connec
                         ST_SO_DUPLICADA, ST_SO_OTRO_EQUIPO, ST_SO_CANCELADA, ST_ORDEN_MIXTA,
                         ST_WM_REVISAR, ST_WM_EXCEDENTE, ST_RECLASIFICAR, ST_PENDING_WM_XML,
                         ST_WB_INVOICED, ST_MANUAL_SERIE, ST_BORRADOR_AJENO, ST_WM_NO_VIGENTE,
-                        ST_PENDING_WM_UUID, MKP_FENIX, CFDI_SIN_LIGAR, frescura_etl_fenix)
+                        ST_PENDING_WM_UUID, MKP_FENIX, CFDI_SIN_LIGAR, frescura_etl_fenix,
+                        ST_LINEA_REVISAR, ST_ADOPTADA_REVISAR)
 
 WM_CSV_FINANZAS = os.getenv('WM_CSV_FINANZAS', '').strip()
 WM_REPORTE_DIR = os.getenv('WM_REPORTE_DIR', _dir)
@@ -44,7 +45,7 @@ WM_REPORTE_DIR = os.getenv('WM_REPORTE_DIR', _dir)
 ATENCION = (ST_DOBLE_CFDI, ST_TOTAL_DIFF, ST_XML_INVALIDO, ST_NO_SO, ST_SO_DUPLICADA,
             ST_SO_OTRO_EQUIPO, ST_SO_CANCELADA, ST_ORDEN_MIXTA, ST_WM_REVISAR,
             ST_WM_EXCEDENTE, ST_RECLASIFICAR, ST_MANUAL_SERIE, ST_BORRADOR_AJENO,
-            ST_WM_NO_VIGENTE)
+            ST_WM_NO_VIGENTE, ST_LINEA_REVISAR, ST_ADOPTADA_REVISAR)
 
 
 def leer_csv_finanzas(ruta):
@@ -102,6 +103,32 @@ def main():
         raw = json.loads(r['raw_json']) if isinstance(r['raw_json'], str) else (r['raw_json'] or {})
         sin_ligar.append((r['cfdi_uuid'], r['total_amount'], raw))
 
+    # Completitud contra el SAT (Finanzas, D4): el universo son los CFDI de
+    # Fenix que bajo la descarga masiva (repositorio), no las tablas de
+    # Walmart. Cada uno tiene que terminar como factura en Odoo (WM_LINKED).
+    cur.execute(f"""
+        SELECT r.cfdi_uuid, r.status AS st_repo, r.raw_json, b.status AS st_fila
+        FROM {TBL_BILLING} r
+        LEFT JOIN {TBL_BILLING} b
+          ON b.marketplace = %s AND b.mkp_order_id = CONCAT(
+               JSON_UNQUOTE(JSON_EXTRACT(r.raw_json, '$.orden')), ':', r.cfdi_uuid)
+        WHERE r.marketplace = %s AND r.mkp_order_id LIKE 'CFDI:%%'
+    """, (MARKETPLACE, MKP_FENIX))
+    completitud, sin_factura = Counter(), []
+    for r in cur.fetchall():
+        if r['st_repo'] == CFDI_SIN_LIGAR:
+            completitud['sin_ligar'] += 1
+        elif r['st_fila'] == 'WM_LINKED':
+            completitud['en_odoo'] += 1
+        else:
+            completitud['ligado_sin_factura'] += 1
+            raw = json.loads(r['raw_json']) if isinstance(r['raw_json'], str) else (r['raw_json'] or {})
+            sin_factura.append((r['cfdi_uuid'], raw.get('orden'), raw.get('fecha'), r['st_fila'] or 'SIN_FILA'))
+    total_sat = sum(completitud.values())
+    log.info(f"Completitud contra el SAT: {total_sat} CFDI de Fenix descargados | en Odoo "
+             f"{completitud['en_odoo']} | ligados sin factura {completitud['ligado_sin_factura']} | "
+             f"sin ligar {completitud['sin_ligar']}")
+
     cruce = []
     if WM_CSV_FINANZAS:
         ordenes_fin, sos_fin = leer_csv_finanzas(WM_CSV_FINANZAS)
@@ -133,6 +160,8 @@ def main():
             w.writerow(['CFDI_WALMART_SIN_LIGAR', '', '', uuid, total, CFDI_SIN_LIGAR, '',
                         f"fecha={raw.get('fecha')} receptor={raw.get('receptor_rfc')} {raw.get('receptor_nombre')} "
                         f"upc={raw.get('upc')} folio={raw.get('serie')}{raw.get('folio')}"])
+        for uuid, orden, fecha, st in sin_factura:
+            w.writerow(['SAT_SIN_FACTURA_EN_ODOO', orden, '', uuid, '', st, '', f"fecha={fecha}"])
     log.info(f"Detalle: {nombre}")
 
     por_estado = Counter(r['status'] for r in detalle)
@@ -141,6 +170,8 @@ def main():
                f"replicadas WM={conteo.get('WM_LINKED', 0)} "
                f"sin XML={conteo.get(ST_PENDING_WM_XML, 0)} "
                f"sin ligar={conteo.get(ST_PENDING_WM_UUID, 0)} ordenes / {len(sin_ligar)} CFDI | "
+               f"SAT: {total_sat} CFDI de Walmart, {completitud['en_odoo']} en Odoo, "
+               f"{completitud['ligado_sin_factura']} ligados sin factura | "
                f"peticiones con error={fuente.get('PRECFDI/CON_ERROR', 0)} nuevas={fuente.get('PRECFDI/NUEVO', 0)} | "
                f"atencion: " + (', '.join(f"{s}={n}" for s, n in sorted(por_estado.items())) or 'nada'))
     log.info(resumen)

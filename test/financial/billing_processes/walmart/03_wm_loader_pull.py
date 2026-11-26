@@ -14,10 +14,14 @@ Por cada fila:
      concepto, y total contra el precio por pieza de Walmart (+-$1).
   2. SO: existe, es de Team_Walmart, no esta cancelada; en borrador se
      confirma (Walmart ya vendio).
-  3. Linea de la SO por SKU, con piezas pendientes de facturar.
+  3. El UPC del CFDI (NoIdentificacion) es el de la linea ligada; la linea de
+     la SO es la del MISMO SKU con piezas pendientes. Si no -> WM_LINEA_REVISAR
+     (nunca se usa la linea de otro producto: caso SO10339388).
   4. Cliente por el RFC del receptor del XML (se crea si no existe).
   5. REVALIDACION FAIL-CLOSED justo antes de crear: facturas vivas de la SO.
-       - una con este UUID o con la ref AUTOINV:<SO>:<UUID>  -> se adopta
+       - una con este UUID o con la ref AUTOINV:<SO>:<UUID>  -> se adopta si
+         coincide con el CFDI (total, cliente, CxC, diario); si no,
+         WM_ADOPTADA_REVISAR (lo corrige el traslado de 2026)
        - otras piezas de Walmart de la misma orden            -> normal
        - cualquier otra (AUTOINV:<SO> a publico general, global, manual
          con otro UUID)                                        -> DOBLE_CFDI
@@ -25,8 +29,9 @@ Por cada fila:
   5b. ESTADO EN EL SAT (servicio publico de consulta): solo se replica un CFDI
      Vigente. Cancelado -> WM_CFDI_NO_VIGENTE. No Encontrado o el servicio no
      responde -> se queda PENDING_WM_LINK para la siguiente corrida.
-  6. create con ref AUTOINV:<SO>:<UUID> -> base y CxC 105.01.007 -> UUID y
-     narration -> IVA al centavo del CFDI -> XML adjunto -> action_post.
+  6. create en el diario WALM con ref AUTOINV:<SO>:<UUID> -> nombre = serie-folio
+     del CFDI (FI-4252) -> base y CxC 105.01.007 -> UUID y narration -> IVA al
+     centavo del CFDI (impuesto al cobro: 209.01.001) -> XML adjunto -> action_post.
   7. 205.06.003 contra la salida y chatter.
 
 Variables: WM_ENTORNO, WM_MAX_FACTURAS.
@@ -56,7 +61,8 @@ from _wm_common import (configurar_log, log, banner, validar_entorno, notify_sla
                         CLIENTE_TELEFONO_GENERICO, CLIENTE_CORREO_GENERICO,
                         ST_PENDING_WM_LINK, ST_WM_LINKED, ST_DOBLE_CFDI, ST_NO_SO,
                         ST_SO_CANCELADA, ST_SO_OTRO_EQUIPO, ST_TOTAL_DIFF,
-                        ST_XML_INVALIDO, ST_ERROR, ST_BORRADOR_AJENO, ST_WM_NO_VIGENTE)
+                        ST_XML_INVALIDO, ST_ERROR, ST_BORRADOR_AJENO, ST_WM_NO_VIGENTE,
+                        ST_LINEA_REVISAR, ST_ADOPTADA_REVISAR, upc_por_linea)
 import _sat_descarga as sat
 
 
@@ -125,17 +131,55 @@ def resolver_cliente(odoo, cfdi, catalogos, cache):
         return None
 
 
-def elegir_linea_so(lineas, sku):
-    """Linea pendiente de la SO para el SKU de Walmart. Si la SO tiene una sola
-    linea de producto pendiente se usa aunque el SKU no coincida (se avisa)."""
-    pendientes = [l for l in lineas if l['product_uom_qty'] - l['qty_invoiced'] >= 1
-                  and 'C-ENVIO' not in (l['product_id'][1].upper() if l.get('product_id') else '')]
-    por_sku = [l for l in pendientes if sku_de_producto(l.get('product_id')) == (sku or '').upper()]
-    if por_sku:
-        return por_sku[0], None
-    if len(pendientes) == 1:
-        return pendientes[0], f"SKU {sku} no coincide; se uso la unica linea pendiente"
-    return None, f"sin linea pendiente en la SO para el SKU {sku} ({len(pendientes)} candidatas)"
+def elegir_linea_so(lineas, sku, piezas):
+    """Linea de la SO del MISMO SKU con piezas pendientes de facturar. Nunca se
+    usa la linea de otro producto: asi se cruzaron SO10339388 (correo de
+    Finanzas, C2) en el proceso manual y en la prueba del 19-nov (la linea de su
+    SKU ya la habia facturado otra factura con el UUID equivocado)."""
+    del_sku = [l for l in lineas if sku_de_producto(l.get('product_id')) == (sku or '').upper()]
+    pendientes = [l for l in del_sku if l['product_uom_qty'] - l['qty_invoiced'] >= piezas]
+    if pendientes:
+        return pendientes[0], None
+    if del_sku:
+        return None, (f"La linea del SKU {sku} ya esta facturada ({del_sku[0]['qty_invoiced']:g} de "
+                      f"{del_sku[0]['product_uom_qty']:g}): otra factura de la SO la tomo. Revisar que "
+                      f"esa factura tenga el UUID y el producto correctos")
+    return None, (f"La SO no tiene piezas pendientes del SKU {sku}: la linea ya la facturo otra factura "
+                  f"de la SO (revisar que esa factura tenga el UUID y el producto correctos) o la SO "
+                  f"no trae ese producto")
+
+
+def upc_de_linea(db, iderp):
+    """UPC (sin ceros a la izquierda) de la linea de Walmart, de wm_order_line."""
+    if not iderp:
+        return None
+    cur = db.cursor()
+    r = upc_por_linea(cur, {iderp})
+    cur.close()
+    return r.get(iderp)
+
+
+def revisar_adoptada(odoo, inv_id, cfdi, catalogos):
+    """Una factura que ya existia con el UUID (proceso manual) se adopta solo si
+    coincide con el CFDI. Lo que no coincide (C1 y C2 del correo de Finanzas) se
+    reporta; lo corrige el traslado de 2026 al diario WALM."""
+    inv = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                          {'fields': ['name', 'amount_total', 'partner_id', 'journal_id']})[0]
+    problemas = []
+    if abs(a_float(inv['amount_total']) - cfdi['total']) > TOLERANCIA_TOTAL:
+        problemas.append(f"total {a_float(inv['amount_total']):,.2f} vs CFDI {cfdi['total']:,.2f}")
+    if inv['partner_id']:
+        vat = odoo.execute_kw('res.partner', 'read', [[inv['partner_id'][0]]], {'fields': ['vat']})[0]['vat']
+        if (vat or '').upper() != (cfdi['receptor_rfc'] or '').upper():
+            problemas.append(f"cliente {inv['partner_id'][1]} ({vat or 'sin RFC'}) vs receptor {cfdi['receptor_rfc']}")
+    cxc = odoo.execute_kw('account.move.line', 'search_read',
+                          [[('move_id', '=', inv_id), ('display_type', '=', 'payment_term')]],
+                          {'fields': ['account_id']})
+    if any(l['account_id'][0] != catalogos['cuenta_cxc'] for l in cxc):
+        problemas.append(f"CxC {cxc[0]['account_id'][1]}")
+    if not inv['journal_id'] or inv['journal_id'][0] != catalogos['diario_walmart']:
+        problemas.append(f"diario {inv['journal_id'][1] if inv['journal_id'] else '-'}")
+    return inv, problemas
 
 
 def procesar(odoo, db, fila, catalogos, cache_clientes, stats):
@@ -196,8 +240,17 @@ def procesar(odoo, db, fila, catalogos, cache_clientes, stats):
 
     # --- 3. Linea de la SO ---
     concepto = cfdi['conceptos'][0]
+    # El CFDI tiene que ser de la linea a la que se ligo: su NoIdentificacion es
+    # el UPC de la linea en Walmart (232 de 232 en octubre).
+    upc_cfdi = (concepto.get('no_identificacion') or '').lstrip('0')
+    upc_wm = upc_de_linea(db, linea_wm.get('iderp'))
+    if upc_cfdi and upc_wm and upc_cfdi != upc_wm:
+        update_fila(db, rid, ST_LINEA_REVISAR,
+                    f"El CFDI es del UPC {upc_cfdi} y la linea {linea_wm.get('iderp')} ({linea_wm.get('sku')}) "
+                    f"es del UPC {upc_wm}: el CFDI esta ligado a otra linea")
+        return 'linea_revisar'
     lineas = leer_lineas_so(odoo, so)
-    linea_so, aviso_linea = elegir_linea_so(lineas, linea_wm.get('sku'))
+    linea_so, aviso_linea = elegir_linea_so(lineas, linea_wm.get('sku'), piezas)
 
     # --- 5. REVALIDACION FAIL-CLOSED (antes de crear cualquier cosa) ---
     ref = f"{IDEMPOTENCY_PREFIX}{so['name']}:{uuid}"
@@ -213,6 +266,12 @@ def procesar(odoo, db, fila, catalogos, cache_clientes, stats):
               and normalizar_uuid(f.get('l10n_mx_edi_cfdi_uuid')) not in uuids_orden
               and not (f.get('ref') or '').startswith(f"{IDEMPOTENCY_PREFIX}{so['name']}:")]
     if len(mias) == 1 and mias[0]['state'] == 'posted':
+        inv_adoptada, problemas = revisar_adoptada(odoo, mias[0]['id'], cfdi, catalogos)
+        if problemas:
+            update_fila(db, rid, ST_ADOPTADA_REVISAR,
+                        f"Ya existia {inv_adoptada['name']} con este UUID, pero no coincide con el CFDI: "
+                        + '; '.join(problemas), facturas=[resumen_factura(mias[0])])
+            return 'adoptada_revisar'
         update_fila(db, rid, ST_WM_LINKED, 'Ya existia en Odoo (proceso manual o corrida previa)',
                     facturas=[resumen_factura(mias[0])])
         return 'adoptada'
@@ -253,8 +312,9 @@ def procesar(odoo, db, fila, catalogos, cache_clientes, stats):
         stats['retomadas'] += 1
     else:
         if not linea_so:
-            update_fila(db, rid, ST_ERROR, aviso_linea, sumar_retry=True)
-            return 'error'
+            update_fila(db, rid, ST_LINEA_REVISAR, aviso_linea,
+                        facturas=[resumen_factura(f) for f in vivas])
+            return 'linea_revisar'
         partner_id = resolver_cliente(odoo, cfdi, catalogos, cache_clientes)
         if not partner_id:
             update_fila(db, rid, ST_ERROR, f"No se pudo resolver el cliente {cfdi['receptor_rfc']}",
@@ -273,6 +333,7 @@ def procesar(odoo, db, fila, catalogos, cache_clientes, stats):
         vals = {
             'ref': ref,
             'move_type': 'out_invoice',
+            'journal_id': catalogos['diario_walmart'],
             'partner_id': partner_id,
             'invoice_origin': so['name'],
             'invoice_line_ids': comandos,
@@ -300,7 +361,29 @@ def procesar(odoo, db, fila, catalogos, cache_clientes, stats):
                         sumar_retry=True)
             return 'error'
 
-    # --- 6. Base, CxC, UUID, IVA, XML, post ---
+    # --- 6. Nombre, base, CxC, UUID, IVA, XML, post ---
+    # Nombre = serie-folio del CFDI (FI-4252) en el diario WALM: no consume la
+    # secuencia INV (Finanzas, C3/D5; mismo patron que MELI-xxxxx y AB-xxxx).
+    serie_folio = f"{cfdi['serie'] or ''}-{cfdi['folio'] or ''}".strip('-')
+    if cfdi['serie'] and cfdi['folio']:
+        try:
+            actual = odoo.execute_kw('account.move', 'read', [[inv_id]],
+                                     {'fields': ['name', 'state', 'journal_id']})[0]
+            otro_diario = actual['journal_id'] and actual['journal_id'][0] != catalogos['diario_walmart']
+            if actual['state'] == 'draft' and (otro_diario or actual['name'] != serie_folio):
+                ctx = {'context': {'tracking_disable': True}}
+                if otro_diario:   # borrador retomado de una corrida anterior en INV
+                    odoo.execute_kw('account.move', 'write', [[inv_id], {'name': '/'}], ctx)
+                odoo.execute_kw('account.move', 'write',
+                                [[inv_id], {'journal_id': catalogos['diario_walmart'], 'name': serie_folio}], ctx)
+        except OdooWriteUncertain as e:
+            update_fila(db, rid, ST_ERROR, f"WRITE_UNCERTAIN al poner el nombre {serie_folio} (factura "
+                        f"{inv_id} en borrador; la siguiente corrida la retoma): {e}", sumar_retry=True)
+            return 'error'
+        except xmlrpc.client.Fault as e:
+            update_fila(db, rid, ST_ERROR, f"Odoo rechazo el nombre {serie_folio} (factura {inv_id} en "
+                        f"borrador): {e.faultString[:400]}", sumar_retry=True)
+            return 'error'
     try:
         ajuste_base = cuadrar_base_con_cfdi(odoo, inv_id, cfdi, etiqueta)
         narration = (f"CFDI autofacturador Walmart {cfdi['serie'] or ''}-{cfdi['folio'] or ''} "
@@ -400,10 +483,12 @@ def main():
 
     for k, v in sorted(stats.items()):
         log.info(f"  {k:<22} {v:>6}")
-    if stats['doble_cfdi'] or stats['error'] or stats['no_vigente']:
+    if (stats['doble_cfdi'] or stats['error'] or stats['no_vigente'] or stats['linea_revisar']
+            or stats['adoptada_revisar']):
         notify_slack(f"Walmart 03 (pull): creadas={stats['creada']} adoptadas={stats['adoptada']} "
                      f"DOBLE_CFDI={stats['doble_cfdi']} errores={stats['error']} "
-                     f"TOTAL_DIFF={stats['total_diff']} no_vigentes={stats['no_vigente']}")
+                     f"TOTAL_DIFF={stats['total_diff']} no_vigentes={stats['no_vigente']} "
+                     f"linea_a_revisar={stats['linea_revisar']} adoptadas_a_corregir={stats['adoptada_revisar']}")
 
 
 if __name__ == '__main__':

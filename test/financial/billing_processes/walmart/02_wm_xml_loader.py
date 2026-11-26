@@ -38,6 +38,13 @@ COMO SE PIDE AL SAT (asincrono: lo que se pide hoy se descarga en otra corrida)
          API). 04 no timbra una orden si hay un CFDI de Walmart sin ligar que
          podria ser suyo.
      Solo dias ya cerrados (anteriores a hoy en CDMX).
+     SEGUNDA DESCARGA (definitiva). El PAC tiene hasta 72 h para entregar un
+     CFDI al SAT: lo que se pide al dia siguiente puede llegar incompleto. Una
+     solicitud de un dia D hecha antes de D + WM_SAT_DIAS_DEFINITIVA (4) es
+     PROVISIONAL; cuando se cumple ese plazo, el dia se vuelve a pedir una
+     vez (la segunda y ultima que permite el SAT). Si la primera ya se hizo
+     despues del plazo, es definitiva y no se repite. Los CFDI de Walmart que
+     solo aparecen en la definitiva se avisan por Slack (llegaron tarde).
   3. Pedir por FOLIO lo que siga faltando despues de descargar su dia (por
      ejemplo, un CFDI timbrado cerca de medianoche con la fecha de Fenix en el
      dia vecino).
@@ -47,10 +54,13 @@ marketplace = 'SAT_DESCARGA' (no se crea tabla nueva):
   mkp_order_id  EMITIDOS:<AAAA-MM-DD>  o  FOLIO:<uuid>
   status        SOLICITADA -> TERMINADA -> DESCARGADA
                 o SIN_CFDI, RECHAZADA, VENCIDA, ERROR
-  raw_json      id_solicitud, paquetes, paquetes descargados, ultima verificacion
+  raw_json      id_solicitud, pedida_en, definitiva, paquetes, paquetes
+                descargados, ultima verificacion; 'anteriores' guarda la
+                solicitud provisional cuando el dia se vuelve a pedir
   retry_count   veces que se pidio. El SAT solo acepta 2 solicitudes con los
                 mismos parametros "de por vida" (codigo 5002): no se pasa de 2.
-La clave unica (marketplace, mkp_order_id) impide pedir dos veces el mismo dia.
+La clave unica (marketplace, mkp_order_id) deja una fila por dia: a lo mas una
+solicitud provisional y una definitiva.
 
 Un error del SAT no detiene el flujo: se registra en la fila, se avisa por
 Slack y 03/04 siguen.
@@ -62,7 +72,10 @@ Variables:
   WM_SAT_MAX_FOLIOS          solicitudes por folio en una corrida (20)
   WM_SAT_DIAS_TRAS_PETICION  dias despues de la peticion de factura que se piden (1)
   WM_SAT_DIAS_BARRIDO        ultimos dias cerrados que se piden siempre (7; 0 = sin barrido)
-  WM_DRY_RUN=1               no escribe ni llama al SAT; dice que haria
+  WM_SAT_DIAS_DEFINITIVA     dias despues de D a partir de los que la solicitud de D es definitiva (4)
+  WM_SAT_SOLO_DIAS           pruebas: lista AAAA-MM-DD separada por comas. Si viene llena, solo se
+                             piden esos dias (sin barrido, sin pendientes, sin folios)
+  WM_DRY_RUN=1              no escribe ni llama al SAT; dice que haria
 """
 
 import io
@@ -82,7 +95,8 @@ if _dir not in sys.path:
 from _wm_common import (configurar_log, log, banner, get_db_connection, leer_cfdi, notify_slack,
                         a_json, ahora_cdmx, a_datetime, TBL_BILLING, MARKETPLACE, RFC_EMISOR,
                         ST_PENDING_WM_XML, ST_PENDING_WM_LINK, ST_PENDING_WM_UUID, lotes,
-                        MKP_FENIX, PRE_RECIBIDO, es_cfdi_walmart, guardar_cfdis_walmart, ligar_cfdis)
+                        MKP_FENIX, PRE_RECIBIDO, es_cfdi_walmart, guardar_cfdis_walmart, ligar_cfdis,
+                        llenar_xml_desde_repositorio)
 import _sat_descarga as sat
 
 DRY_RUN = os.getenv('WM_DRY_RUN', '0').strip() in ('1', 'true', 'TRUE')
@@ -91,6 +105,8 @@ MAX_SOLICITUDES = int(os.getenv('WM_SAT_MAX_SOLICITUDES', '10'))
 MAX_FOLIOS = int(os.getenv('WM_SAT_MAX_FOLIOS', '20'))
 DIAS_TRAS_PETICION = int(os.getenv('WM_SAT_DIAS_TRAS_PETICION', '1'))
 DIAS_BARRIDO = int(os.getenv('WM_SAT_DIAS_BARRIDO', '7'))
+DIAS_DEFINITIVA = int(os.getenv('WM_SAT_DIAS_DEFINITIVA', '4'))
+SOLO_DIAS = {d.strip() for d in os.getenv('WM_SAT_SOLO_DIAS', '').split(',') if d.strip()}
 
 MKP_SAT = 'SAT_DESCARGA'
 SAT_SOLICITADA, SAT_TERMINADA, SAT_DESCARGADA = 'SOLICITADA', 'TERMINADA', 'DESCARGADA'
@@ -135,9 +151,24 @@ def xml_de_carpeta(ruta, solo_uuids=None):
                     yield nombre, fh.read()
 
 
-def aplicar_xmls(db, xmls, stats):
+def uuids_en_repositorio(db, uuids):
+    """Cuales de estos UUID ya tienen fila CFDI:<UUID> en el repositorio."""
+    existentes = set()
+    cur = db.cursor()
+    for chunk in lotes(sorted(uuids), 500):
+        cur.execute(f"""SELECT cfdi_uuid FROM {TBL_BILLING}
+                        WHERE marketplace = %s AND mkp_order_id IN ({','.join(['%s'] * len(chunk))})""",
+                    tuple([MKP_FENIX] + [f"CFDI:{u}" for u in chunk]))
+        existentes.update(u.upper() for (u,) in cur.fetchall() if u)
+    cur.close()
+    return existentes
+
+
+def aplicar_xmls(db, xmls, stats, nuevos_walmart=None):
     """Guarda en el repositorio cada CFDI timbrado por Fenix y pone el XML en
-    su fila PENDING_WM_XML si la hay. Devuelve los UUID cargados a filas."""
+    su fila PENDING_WM_XML si la hay. Devuelve los UUID cargados a filas.
+    nuevos_walmart (lista): recibe los UUID de Walmart que no estaban en el
+    repositorio."""
     validos, repositorio = {}, []
     for nombre, contenido in xmls:
         stats['xml_leidos'] += 1
@@ -153,7 +184,12 @@ def aplicar_xmls(db, xmls, stats):
         if es_cfdi_walmart(cfdi) and cfdi['uuid'] not in validos:
             repositorio.append((contenido, cfdi))
         validos.setdefault(cfdi['uuid'], contenido)
-    stats['xml_de_walmart_al_repositorio'] += len(repositorio)
+    stats['xml_de_walmart_leidos'] += len(repositorio)
+    ya = uuids_en_repositorio(db, {c['uuid'].upper() for _, c in repositorio})
+    nuevos = sorted({c['uuid'].upper() for _, c in repositorio} - ya)
+    stats['xml_de_walmart_nuevos_al_repositorio'] += len(nuevos)
+    if nuevos_walmart is not None:
+        nuevos_walmart.extend(nuevos)
     guardar_cfdis_walmart(db, repositorio, dry_run=DRY_RUN)
 
     cur = db.cursor()
@@ -256,23 +292,39 @@ def dias_por_peticion(db):
 
 def llenar_desde_repositorio(db, stats):
     """Las filas PENDING_WM_XML cuyo UUID ya esta en el repositorio toman de ahi su XML."""
-    if DRY_RUN:
-        return
-    cur = db.cursor()
-    cur.execute(f"""
-        UPDATE {TBL_BILLING} b
-        JOIN {TBL_BILLING} r ON r.marketplace = %s AND r.mkp_order_id = CONCAT('CFDI:', b.cfdi_uuid)
-        SET b.xml_data = r.xml_data, b.status = %s, b.processed_at = NOW(), b.error_log = NULL
-        WHERE b.marketplace = %s AND b.status = %s AND r.xml_data IS NOT NULL
-    """, (MKP_FENIX, ST_PENDING_WM_LINK, MARKETPLACE, ST_PENDING_WM_XML))
-    stats['xml_desde_repositorio'] += cur.rowcount
-    db.commit()
-    cur.close()
+    stats['xml_desde_repositorio'] += llenar_xml_desde_repositorio(db, dry_run=DRY_RUN)
 
 
-def puede_pedirse(fila):
-    return fila is None or (fila['status'] in SAT_REPETIBLES
-                            and (fila['retry_count'] or 0) < MAX_PEDIDOS_MISMOS_PARAMETROS)
+def dia_definitivo(dia):
+    """Primer dia (AAAA-MM-DD) en que una solicitud del dia `dia` ya es definitiva."""
+    return f"{datetime.strptime(dia, '%Y-%m-%d') + timedelta(days=DIAS_DEFINITIVA):%Y-%m-%d}"
+
+
+def es_definitiva(clave, fila):
+    """Una solicitud por dia es definitiva si se hizo en o despues de D + DIAS_DEFINITIVA.
+    Las de folio siempre lo son. Sin fecha de solicitud se toma como provisional."""
+    if not clave.startswith('EMITIDOS:'):
+        return True
+    pedida = (fila['raw'] or {}).get('pedida_en') or ''
+    return bool(pedida) and pedida[:10] >= dia_definitivo(clave.split(':', 1)[1])
+
+
+def falta_definitiva(clave, fila):
+    """Dia ya descargado con una solicitud provisional, al que ya le toca la
+    definitiva y al que el SAT todavia le acepta una solicitud."""
+    return (clave.startswith('EMITIDOS:') and fila is not None
+            and fila['status'] in (SAT_DESCARGADA, SAT_SIN_CFDI)
+            and (fila['retry_count'] or 0) < MAX_PEDIDOS_MISMOS_PARAMETROS
+            and not es_definitiva(clave, fila)
+            and f"{ahora_cdmx():%Y-%m-%d}" >= dia_definitivo(clave.split(':', 1)[1]))
+
+
+def puede_pedirse(fila, clave=''):
+    if fila is None:
+        return True
+    if fila['status'] in SAT_REPETIBLES and (fila['retry_count'] or 0) < MAX_PEDIDOS_MISMOS_PARAMETROS:
+        return True
+    return falta_definitiva(clave, fila)
 
 
 # =============================================================================
@@ -303,6 +355,10 @@ def avanzar_abiertas(db, sesion, solicitudes, stats):
                     continue
                 else:
                     nuevo = {4: SAT_ERROR, 5: SAT_RECHAZADA, 6: SAT_VENCIDA}.get(v['estado'], SAT_ERROR)
+                    if raw.get('anteriores'):
+                        # Fallo la definitiva: el dia conserva lo que bajo la provisional.
+                        raw['definitiva_fallo'] = f"{nuevo}: {v['codigo_estado']} {v['mensaje']}"
+                        nuevo = raw['anteriores'][-1]['status']
                     fila['status'] = nuevo
                     guardar_solicitud(db, clave, nuevo, raw,
                                       f"{v['codigo_estado']} {v['mensaje']}")
@@ -319,14 +375,26 @@ def avanzar_abiertas(db, sesion, solicitudes, stats):
                     guardar_solicitud(db, clave, SAT_TERMINADA, raw, f"{cod} {mensaje}")
                     stats['paquetes_con_error'] += 1
                     continue
-                cargados = aplicar_xmls(db, xml_de_zip(datos), stats)
+                nuevos = []
+                cargados = aplicar_xmls(db, xml_de_zip(datos), stats, nuevos)
                 raw.setdefault('descargados', []).append(paquete)
                 raw.setdefault('uuids_cargados', []).extend(sorted(cargados))
+                raw.setdefault('walmart_nuevos', []).extend(nuevos)
                 stats['paquetes_descargados'] += 1
                 guardar_solicitud(db, clave, SAT_TERMINADA, raw)
             if set(raw.get('paquetes', [])) <= set(raw.get('descargados', [])):
                 fila['status'] = SAT_DESCARGADA
                 guardar_solicitud(db, clave, SAT_DESCARGADA, raw)
+                # Segunda descarga de un dia: lo de Walmart que no trajo la
+                # provisional llego tarde al SAT. Si la orden ya se timbro a
+                # publico general, 01 la marcara DOBLE_CFDI al ligarla.
+                if raw.get('anteriores') and raw.get('walmart_nuevos'):
+                    stats['walmart_llegaron_tarde'] += len(raw['walmart_nuevos'])
+                    log.warning(f"{clave}: {len(raw['walmart_nuevos'])} CFDI de Walmart solo aparecieron "
+                                f"en la descarga definitiva: {', '.join(raw['walmart_nuevos'][:10])}")
+                    notify_slack(f"Walmart 02: {len(raw['walmart_nuevos'])} CFDI de Walmart del "
+                                 f"{clave.split(':', 1)[1]} llegaron tarde al SAT (no estaban en la primera "
+                                 f"descarga). Revisar que su orden no se haya timbrado a publico general.")
         except sat.ErrorSAT as e:
             stats['errores_sat'] += 1
             log.error(f"{clave}: {e}")
@@ -334,26 +402,46 @@ def avanzar_abiertas(db, sesion, solicitudes, stats):
 
 
 def pedir(db, sesion, clave, fila, funcion, stats):
-    """Hace una solicitud nueva y la registra."""
+    """Hace una solicitud nueva y la registra. Si es la segunda (definitiva) de
+    un dia ya descargado y falla, el dia se queda como estaba: lo descargado
+    sigue valiendo y no se vuelve a intentar (ya se gastaron las 2)."""
+    segunda = fila is not None and fila['status'] in (SAT_DESCARGADA, SAT_SIN_CFDI)
     if DRY_RUN:
-        log.info(f"  [DRY RUN] pediria {clave}")
+        log.info(f"  [DRY RUN] pediria {clave}{' (definitiva)' if segunda else ''}")
         stats['solicitudes_nuevas'] += 1
         return
+
+    def fallo(raw_error, mensaje):
+        if segunda:
+            previo = dict(fila['raw'] or {})
+            previo['definitiva_fallo'] = {'pedida_en': f"{ahora_cdmx():%Y-%m-%d %H:%M}", 'error': mensaje}
+            guardar_solicitud(db, clave, fila['status'], previo, mensaje, nueva_peticion=True)
+        else:
+            guardar_solicitud(db, clave, SAT_ERROR, raw_error, mensaje, nueva_peticion=True)
+
     try:
         r = funcion()
     except sat.ErrorSAT as e:
         stats['errores_sat'] += 1
         log.error(f"{clave}: {e}")
-        guardar_solicitud(db, clave, SAT_ERROR, {'error': str(e)[:900]}, str(e)[:900], nueva_peticion=True)
+        fallo({'error': str(e)[:900]}, str(e)[:900])
         return
     raw = {'id_solicitud': r['id_solicitud'], 'cod_estatus': r['cod_estatus'],
            'mensaje': r['mensaje'], 'pedida_en': f"{ahora_cdmx():%Y-%m-%d %H:%M}"}
+    raw['definitiva'] = es_definitiva(clave, {'raw': raw})
     if r['cod_estatus'] == '5000' and r['id_solicitud']:
+        if segunda:
+            # Se conserva el resumen de la solicitud provisional.
+            previo = fila['raw'] or {}
+            raw['anteriores'] = previo.get('anteriores', []) + [{
+                'id_solicitud': previo.get('id_solicitud'), 'pedida_en': previo.get('pedida_en'),
+                'status': fila['status'], 'paquetes': previo.get('paquetes', []),
+                'walmart_nuevos': len(previo.get('walmart_nuevos', []))}]
+            stats['solicitudes_definitivas'] += 1
         guardar_solicitud(db, clave, SAT_SOLICITADA, raw, nueva_peticion=True)
         stats['solicitudes_nuevas'] += 1
     else:
-        guardar_solicitud(db, clave, SAT_ERROR, raw, f"{r['cod_estatus']} {r['mensaje']}",
-                          nueva_peticion=True)
+        fallo(raw, f"{r['cod_estatus']} {r['mensaje']}")
         stats['solicitudes_rechazadas'] += 1
         log.warning(f"{clave}: el SAT no acepto la solicitud: {r['cod_estatus']} {r['mensaje']}")
 
@@ -365,7 +453,7 @@ def pedir_dias(db, sesion, solicitudes, dias, stats):
         if dia >= hoy or nuevas >= MAX_SOLICITUDES:
             continue
         clave = f"EMITIDOS:{dia}"
-        if not puede_pedirse(solicitudes.get(clave)):
+        if not puede_pedirse(solicitudes.get(clave), clave):
             continue
         pedir(db, sesion, clave, solicitudes.get(clave),
               lambda d=dia: sat.solicitar_emitidos(sesion.fiel, sesion.token(), f"{d}T00:00:00",
@@ -375,11 +463,16 @@ def pedir_dias(db, sesion, solicitudes, dias, stats):
 
 
 def pedir_folios(db, sesion, solicitudes, por_dia, stats):
-    """UUID que siguen sin XML aunque su dia ya se descargo."""
+    """UUID que siguen sin XML aunque su dia ya se descargo de forma
+    definitiva (antes de eso todavia pueden llegar en la segunda descarga)."""
     nuevas = 0
     for dia, uuids in sorted(por_dia.items()):
-        fila_dia = solicitudes.get(f"EMITIDOS:{dia}")
+        clave_dia = f"EMITIDOS:{dia}"
+        fila_dia = solicitudes.get(clave_dia)
         if not fila_dia or fila_dia['status'] not in (SAT_DESCARGADA, SAT_SIN_CFDI):
+            continue
+        if (not es_definitiva(clave_dia, fila_dia)
+                and (fila_dia['retry_count'] or 0) < MAX_PEDIDOS_MISMOS_PARAMETROS):
             continue
         for uuid in sorted(uuids):
             if nuevas >= MAX_FOLIOS:
@@ -412,14 +505,23 @@ def modo_sat(db, stats):
     solicitudes = leer_solicitudes(db)
     if not DRY_RUN:
         avanzar_abiertas(db, sesion, solicitudes, stats)
+    if SOLO_DIAS:
+        # Pruebas: solo los dias pedidos; nada de barrido, pendientes ni folios.
+        log.warning(f"WM_SAT_SOLO_DIAS: solo se piden {sorted(SOLO_DIAS)}")
+        pedir_dias(db, sesion, solicitudes, SOLO_DIAS, stats)
+        return
     por_dia = pendientes_por_dia(db)
     dias_pet = dias_por_peticion(db)
     hoy = ahora_cdmx()
     barrido = {f"{hoy - timedelta(days=i):%Y-%m-%d}" for i in range(1, DIAS_BARRIDO + 1)}
+    # Dias con solicitud provisional a los que ya les toca la definitiva,
+    # esten o no en el barrido (por ejemplo, si el flujo no corrio unos dias).
+    definitivas = {c.split(':', 1)[1] for c, f in solicitudes.items() if falta_definitiva(c, f)}
     log.info(f"CFDI de Walmart sin XML: {sum(len(v) for v in por_dia.values())} en {len(por_dia)} dia(s) | "
-             f"dias por peticiones sin ligar (PENDING_WM_UUID): {len(dias_pet)} | barrido: {len(barrido)} dia(s)")
-    # Primero el barrido (lo mas reciente protege a 04), luego lo demas.
-    pedir_dias(db, sesion, solicitudes, barrido, stats)
+             f"dias por peticiones sin ligar (PENDING_WM_UUID): {len(dias_pet)} | barrido: {len(barrido)} dia(s) | "
+             f"segunda descarga pendiente: {len(definitivas)} dia(s)")
+    # Primero el barrido y las definitivas (protegen a 04), luego lo demas.
+    pedir_dias(db, sesion, solicitudes, barrido | definitivas, stats)
     solicitudes = leer_solicitudes(db) if not DRY_RUN else solicitudes
     pedir_dias(db, sesion, solicitudes, set(por_dia) | dias_pet, stats)
     pedir_folios(db, sesion, solicitudes, por_dia, stats)

@@ -87,13 +87,16 @@ tasks:
           WM_START_DATE: "{{ inputs.start_date ?? '' }}"
           WM_END_DATE: "{{ inputs.end_date ?? '' }}"
           WM_MAX_FACTURAS: "{{ inputs.max_facturas ?? '' }}"
-          WM_GRACE_DAYS: "5"          # decision pendiente de Finanzas
+          WM_GRACE_DAYS: "7"          # desde order_date; 99.8% de las peticiones llega en 5 dias
+          WM_TAX_ID: "14"             # IVA 16% al cobro: 209.01.001 -> 208.01.001 al cobrar
+          WM_JOURNAL_CODE: "WALM"     # diario de los CFDI de Walmart (serie-folio FI-xxxx)
           WM_DIAS_CIERRE_MES: "2"     # una corrida por dia: dias 1 y 2
           # 04 no emite si la ultima corrida buena de 00b (API de Fenix) es mas
           # vieja que esto. 00b corre en este mismo flujo minutos antes.
           WM_FENIX_MAX_HORAS: "6"
           # Crawler de Data (wm_fenix_invoices_report): opcional. Sin el se
-          # liga ~87% (camino rapido + folio); si trae el UUID, liga el resto.
+          # liga 66-87% (camino rapido + folio; 66% en Buen Fin); si trae el
+          # UUID, liga el resto.
           WM_USAR_CRAWLER: "1"
           WM_REPORTE_DIR: "."
           FENIX_WALMART_USER: "{{ secret('FENIX_WALMART_USER') }}"
@@ -108,6 +111,9 @@ tasks:
           WM_SAT_DIAS_TRAS_PETICION: "1"
           # Barrido: pide siempre los ultimos 7 dias cerrados (1 solicitud por dia).
           WM_SAT_DIAS_BARRIDO: "7"
+          # Segunda descarga: la solicitud de un dia D hecha antes de D+4 se
+          # repite en D+4 (el PAC tiene 72 h para entregar el CFDI al SAT).
+          WM_SAT_DIAS_DEFINITIVA: "4"
           # 04 detiene una orden si hay un CFDI de Walmart sin ligar que podria
           # ser suyo, timbrado hasta 7 dias despues de la venta (0 = apagado).
           WM_B2_DIAS: "7"

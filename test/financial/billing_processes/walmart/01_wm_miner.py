@@ -62,7 +62,8 @@ from _wm_common import (configurar_log, log, banner, get_db_connection, notify_s
                         ST_ORDEN_MIXTA, ST_WM_REVISAR, ST_WM_EXCEDENTE, ST_DESCARTADA,
                         ST_MANUAL_SERIE, SKUS_FACTURA_MANUAL, USAR_CRAWLER, PRE_RECIBIDO,
                         precfdi_por_linea, cfdis_ligados_por_linea,
-                        inicio_de_mes, a_float, a_json, normalizar_uuid, lotes)
+                        inicio_de_mes, a_float, a_json, normalizar_uuid, lotes,
+                        llenar_xml_desde_repositorio)
 
 DRY_RUN = os.getenv('WM_DRY_RUN', '0').strip() in ('1', 'true', 'TRUE')
 
@@ -379,8 +380,12 @@ def main():
     db.commit()
     wcur.close()
     cur.close()
+    # Las filas <orden>:<UUID> de lo que 02 acaba de ligar toman el XML del
+    # repositorio aqui mismo; si no, 03 no las veria hasta la corrida siguiente.
+    con_xml = llenar_xml_desde_repositorio(db)
     db.close()
-    log.info(f"Escritas {len(deseadas)} fila(s); {len(descartar)} descartada(s).")
+    log.info(f"Escritas {len(deseadas)} fila(s); {len(descartar)} descartada(s); "
+             f"{con_xml} CFDI de Walmart tomaron su XML del repositorio.")
 
     normales = (ST_PENDING_WB, ST_PENDING_WM_UUID, ST_PENDING_WM_XML, ST_PENDING_WM_LINK)
     espera = sum(n for s, n in resumen.items() if s not in normales)

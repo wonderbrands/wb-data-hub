@@ -50,7 +50,7 @@ import logging
 import urllib.request
 import xmlrpc.client
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -82,9 +82,19 @@ DO_STAMPING = (ENTORNO == 'prod')
 # CONFIGURACION CONTABLE Y FISCAL
 # =============================================================================
 
-TAX_ID_MARKETPLACES = 38                    # IVA 16% trasladado
+# IVA 16% con exigibilidad AL COBRO (correo de Finanzas, 25-nov-2026, A1): al
+# facturar va a 209.01.001 IVA trasladado no cobrado y Odoo lo pasa a 208.01.001
+# al conciliar el cobro. En Odoo es el impuesto 14 ("16%"). El 38 ("IVA(16%)
+# Marketplaces", que usan ML y Amazon) es exigible al facturar y va directo a la
+# 208. cargar_catalogos() valida que el impuesto sea al cobro y con la 209.
+TAX_ID_MARKETPLACES = int(os.getenv('WM_TAX_ID', '14'))
+ACCOUNT_IVA_NO_COBRADO = '209.01.001'
 PARTNER_ID_PUBLICO_GENERAL = 13436          # XAXX010101000
 ACCOUNT_WALMART_CXC = '105.01.007'
+# Diario de los CFDI del autofacturador de Walmart (Finanzas, C3/D5): entran con
+# su serie y folio (FI-4252), no consumen la secuencia INV. Las de publico
+# general (04) siguen en el diario de facturas normal (INV).
+JOURNAL_WALMART_CODE = os.getenv('WM_JOURNAL_CODE', 'WALM').strip()
 ACCOUNT_MERC_NO_ENVIADA = os.getenv('WM_ACCOUNT_MERC_NO_ENVIADA', '205.06.003').strip()
 PAYMENT_METHOD_TRANSFERENCIA = 3            # l10n_mx_edi_payment_method_id (03)
 
@@ -142,14 +152,19 @@ ST_MANUAL_SERIE = 'FACTURA_MANUAL_SERIE'  # bici electrica: factura CS/Finanzas 
 ST_BORRADOR_AJENO = 'BORRADOR_AJENO'      # la SO tiene un borrador de otro proceso (sin CFDI):
                                           # Finanzas lo cancela y la orden se reevalua
 
-# Bicis electricas (correo de Jero, nov-2026): por disposicion legal se facturan
-# con el numero de serie, que solo se conoce al abrir la caja. Walmart las
-# bloqueo en su portal y las deriva a Somos Reyes; mientras no exista un
-# mecanismo, las emiten a mano Customer Service y Finanzas. Si Walmart ya
-# emitio su CFDI, se replica igual (03). Prefijos de SKU, separados por coma.
+# Bicis electricas. Finanzas (25-nov-2026, A3): sin trato especial; si la orden
+# sigue pendiente pasado el plazo de gracia, 04 la factura a publico general
+# como cualquier otra. Por eso la lista viene VACIA. Se conserva la variable por
+# si algun SKU necesitara volver a factura manual (prefijos separados por coma).
 SKUS_FACTURA_MANUAL = tuple(s.strip().upper() for s in
-                            os.getenv('WM_SKUS_FACTURA_MANUAL', 'EBIKE350,EBIKE500,EX-1').split(',')
+                            os.getenv('WM_SKUS_FACTURA_MANUAL', '').split(',')
                             if s.strip())
+ST_LINEA_REVISAR = 'WM_LINEA_REVISAR'     # el CFDI no corresponde a la linea de la SO
+                                          # (UPC distinto o la linea ya la facturo otra
+                                          # factura): no se crea nada cruzado
+ST_ADOPTADA_REVISAR = 'WM_ADOPTADA_REVISAR'  # ya existia una factura con el UUID pero con
+                                             # otro total, cliente, CxC o diario (proceso
+                                             # manual): la corrige el traslado de 2026
 
 # Finales
 ST_WB_INVOICED = 'WB_INVOICED'            # factura de WB publicada (y timbrada en prod)
@@ -165,7 +180,8 @@ ST_ERROR = 'ERROR'                        # se reintenta hasta 3 veces (retry_co
 REFRESCABLES = (ST_PENDING_WB, ST_PENDING_WM_UUID, ST_PENDING_WM_XML, ST_PENDING_WM_LINK,
                 ST_NO_SO, ST_SO_DUPLICADA, ST_SO_OTRO_EQUIPO, ST_SO_CANCELADA,
                 ST_ORDEN_MIXTA, ST_WM_REVISAR, ST_WM_EXCEDENTE, ST_DOBLE_CFDI,
-                ST_RECLASIFICAR, ST_MANUAL_SERIE, ST_BORRADOR_AJENO)
+                ST_RECLASIFICAR, ST_MANUAL_SERIE, ST_BORRADOR_AJENO,
+                ST_LINEA_REVISAR, ST_ADOPTADA_REVISAR)
 
 
 # =============================================================================
@@ -205,6 +221,7 @@ USAR_CRAWLER = os.getenv('WM_USAR_CRAWLER', '1').strip() in ('1', 'true', 'TRUE'
 #    dos ya ligados solo pueden ser de las peticiones con cfdiid entre las de
 #    esos dos; se emparejan en orden y solo si hay UNA manera de hacerlo (90).
 VENTANA_LIGADO_MIN = int(os.getenv('WM_VENTANA_LIGADO_MIN', '30'))
+GRUPO_CERRADO = os.getenv('WM_GRUPO_CERRADO', 'orden').strip().lower()   # 'orden' | 'cliente' | '0'
 TOLERANCIA_PRECIO_LIGADO = 0.02
 
 STUCK_PROCESSING_MIN_AGE_HOURS = 6
@@ -541,13 +558,40 @@ def cargar_catalogos(odoo):
     formas = odoo.execute_kw('l10n_mx_edi.payment.method', 'search_read', [[]],
                              {'fields': ['id', 'code']})
     mx = odoo.execute_kw('res.country', 'search', [[('code', '=', 'MX')]], {'limit': 1})
+    validar_impuesto(odoo)
     return {
         'formas_pago': {f['code']: f['id'] for f in formas},
         'mx_country_id': mx[0] if mx else False,
         'cuenta_cxc': get_account_id(odoo, ACCOUNT_WALMART_CXC),
         'cuenta_merc_no_enviada': get_account_id(odoo, ACCOUNT_MERC_NO_ENVIADA),
         'team_walmart': get_team_walmart(odoo),
+        'diario_walmart': get_journal_id(odoo, JOURNAL_WALMART_CODE),
     }
+
+
+def validar_impuesto(odoo):
+    """El IVA tiene que ser al cobro y pasar por la 209.01.001 (A1). Si alguien
+    cambia el impuesto en Odoo, no se factura con el equivocado."""
+    t = odoo.execute_kw('account.tax', 'read', [[TAX_ID_MARKETPLACES]],
+                        {'fields': ['name', 'amount', 'type_tax_use', 'tax_exigibility',
+                                    'cash_basis_transition_account_id']})
+    if not t:
+        raise Exception(f"No existe el impuesto {TAX_ID_MARKETPLACES} (WM_TAX_ID).")
+    t = t[0]
+    transitoria = (t['cash_basis_transition_account_id'] or [None, ''])[1] or ''
+    if (t['type_tax_use'] != 'sale' or a_float(t['amount']) != 16 or t['tax_exigibility'] != 'on_payment'
+            or not transitoria.startswith(ACCOUNT_IVA_NO_COBRADO)):
+        raise Exception(f"El impuesto {TAX_ID_MARKETPLACES} ({t['name']}) no es IVA 16% de venta al cobro "
+                        f"con transitoria {ACCOUNT_IVA_NO_COBRADO} (exigibilidad {t['tax_exigibility']}, "
+                        f"transitoria {transitoria or 'ninguna'}). Revisar WM_TAX_ID.")
+
+
+def get_journal_id(odoo, code):
+    j = odoo.execute_kw('account.journal', 'search_read', [[('code', '=', code), ('type', '=', 'sale')]],
+                        {'fields': ['id'], 'limit': 1})
+    if not j:
+        raise Exception(f"No existe el diario de ventas {code} en {ODOO_DB} (WM_JOURNAL_CODE).")
+    return j[0]['id']
 
 
 def buscar_so(odoo, so_name):
@@ -970,6 +1014,26 @@ def guardar_cfdis_walmart(db, cfdis, dry_run=False):
     cur.close()
 
 
+def llenar_xml_desde_repositorio(db, dry_run=False):
+    """Las filas <orden>:<UUID> en PENDING_WM_XML cuyo UUID ya esta en el
+    repositorio toman de ahi su XML y pasan a PENDING_WM_LINK. La llaman 01
+    (al crear las filas de lo recien ligado, para que 03 las replique en la
+    misma corrida) y 02. Devuelve cuantas filas se llenaron."""
+    if dry_run:
+        return 0
+    cur = db.cursor()
+    cur.execute(f"""
+        UPDATE {TBL_BILLING} b
+        JOIN {TBL_BILLING} r ON r.marketplace = %s AND r.mkp_order_id = CONCAT('CFDI:', b.cfdi_uuid)
+        SET b.xml_data = r.xml_data, b.status = %s, b.processed_at = NOW(), b.error_log = NULL
+        WHERE b.marketplace = %s AND b.status = %s AND r.xml_data IS NOT NULL
+    """, (MKP_FENIX, ST_PENDING_WM_LINK, MARKETPLACE, ST_PENDING_WM_XML))
+    n = cur.rowcount
+    db.commit()
+    cur.close()
+    return n
+
+
 def _lineas_ftm(cursor, iderps):
     """{iderp: (precio_unitario, cantidad)} de FTM."""
     res = {}
@@ -1033,6 +1097,71 @@ def _emparejar_en_orden(cfdis, peticiones, cuadra):
     return pares if i == n else None
 
 
+def _grupos_cerrados(cfdis, pres, cuadra, ftm, usos):
+    """Pares (cfdi, peticion) de los grupos cerrados. Se arma un grafo: cada
+    CFDI sin ligar se une con cada peticion libre que le cuadra (precio, UPC,
+    piezas, peticion antes del timbrado). En cada componente conexo:
+      - tantos CFDI como peticiones;
+      - todos los CFDI con el mismo receptor (RFC), UPC, total y piezas;
+      - las piezas caben en sus lineas;
+      - se emparejan en orden (folio del CFDI con cfdiid de la peticion) y en
+        cada par la peticion es anterior al timbrado.
+    Entonces todas esas peticiones son de ese cliente y cada orden recibe sus
+    piezas (mismo cliente, producto y precio). El orden por folio ademas pone
+    cada UUID en su orden: emparejar por fecha cruzaba 8 de 24 entre ordenes
+    del mismo cliente, lo que despues confunde la NC de una devolucion."""
+    padre = {}
+
+    def raiz(x):
+        padre.setdefault(x, x)
+        while padre[x] != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+
+    por_id = {p['cfdiid']: p for p in pres}
+    for c in cfdis:
+        raiz(('c', c['uuid']))
+        for p in pres:
+            if p['t'] is not None and cuadra(p, c):
+                padre[raiz(('c', c['uuid']))] = raiz(('p', p['cfdiid']))
+    grupos = defaultdict(lambda: ([], []))
+    for c in cfdis:
+        grupos[raiz(('c', c['uuid']))][0].append(c)
+    for nodo in list(padre):
+        if nodo[0] == 'p':
+            grupos[raiz(nodo)][1].append(por_id[nodo[1]])
+    pares = []
+    for cs, ps in grupos.values():
+        if not cs or len(cs) != len(ps):
+            continue
+        if GRUPO_CERRADO == 'orden' and len({p['orden'] for p in ps}) != 1:
+            continue
+        firma = {(c['receptor'], c['upc'], round(c['total'], 2), c['cant']) for c in cs}
+        if len(firma) != 1 or not cs[0]['receptor']:
+            continue
+        piezas = Counter()
+        for p in ps:
+            piezas[p['iderp']] += cs[0]['cant']
+        if any(usos[k] + n > ftm[k][1] for k, n in piezas.items()):
+            continue
+        # En orden: el Folio de la serie FI crece igual que el cfdiid de la
+        # peticion (0 inversiones en octubre). Si algun par queda con la
+        # peticion despues del timbrado, el grupo no se liga.
+        folios = [_folio_de(c) for c in cs]
+        if None in folios or len(set(folios)) != len(folios):
+            continue
+        grupo = list(zip(sorted(cs, key=_folio_de), sorted(ps, key=lambda p: p['cfdiid'])))
+        if all(p['t'] <= c['fecha'] for c, p in grupo):
+            pares.extend(grupo)
+    return pares
+
+
+def _folio_de(c):
+    f = c.get('folio') or ''
+    return int(f) if f.isdigit() and len(f) <= 9 else None
+
+
 def ligar_cfdis(db, dry_run=False):
     """Liga cada CFDI:<UUID> SIN_LIGAR con su linea de Walmart (iderp) y su
     peticion (cfdiid). Una linea no recibe mas CFDI que piezas vendidas y una
@@ -1047,6 +1176,11 @@ def ligar_cfdis(db, dry_run=False):
     4. Tramo de folios: los CFDI sin ligar entre dos CFDI ligados (por folio)
        se emparejan, en orden, con las peticiones libres cuyo cfdiid esta entre
        los de esos dos; solo si hay una sola manera. Se repite mientras ligue.
+    5. Grupo cerrado (ver _grupos_cerrados): N CFDI iguales del mismo cliente
+       que solo pueden ser de N peticiones, y esas peticiones de ningun otro
+       CFDI. WM_GRUPO_CERRADO: 'orden' (por defecto) solo si las N peticiones
+       son de la misma orden; 'cliente' tambien entre ordenes del mismo
+       cliente; '0' apagado.
     Lo demas queda SIN_LIGAR (no se adivina: un CFDI pegado a la orden
     equivocada no se corrige despues). Devuelve un Counter."""
     stats = Counter()
@@ -1110,7 +1244,8 @@ def ligar_cfdis(db, dry_run=False):
             continue
         datos[u] = {'uuid': u, 'fecha': fecha, 'cant': a_float(raw.get('cantidad')) or 1.0,
                     'total': a_float(raw.get('total')), 'upc': str(raw.get('upc') or '').strip().lstrip('0'),
-                    'folio': str(raw.get('folio') or '').strip()}
+                    'folio': str(raw.get('folio') or '').strip(),
+                    'receptor': str(raw.get('receptor_rfc') or '').strip().upper()}
 
     def cuadra(p, c):
         k = p['iderp']
@@ -1176,6 +1311,10 @@ def ligar_cfdis(db, dry_run=False):
             for c, p in pares:
                 ligar(c['uuid'], p['iderp'], p['orden'], p['cfdiid'], 'folio_tramo')
             cambio = True
+
+    # 5. Grupo cerrado
+    for c, p in [] if GRUPO_CERRADO not in ('orden', 'cliente') else _grupos_cerrados([c for c in datos.values() if c['uuid'] not in ligas], pres, cuadra, ftm, usos):
+        ligar(c['uuid'], p['iderp'], p['orden'], p['cfdiid'], 'grupo_cerrado')
 
     for u in sueltos:
         if u not in ligas:
